@@ -99,9 +99,13 @@ declare global {
     api: {
       onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => void
       obtenerRuta: (file: File) => string
-      guardarBytesDirecto: (
-        bufferData: Uint8Array,
+      guardarPaginasImagen: (
+        paginasBytes: Uint8Array[],
         formatoDestino: string,
+        rutaOriginal: string
+      ) => Promise<boolean>
+      guardarPaginasComoPdf: (
+        paginasPngBytes: Uint8Array[],
         rutaOriginal: string
       ) => Promise<boolean>
       guardarTextoDocumento: (
@@ -109,6 +113,7 @@ declare global {
         formatoDestino: 'txt' | 'docx',
         rutaOriginal: string
       ) => Promise<boolean>
+      leerDocumentoTexto: (rutaOriginal: string) => Promise<BloqueDocumento[]>
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
       cerrarMenu: () => void
     }
@@ -120,7 +125,7 @@ const procesando = ref(false)
 const posX = ref(500)
 const posY = ref(400)
 const opcionActiva = ref<string | null>(null)
-const tipoDetectado = ref<'pdf' | 'imagen'>('pdf')
+const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen'>('pdf')
 
 function crearPathSegmento(anguloCentralGrados: number): string {
   const cx = 160
@@ -183,6 +188,18 @@ const catalogoOpciones = {
     { id: 'png', label: 'PNG', angulo: 90, tx: 160, ty: 265 },
     { id: 'txt', label: 'TXT', angulo: 180, tx: 55, ty: 160 }
   ],
+  docx: [
+    { id: 'pdf', label: 'PDF', angulo: -90, tx: 160, ty: 55 },
+    { id: 'jpg', label: 'JPG', angulo: 0, tx: 265, ty: 160 },
+    { id: 'png', label: 'PNG', angulo: 90, tx: 160, ty: 265 },
+    { id: 'txt', label: 'TXT', angulo: 180, tx: 55, ty: 160 }
+  ],
+  txt: [
+    { id: 'docx', label: 'DOCX', angulo: -90, tx: 160, ty: 55 },
+    { id: 'jpg', label: 'JPG', angulo: 0, tx: 265, ty: 160 },
+    { id: 'png', label: 'PNG', angulo: 90, tx: 160, ty: 265 },
+    { id: 'pdf', label: 'PDF', angulo: 180, tx: 55, ty: 160 }
+  ],
   imagen: [
     { id: 'pdf', label: 'PDF', angulo: -90, tx: 160, ty: 55 },
     { id: 'jpg', label: 'JPG', angulo: 0, tx: 265, ty: 160 },
@@ -190,6 +207,12 @@ const catalogoOpciones = {
     { id: 'webp', label: 'WEBP', angulo: 180, tx: 55, ty: 160 }
   ]
 }
+
+const etiquetaCentro = computed(() => {
+  if (opcionActiva.value) return opcionActiva.value.toUpperCase()
+  if (tipoDetectado.value === 'imagen') return 'IMG'
+  return tipoDetectado.value.toUpperCase()
+})
 
 const segmentos = computed(() => {
   const opciones = catalogoOpciones[tipoDetectado.value] || catalogoOpciones.pdf
@@ -220,7 +243,11 @@ const detectarTipoEnVuelo = (event: DragEvent) => {
   const mime = (items[0].type || '').toLowerCase()
   if (mime.startsWith('image/')) {
     tipoDetectado.value = 'imagen'
-  } else {
+  } else if (mime.includes('word') || mime.includes('officedocument')) {
+    tipoDetectado.value = 'docx'
+  } else if (mime === 'text/plain') {
+    tipoDetectado.value = 'txt'
+  } else if (mime.includes('pdf')) {
     tipoDetectado.value = 'pdf'
   }
 }
@@ -241,6 +268,27 @@ const canvasToUint8ArrayDirecto = (
       mime,
       0.92
     )
+  })
+}
+
+const uint8ToBase64 = (u8Arr: Uint8Array): string => {
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < u8Arr.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, Array.from(u8Arr.subarray(i, i + chunkSize)))
+  }
+  return window.btoa(binary)
+}
+
+// Carga la imagen usando Data URI (base64) permitido por la política CSP de Electron
+const cargarImagenDesdeBytes = (bytes: Uint8Array): Promise<HTMLImageElement> => {
+  return new Promise((resolve, reject) => {
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as any)
+    const base64 = uint8ToBase64(u8)
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = (err) => reject(err)
+    img.src = `data:image/png;base64,${base64}`
   })
 }
 
@@ -268,7 +316,193 @@ const renderizarPaginaACanvas = async (
   return { canvas, scale, pageWidth: baseVp.width, pageHeight: baseVp.height }
 }
 
-// --- DETECTOR DE NEGRITAS REALES LEYENDO LOS OBJETOS DE FUENTE INTERNOS DEL PDF ---
+const renderizarBloquesAPaginas = async (
+  bloques: BloqueDocumento[],
+  formatoImagen: 'png' | 'jpg'
+): Promise<Uint8Array[]> => {
+  const W = 1224
+  const H = 1584
+  const marginX = 110
+  const marginY = 85
+  const maxLineWidth = W - marginX * 2
+
+  const canvases: HTMLCanvasElement[] = []
+  let currentCanvas = document.createElement('canvas')
+  currentCanvas.width = W
+  currentCanvas.height = H
+  let ctx = currentCanvas.getContext('2d', { alpha: false })!
+  ctx.fillStyle = '#FFFFFF'
+  ctx.fillRect(0, 0, W, H)
+  canvases.push(currentCanvas)
+
+  let cursorY = marginY
+
+  const nuevaPagina = () => {
+    currentCanvas = document.createElement('canvas')
+    currentCanvas.width = W
+    currentCanvas.height = H
+    ctx = currentCanvas.getContext('2d', { alpha: false })!
+    ctx.fillStyle = '#FFFFFF'
+    ctx.fillRect(0, 0, W, H)
+    canvases.push(currentCanvas)
+    cursorY = marginY
+  }
+
+  for (const b of bloques) {
+    if (b.tipo === 'salto_pagina') {
+      nuevaPagina()
+      continue
+    }
+
+    // 1. DIBUJAR IMÁGENES INCRUSTADAS EN EL DOCX
+    if (b.tipo === 'imagen' && b.pngBytes && b.pngBytes.byteLength > 0) {
+      try {
+        const img = await cargarImagenDesdeBytes(b.pngBytes)
+        let drawW = (b.width || img.naturalWidth || 600) * 1.55
+        let drawH = (b.height || img.naturalHeight || 400) * 1.55
+
+        if (drawW > maxLineWidth) {
+          const ratio = maxLineWidth / drawW
+          drawW = maxLineWidth
+          drawH = drawH * ratio
+        }
+        const maxPageH = H - marginY * 2
+        if (drawH > maxPageH) {
+          const ratio = maxPageH / drawH
+          drawH = maxPageH
+          drawW = drawW * ratio
+        }
+
+        if (cursorY + drawH > H - marginY && cursorY > marginY + 20) {
+          nuevaPagina()
+        }
+
+        let drawX = marginX
+        if (b.align === 'center' || !b.align) drawX = (W - drawW) / 2
+        else if (b.align === 'right') drawX = W - marginX - drawW
+
+        ctx.drawImage(img, drawX, cursorY, drawW, drawH)
+        cursorY += drawH + 18
+      } catch (e) {
+        console.error('Error dibujando imagen de DOCX en canvas:', e)
+      }
+      continue
+    }
+
+    // 2. DIBUJAR TABLAS CON BORDES (<w:tbl>)
+    if (b.tipo === 'tabla' && b.filasTabla && b.filasTabla.length > 0) {
+      const numCols = Math.max(...b.filasTabla.map((f) => f.length))
+      const colW = maxLineWidth / numCols
+      const fontSizePx = 20
+      const rowH = 54
+
+      cursorY += 10
+      for (const fila of b.filasTabla) {
+        if (cursorY + rowH > H - marginY) nuevaPagina()
+
+        for (let c = 0; c < numCols; c++) {
+          const cellX = marginX + c * colW
+          ctx.strokeStyle = '#000000'
+          ctx.lineWidth = 2
+          ctx.strokeRect(cellX, cursorY, colW, rowH)
+
+          const celdaSegs = fila[c] || []
+          let textX = cellX + 16
+          for (const seg of celdaSegs) {
+            ctx.font = `${seg.bold ? 'bold ' : ''}${fontSizePx}px Calibri, Arial, sans-serif`
+            ctx.fillStyle = '#000000'
+            ctx.fillText(seg.texto, textX, cursorY + 34)
+            textX += ctx.measureText(seg.texto).width
+          }
+        }
+        cursorY += rowH
+      }
+      cursorY += 20
+      continue
+    }
+
+    // 3. DIBUJAR PÁRRAFOS DE TEXTO CON SOPORTE DE NEGRITAS MIXTAS Y SANGRÍA
+    const fontSizePx = Math.round((b.fontSize || 10.5) * 2.0)
+    const lineHeight = Math.round(fontSizePx * 1.35)
+    const indentPx = b.indentLeft ? Math.min(400, Math.round(b.indentLeft * 0.12)) : 0
+    const startX = marginX + indentPx
+    const availW = maxLineWidth - indentPx
+
+    const segs: SegmentoTexto[] =
+      b.segmentos && b.segmentos.length > 0
+        ? b.segmentos
+        : [{ texto: b.texto || '', bold: b.bold, fontSize: b.fontSize }]
+
+    interface TokenPalabra {
+      texto: string
+      bold: boolean
+      width: number
+    }
+    const tokens: TokenPalabra[] = []
+
+    for (const seg of segs) {
+      const isBold = !!(seg.bold ?? b.bold)
+      ctx.font = `${isBold ? 'bold ' : ''}${fontSizePx}px Calibri, Arial, sans-serif`
+      const partes = (seg.texto || '').split(/(\s+)/)
+      for (const p of partes) {
+        if (!p) continue
+        tokens.push({
+          texto: p,
+          bold: isBold,
+          width: ctx.measureText(p).width
+        })
+      }
+    }
+
+    if (tokens.length === 0) {
+      cursorY += Math.round(lineHeight * 0.6)
+      continue
+    }
+
+    const lineasTokens: TokenPalabra[][] = [[]]
+    let anchoActual = 0
+
+    for (const tk of tokens) {
+      const lineaActual = lineasTokens[lineasTokens.length - 1]
+      if (lineaActual.length === 0 && /^\s+$/.test(tk.texto)) continue
+
+      if (anchoActual + tk.width > availW && lineaActual.length > 0) {
+        lineasTokens.push([tk])
+        anchoActual = tk.width
+      } else {
+        lineaActual.push(tk)
+        anchoActual += tk.width
+      }
+    }
+
+    for (const linea of lineasTokens) {
+      if (cursorY + lineHeight > H - marginY) nuevaPagina()
+
+      const totalLineW = linea.reduce((acc, t) => acc + t.width, 0)
+      let drawX = startX
+      if (b.align === 'center') drawX = (W - totalLineW) / 2
+      else if (b.align === 'right') drawX = W - marginX - totalLineW
+
+      for (const tk of linea) {
+        ctx.font = `${tk.bold ? 'bold ' : ''}${fontSizePx}px Calibri, Arial, sans-serif`
+        ctx.fillStyle = '#111827'
+        ctx.fillText(tk.texto, drawX, cursorY + fontSizePx)
+        drawX += tk.width
+      }
+      cursorY += lineHeight
+    }
+
+    cursorY += Math.round(fontSizePx * 0.25)
+  }
+
+  const paginasBytes: Uint8Array[] = []
+  for (const c of canvases) {
+    const bytes = await canvasToUint8ArrayDirecto(c, formatoImagen)
+    paginasBytes.push(bytes)
+  }
+  return paginasBytes
+}
+
 const esFuenteNegrita = (page: any, styles: any, fontKey: string, fontSize: number): boolean => {
   let nombreReal = String(fontKey || '').toLowerCase()
   const styleFamily = String(styles[fontKey]?.fontFamily || '').toLowerCase()
@@ -296,14 +530,12 @@ const esFuenteNegrita = (page: any, styles: any, fontKey: string, fontSize: numb
   )
 }
 
-// --- ANALIZADOR DE ESTRUCTURA VISUAL DEL PDF (Texto rico, Tablas y Cajas para Recorte Gráfico) ---
 const analizarPaginaCompleta = async (
   page: any,
   textContent: any,
   formatoDestino: 'txt' | 'docx'
 ): Promise<BloqueDocumento[]> => {
-  // Renderizamos primero la página para poblar commonObjs (fuentes reales) y tener el lienzo para recortar logos/firmas
-  const { canvas, scale, pageWidth, pageHeight } = await renderizarPaginaACanvas(page, 1400)
+  const { canvas, scale, pageWidth } = await renderizarPaginaACanvas(page, 1400)
   const styles = textContent.styles || {}
 
   interface ItemTexto {
@@ -335,7 +567,6 @@ const analizarPaginaCompleta = async (
     })
   }
 
-  // Si la página es 100% imagen escaneada sin nada de texto
   if (items.length === 0) {
     if (formatoDestino === 'docx') {
       const bytes = await canvasToUint8ArrayDirecto(canvas, 'png')
@@ -344,14 +575,12 @@ const analizarPaginaCompleta = async (
     return []
   }
 
-  // 1. Ordenar de arriba hacia abajo (Y descendente) y de izquierda a derecha (X ascendente)
   items.sort((a, b) => {
     const tol = Math.max(a.fontSize, b.fontSize) * 0.42
     if (Math.abs(a.y - b.y) <= tol) return a.x - b.x
     return b.y - a.y
   })
 
-  // 2. Agrupar en renglones
   interface Renglon {
     y: number
     minX: number
@@ -388,7 +617,6 @@ const analizarPaginaCompleta = async (
     }
   }
 
-  // 3. Construir segmentos con negritas mixtas y detectar columnas de tabla
   for (const r of renglones) {
     r.items.sort((a, b) => a.x - b.x)
     const celdas: SegmentoTexto[][] = [[]]
@@ -402,7 +630,6 @@ const analizarPaginaCompleta = async (
         const prev = r.items[i - 1]
         const gap = actual.x - (prev.x + prev.w)
 
-        // Si hay un salto horizontal grande hacia la mitad de la página, es una nueva columna de tabla
         if (gap > r.fontSize * 2.1 && actual.x > pageWidth * 0.35) {
           celdas.push([])
           textoPlano += '    '
@@ -444,7 +671,6 @@ const analizarPaginaCompleta = async (
   const maxXPagina = Math.max(...renglones.map((r) => r.maxX))
   const anchoUtil = Math.max(200, maxXPagina - minXPagina)
 
-  // 4. Construir bloques de texto y agrupar filas de tablas (<w:tbl>)
   const bloquesPosicion: BloqueConPosicion[] = []
   const cajasTablaPdf: { topY: number; bottomY: number }[] = []
 
@@ -452,7 +678,6 @@ const analizarPaginaCompleta = async (
   while (i < renglones.length) {
     const r = renglones[i]
 
-    // Si este renglón tiene 2 o más columnas (ej. Tabla de Dirección / Teléfono / Correo)
     if (r.celdas.length >= 2) {
       const filasTabla: SegmentoTexto[][][] = [r.celdas]
       const topY = r.y + r.fontSize * 1.2
@@ -486,13 +711,11 @@ const analizarPaginaCompleta = async (
     const centroPagina = pageWidth / 2
     const anchoRenglon = r.maxX - r.minX
 
-    // Detectar alineación Derecha (ej. Fecha "Acapulco, Gro..." y Subencabezado derecho)
     const esDerecha =
       r.minX > pageWidth * 0.44 &&
       r.maxX >= maxXPagina - 55 &&
       anchoRenglon < anchoUtil * 0.65
 
-    // Detectar alineación Centrada (ej. Título "SOLICITUD DEL ESTUDIANTE" o pie de página centrado)
     const esCentrado =
       !esDerecha &&
       anchoRenglon < anchoUtil * 0.82 &&
@@ -507,7 +730,6 @@ const analizarPaginaCompleta = async (
 
     const esLista = /^([a-zA-Z0-9][\.\)]|\u2022|-|\*)\s/.test(r.textoPlano)
 
-    // Solo unir renglones si son un párrafo largo corrido de margen a margen
     const ultimoItem = bloquesPosicion[bloquesPosicion.length - 1]
     const prevEraTextoLargo =
       prev &&
@@ -567,13 +789,11 @@ const analizarPaginaCompleta = async (
     i++
   }
 
-  // 5. EXTRACCIÓN AUTOMÁTICA DE LOGOS, FIRMAS Y PLECAS GRÁFICAS PARA WORD (.DOCX)
   if (formatoDestino === 'docx') {
     const ctx = canvas.getContext('2d')
     if (ctx) {
       ctx.fillStyle = '#FFFFFF'
 
-      // Borramos del lienzo todas las letras que ya convertimos a texto editable
       for (const item of items) {
         const cx = item.x * scale - 4
         const cy = canvas.height - item.y * scale - item.fontSize * scale * 1.05
@@ -582,14 +802,12 @@ const analizarPaginaCompleta = async (
         ctx.fillRect(cx, cy, cw, ch)
       }
 
-      // Borramos del lienzo las líneas de borde de las tablas que ya convertimos a <w:tbl>
       for (const caja of cajasTablaPdf) {
         const topPx = canvas.height - caja.topY * scale - 4
         const bottomPx = canvas.height - caja.bottomY * scale + 12
         ctx.fillRect(0, topPx, canvas.width, Math.max(10, bottomPx - topPx))
       }
 
-      // Escaneamos qué franjas horizontales tienen gráficos (Logos superiores, firma, logos inferiores)
       const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data
       const filasConGrafico: boolean[] = new Array(canvas.height).fill(false)
 
@@ -608,7 +826,6 @@ const analizarPaginaCompleta = async (
         }
       }
 
-      // Agrupar filas contiguas en bandas gráficas
       const bandas: { startY: number; endY: number }[] = []
       let enBanda = false
       let inicioActual = 0
@@ -656,7 +873,6 @@ const analizarPaginaCompleta = async (
         subCtx.drawImage(canvas, cropLeft, sy, cropWidth, sh, 0, 0, cropWidth, sh)
 
         const pngBytes = await canvasToUint8ArrayDirecto(subCanvas, 'png')
-        // Calculamos la coordenada Y del PDF equivalente a la parte superior de la imagen para insertarla en orden exacto
         const pdfYImagen = (canvas.height - (banda.startY + altoBanda * 0.35)) / scale
 
         bloquesPosicion.push({
@@ -674,9 +890,7 @@ const analizarPaginaCompleta = async (
     }
   }
 
-  // Ordenar todos los bloques (Imágenes, Textos y Tablas) de arriba hacia abajo según su posición Y en la hoja
   bloquesPosicion.sort((a, b) => b.pdfY - a.pdfY)
-
   return bloquesPosicion.map((item) => item.bloque)
 }
 
@@ -701,8 +915,8 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
 
   try {
     const esPdf = ext === 'pdf' || file.type === 'application/pdf'
+    const esDocTexto = ext === 'docx' || ext === 'txt'
 
-    // 1. PDF -> IMAGEN (JPG / PNG / WEBP)
     if (esPdf && ['jpg', 'png', 'webp'].includes(formatoDestino)) {
       const arrayBuffer = await file.arrayBuffer()
       const loadingTask = pdfjsLib.getDocument({
@@ -714,15 +928,17 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
       } as any)
 
       const pdf = await loadingTask.promise
-      const page = await pdf.getPage(1)
+      const paginasBytes: Uint8Array[] = []
 
-      const { canvas } = await renderizarPaginaACanvas(page, 1600)
-      const bytes = await canvasToUint8ArrayDirecto(canvas, formatoDestino)
-      await window.api.guardarBytesDirecto(bytes, formatoDestino, rutaReal)
-    }
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i)
+        const { canvas } = await renderizarPaginaACanvas(page, 1600)
+        const bytes = await canvasToUint8ArrayDirecto(canvas, formatoDestino)
+        paginasBytes.push(bytes)
+      }
 
-    // 2. PDF -> DOCX (CON LOGOS, FIRMA, TABLAS Y FORMATO) O TXT
-    else if (esPdf && (formatoDestino === 'txt' || formatoDestino === 'docx')) {
+      await window.api.guardarPaginasImagen(paginasBytes, formatoDestino, rutaReal)
+    } else if (esPdf && (formatoDestino === 'txt' || formatoDestino === 'docx')) {
       const arrayBuffer = await file.arrayBuffer()
       const loadingTask = pdfjsLib.getDocument({
         data: new Uint8Array(arrayBuffer),
@@ -755,10 +971,22 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
         formatoDestino as 'txt' | 'docx',
         rutaReal
       )
-    }
+    } else if (esDocTexto) {
+      const bloques = await window.api.leerDocumentoTexto(rutaReal)
 
-    // 3. IMAGEN -> PDF / JPG / PNG / WEBP
-    else if (!esPdf) {
+      if (formatoDestino === 'txt' || formatoDestino === 'docx') {
+        await window.api.guardarTextoDocumento(bloques, formatoDestino, rutaReal)
+      } else if (formatoDestino === 'pdf') {
+        const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
+        await window.api.guardarPaginasComoPdf(paginasPng, rutaReal)
+      } else if (formatoDestino === 'jpg' || formatoDestino === 'png') {
+        const paginasImg = await renderizarBloquesAPaginas(
+          bloques,
+          formatoDestino as 'jpg' | 'png'
+        )
+        await window.api.guardarPaginasImagen(paginasImg, formatoDestino, rutaReal)
+      }
+    } else {
       await window.api.convertirImagenBackend(rutaReal, formatoDestino)
     }
   } catch (error: any) {
@@ -873,7 +1101,7 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
             class="px-5 py-2 rounded-full bg-amber-200/55 border border-white/50 shadow-inner backdrop-blur-md flex items-center justify-center min-w-[74px]"
           >
             <span class="text-[#1c1917] font-extrabold text-xs tracking-wider uppercase">
-              {{ opcionActiva ? opcionActiva : tipoDetectado === 'pdf' ? 'PDF' : 'IMG' }}
+              {{ etiquetaCentro }}
             </span>
           </div>
         </div>

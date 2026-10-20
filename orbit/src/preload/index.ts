@@ -40,18 +40,29 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
-  guardarBytesDirecto: (
-    bufferData: Uint8Array,
+  // Guarda una o varias páginas de imagen directamente en la carpeta original
+  guardarPaginasImagen: (
+    paginasBytes: Uint8Array[],
     formatoDestino: string,
     rutaOriginal: string
-  ) => ipcRenderer.invoke('guardar-bytes-directo', bufferData, formatoDestino, rutaOriginal),
+  ) => ipcRenderer.invoke('guardar-paginas-imagen', paginasBytes, formatoDestino, rutaOriginal),
 
+  // Guarda páginas renderizadas dentro de un archivo PDF nuevo
+  guardarPaginasComoPdf: (paginasPngBytes: Uint8Array[], rutaOriginal: string) =>
+    ipcRenderer.invoke('guardar-paginas-como-pdf', paginasPngBytes, rutaOriginal),
+
+  // Guarda bloques estructurados en formato .TXT o .DOCX
   guardarTextoDocumento: (
     bloques: BloqueDocumento[],
     formatoDestino: 'txt' | 'docx',
     rutaOriginal: string
   ) => ipcRenderer.invoke('guardar-texto-documento', bloques, formatoDestino, rutaOriginal),
 
+  // Lee archivos .DOCX o .TXT del disco y devuelve sus párrafos y formatos
+  leerDocumentoTexto: (rutaOriginal: string) =>
+    ipcRenderer.invoke('leer-documento-texto', rutaOriginal),
+
+  // Convierte Imagen -> PDF / JPG / PNG / WEBP con Sharp
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
 

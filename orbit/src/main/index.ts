@@ -1,14 +1,17 @@
-import { app, shell, BrowserWindow, ipcMain, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, screen } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
+import { spawn, ChildProcessWithoutNullStreams } from 'child_process'
 import sharp from 'sharp'
 import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
 import path from 'path'
+import zlib from 'zlib'
 
 let mainWindow: BrowserWindow | null = null
 let shiftPresionado = false
+let shellNotifierProc: ChildProcessWithoutNullStreams | null = null
 
 interface SegmentoTexto {
   texto: string
@@ -32,6 +35,304 @@ interface BloqueDocumento {
   height?: number
 }
 
+// --- NOTIFICADOR NATIVO DE WINDOWS EXPLORER (SHChangeNotify en shell32.dll) ---
+function iniciarNotificadorEscritorio() {
+  if (process.platform !== 'win32') return
+
+  const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class OrbitShell {
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    public static extern void SHChangeNotify(int wEventId, uint uFlags, string dwItem1, IntPtr dwItem2);
+}
+"@
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    if ($line -ne "") {
+        try {
+            $dir = [System.IO.Path]::GetDirectoryName($line)
+            [OrbitShell]::SHChangeNotify(0x00000002, 0x1005, $line, [IntPtr]::Zero)
+            [OrbitShell]::SHChangeNotify(0x00001000, 0x1005, $dir, [IntPtr]::Zero)
+        } catch {}
+    }
+}
+`
+  try {
+    shellNotifierProc = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
+      { windowsHide: true }
+    )
+    shellNotifierProc.on('error', () => {
+      shellNotifierProc = null
+    })
+  } catch {
+    shellNotifierProc = null
+  }
+}
+
+function guardarYRefrescarEscritorio(rutaArchivo: string, datos: Buffer | string) {
+  if (typeof datos === 'string') {
+    fs.writeFileSync(rutaArchivo, datos, 'utf8')
+  } else {
+    const fd = fs.openSync(rutaArchivo, 'w')
+    fs.writeFileSync(fd, datos)
+    fs.fsyncSync(fd)
+    fs.closeSync(fd)
+  }
+
+  // Dispara el refresco instantáneo del Escritorio en Windows
+  if (shellNotifierProc && shellNotifierProc.stdin.writable) {
+    shellNotifierProc.stdin.write(`${rutaArchivo}\n`)
+  }
+}
+
+function obtenerRutaSalida(rutaOriginal: string, extDestino: string, sufijo = ''): string {
+  const parsed = path.parse(rutaOriginal)
+  const base = `${parsed.name}${sufijo}`
+  let candidato = path.join(parsed.dir, `${base}.${extDestino}`)
+  let contador = 1
+
+  while (fs.existsSync(candidato)) {
+    candidato = path.join(parsed.dir, `${base} (${contador}).${extDestino}`)
+    contador++
+  }
+  return candidato
+}
+
+// --- EXTRACTOR BINARIO Y XML DE ARCHIVOS ZIP (.DOCX) ---
+function extraerBufferDeZip(zipBuf: Buffer, nombreBuscado: string): Buffer | null {
+  let eocdOffset = -1
+  for (let i = zipBuf.length - 22; i >= Math.max(0, zipBuf.length - 65557); i--) {
+    if (zipBuf.readUInt32LE(i) === 0x06054b50) {
+      eocdOffset = i
+      break
+    }
+  }
+  if (eocdOffset === -1) return null
+
+  const totalEntries = zipBuf.readUInt16LE(eocdOffset + 10)
+  let cdOffset = zipBuf.readUInt32LE(eocdOffset + 16)
+  const buscadoNorm = nombreBuscado.replace(/\\/g, '/').replace(/^\//, '')
+
+  for (let i = 0; i < totalEntries; i++) {
+    if (cdOffset + 46 > zipBuf.length || zipBuf.readUInt32LE(cdOffset) !== 0x02014b50) break
+
+    const method = zipBuf.readUInt16LE(cdOffset + 10)
+    const compSize = zipBuf.readUInt32LE(cdOffset + 20)
+    const nameLen = zipBuf.readUInt16LE(cdOffset + 28)
+    const extraLen = zipBuf.readUInt16LE(cdOffset + 30)
+    const commentLen = zipBuf.readUInt16LE(cdOffset + 32)
+    const localHeaderOffset = zipBuf.readUInt32LE(cdOffset + 42)
+
+    const fileName = zipBuf
+      .toString('utf8', cdOffset + 46, cdOffset + 46 + nameLen)
+      .replace(/\\/g, '/')
+
+    if (fileName === buscadoNorm) {
+      const localNameLen = zipBuf.readUInt16LE(localHeaderOffset + 26)
+      const localExtraLen = zipBuf.readUInt16LE(localHeaderOffset + 28)
+      const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen
+      const compData = zipBuf.subarray(dataStart, dataStart + compSize)
+
+      if (method === 0) return Buffer.from(compData)
+      if (method === 8) return zlib.inflateRawSync(compData)
+      return null
+    }
+
+    cdOffset += 46 + nameLen + extraLen + commentLen
+  }
+  return null
+}
+
+function decodificarEntidadesXml(str: string): string {
+  return str
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+function extraerSegmentosDeRuns(xmlContenedor: string): {
+  segmentos: SegmentoTexto[]
+  textoCompleto: string
+  maxFontSize: number
+  tieneBold: boolean
+} {
+  const segmentos: SegmentoTexto[] = []
+  let textoCompleto = ''
+  let maxFontSize = 10.5
+  let tieneBold = false
+
+  const runsMatch = xmlContenedor.match(/<w:r[\s>][\s\S]*?<\/w:r>/g) || []
+  for (const rXml of runsMatch) {
+    const isBold = /<w:b(\s|\/|>)/i.test(rXml) && !/<w:b[^>]*w:val="(false|0)"/i.test(rXml)
+    let fontSize = 10.5
+    const szMatch = rXml.match(/<w:sz[^>]*w:val="(\d+)"/i)
+    if (szMatch) {
+      fontSize = Math.max(7.5, Math.min(36, parseInt(szMatch[1], 10) / 2))
+    }
+
+    const textosMatch = rXml.match(/<w:t(?:\s[^>]*)?>([\s\S]*?)<\/w:t>/g) || []
+    let runTexto = ''
+    for (const tNode of textosMatch) {
+      const inner = tNode.replace(/^<w:t(?:\s[^>]*)?>/, '').replace(/<\/w:t>$/, '')
+      runTexto += decodificarEntidadesXml(inner)
+    }
+    if (/<w:tab(\s|\/|>)/i.test(rXml)) runTexto += '    '
+
+    if (runTexto) {
+      segmentos.push({ texto: runTexto, bold: isBold, fontSize })
+      textoCompleto += runTexto
+      if (fontSize > maxFontSize) maxFontSize = fontSize
+      if (isBold) tieneBold = true
+    }
+  }
+
+  return { segmentos, textoCompleto, maxFontSize, tieneBold }
+}
+
+// --- PARSER COMPLETO DE .DOCX (Lee Imágenes incrustadas, Tablas y Texto con formato) ---
+async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]> {
+  const zipBuf = await fs.promises.readFile(rutaDocx)
+  const docBuf = extraerBufferDeZip(zipBuf, 'word/document.xml')
+  if (!docBuf) return [{ tipo: 'texto', texto: '[No se pudo abrir el archivo DOCX]' }]
+
+  const xml = docBuf.toString('utf8')
+
+  // 1. Mapa de relaciones para localizar imágenes (rId -> word/media/imageX.png)
+  const relsMap: Record<string, string> = {}
+  const relsBuf = extraerBufferDeZip(zipBuf, 'word/_rels/document.xml.rels')
+  if (relsBuf) {
+    const relsXml = relsBuf.toString('utf8')
+    const relsMatch = relsXml.match(/<Relationship\s+[^>]*\/?>/gi) || []
+    for (const relNode of relsMatch) {
+      const idMatch = relNode.match(/\bId="([^"]+)"/i)
+      const targetMatch = relNode.match(/\bTarget="([^"]+)"/i)
+      if (idMatch && targetMatch) {
+        let target = targetMatch[1].replace(/\\/g, '/')
+        if (target.startsWith('/')) target = target.slice(1)
+        else if (!target.startsWith('word/')) target = `word/${target}`
+        relsMap[idMatch[1]] = target
+      }
+    }
+  }
+
+  const bloques: BloqueDocumento[] = []
+  const bodyMatch = xml.match(/<w:body[^>]*>([\s\S]*?)<\/w:body>/i)
+  const contenidoBody = bodyMatch ? bodyMatch[1] : xml
+
+  // Recorremos en orden exacto tanto Tablas (<w:tbl>) como Párrafos (<w:p>)
+  const elementosRegex = /<w:tbl[\s>][\s\S]*?<\/w:tbl>|<w:p[\s>][\s\S]*?<\/w:p>/g
+  const elementos = contenidoBody.match(elementosRegex) || []
+
+  for (const elXml of elementos) {
+    // CASO A: TABLA (<w:tbl>)
+    if (elXml.startsWith('<w:tbl')) {
+      const filasTabla: SegmentoTexto[][][] = []
+      const trs = elXml.match(/<w:tr[\s>][\s\S]*?<\/w:tr>/g) || []
+
+      for (const trXml of trs) {
+        const fila: SegmentoTexto[][] = []
+        const tcs = trXml.match(/<w:tc[\s>][\s\S]*?<\/w:tc>/g) || []
+        for (const tcXml of tcs) {
+          const { segmentos } = extraerSegmentosDeRuns(tcXml)
+          fila.push(segmentos.length > 0 ? segmentos : [{ texto: '', fontSize: 10 }])
+        }
+        if (fila.length > 0) filasTabla.push(fila)
+      }
+
+      if (filasTabla.length > 0) {
+        bloques.push({ tipo: 'tabla', filasTabla })
+      }
+      continue
+    }
+
+    // CASO B: PÁRRAFO (<w:p>)
+    const pXml = elXml
+    if (/<w:br[^>]*w:type="page"/i.test(pXml)) {
+      bloques.push({ tipo: 'salto_pagina' })
+    }
+
+    let align: 'left' | 'center' | 'right' | 'both' = 'left'
+    const jcMatch = pXml.match(/<w:jc[^>]*w:val="([^"]+)"/i)
+    if (jcMatch) {
+      const val = jcMatch[1].toLowerCase()
+      if (val === 'center') align = 'center'
+      else if (val === 'right' || val === 'end') align = 'right'
+      else if (val === 'both' || val === 'distribute') align = 'both'
+    }
+
+    let indentLeft = 0
+    const indMatch = pXml.match(/<w:ind[^>]*w:left="(\d+)"/i)
+    if (indMatch) {
+      indentLeft = parseInt(indMatch[1], 10)
+    }
+
+    // Buscar si el párrafo tiene imágenes incrustadas (<a:blip r:embed="rId..."/>)
+    const embedMatches = [...pXml.matchAll(/r:(?:embed|id)="([^"]+)"/gi)]
+    for (const match of embedMatches) {
+      const rId = match[1]
+      const zipTarget = relsMap[rId]
+      if (!zipTarget) continue
+
+      const rawImgBuf = extraerBufferDeZip(zipBuf, zipTarget)
+      if (!rawImgBuf) continue
+
+      try {
+        const pngBuf = await sharp(rawImgBuf).png().toBuffer()
+        const meta = await sharp(pngBuf).metadata()
+
+        let width = meta.width || 600
+        let height = meta.height || 400
+
+        // Respetar proporción definida en Word si existe <wp:extent cx="..." cy="..."/>
+        const extentMatch = pXml.match(/<wp:extent[^>]*cx="(\d+)"[^>]*cy="(\d+)"/i)
+        if (extentMatch) {
+          const cxEmu = parseInt(extentMatch[1], 10)
+          const cyEmu = parseInt(extentMatch[2], 10)
+          if (cxEmu > 0 && cyEmu > 0) {
+            width = Math.round(cxEmu / 9525)
+            height = Math.round(cyEmu / 9525)
+          }
+        }
+
+        bloques.push({
+          tipo: 'imagen',
+          pngBytes: new Uint8Array(pngBuf),
+          width,
+          height,
+          align
+        })
+      } catch (e) {
+        console.error('Error procesando imagen interna de DOCX:', e)
+      }
+    }
+
+    // Extraer texto del párrafo
+    const { segmentos, textoCompleto, maxFontSize, tieneBold } = extraerSegmentosDeRuns(pXml)
+    if (textoCompleto.trim()) {
+      bloques.push({
+        tipo: 'texto',
+        texto: textoCompleto,
+        segmentos,
+        fontSize: maxFontSize,
+        bold: tieneBold,
+        align,
+        indentLeft,
+        espacioDespues: 60
+      })
+    }
+  }
+
+  return bloques
+}
+
+// --- EMPAQUETADOR ZIP NATIVO PARA CREAR .DOCX ---
 function crc32(buf: Buffer): number {
   let crc = -1
   for (let i = 0; i < buf.length; i++) {
@@ -139,7 +440,6 @@ function generarDocxEstructurado(bloques: BloqueDocumento[]): Buffer {
       continue
     }
 
-    // 1. BLOQUE DE IMAGEN / FRANJA GRÁFICA (Logos, Firma, Pleca)
     if (b.tipo === 'imagen' && b.pngBytes && b.pngBytes.byteLength > 0) {
       imgCounter++
       const rId = `rIdImg${imgCounter}`
@@ -156,7 +456,7 @@ function generarDocxEstructurado(bloques: BloqueDocumento[]): Buffer {
 
       const imgW = b.width || 800
       const imgH = b.height || 200
-      const maxWidthEmu = 6050000 // ~16.8 cm (ancho útil de la hoja)
+      const maxWidthEmu = 6050000
       const maxHeightEmu = 7600000
 
       let cx = Math.round(imgW * 9525)
@@ -214,7 +514,6 @@ function generarDocxEstructurado(bloques: BloqueDocumento[]): Buffer {
       continue
     }
 
-    // 2. BLOQUE DE TABLA CON BORDES REALES (<w:tbl>)
     if (b.tipo === 'tabla' && b.filasTabla && b.filasTabla.length > 0) {
       const numCols = Math.max(...b.filasTabla.map((f) => f.length))
       const anchoTotalTwips = 9360
@@ -262,7 +561,6 @@ function generarDocxEstructurado(bloques: BloqueDocumento[]): Buffer {
       continue
     }
 
-    // 3. BLOQUE DE TEXTO (Soporta negritas parciales por palabra/segmento y alineación derecha)
     if (b.tipo === 'texto') {
       const align = b.align || 'left'
       const before = b.espacioAntes ?? 0
@@ -376,6 +674,7 @@ function createWindow(): BrowserWindow {
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.orbit.converter')
+  iniciarNotificadorEscritorio()
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
@@ -431,23 +730,51 @@ app.whenReady().then(() => {
     }
   })
 
+  // 1. GUARDAR PÁGINAS DE IMAGEN Y REFRESCAR ESCRITORIO AL INSTANTE
   ipcMain.handle(
-    'guardar-bytes-directo',
-    async (_, bufferData: Uint8Array, formatoDestino: string, rutaOriginal: string) => {
+    'guardar-paginas-imagen',
+    async (_, paginasBytes: Uint8Array[], formatoDestino: string, rutaOriginal: string) => {
       try {
-        const parsedPath = path.parse(rutaOriginal)
-        const newPath = path.join(parsedPath.dir, `${parsedPath.name}_orbit.${formatoDestino}`)
-
-        await fs.promises.writeFile(newPath, Buffer.from(bufferData))
-        setTimeout(() => shell.showItemInFolder(newPath), 10)
+        if (paginasBytes.length === 1) {
+          const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
+          guardarYRefrescarEscritorio(outPath, Buffer.from(paginasBytes[0]))
+        } else {
+          for (let i = 0; i < paginasBytes.length; i++) {
+            const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino, `_pag${i + 1}`)
+            guardarYRefrescarEscritorio(outPath, Buffer.from(paginasBytes[i]))
+          }
+        }
         return true
       } catch (error) {
-        console.error('Error al guardar bytes:', error)
+        console.error('Error al guardar páginas de imagen:', error)
         return false
       }
     }
   )
 
+  // 2. GUARDAR PÁGINAS RENDERIZADAS COMO UN DOCUMENTO .PDF
+  ipcMain.handle(
+    'guardar-paginas-como-pdf',
+    async (_, paginasPngBytes: Uint8Array[], rutaOriginal: string) => {
+      try {
+        const pdfDoc = await PDFDocument.create()
+        for (const pngBytes of paginasPngBytes) {
+          const img = await pdfDoc.embedPng(pngBytes)
+          const page = pdfDoc.addPage([612, 792])
+          page.drawImage(img, { x: 0, y: 0, width: 612, height: 792 })
+        }
+        const pdfBytes = await pdfDoc.save()
+        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf')
+        guardarYRefrescarEscritorio(outPath, Buffer.from(pdfBytes))
+        return true
+      } catch (error) {
+        console.error('Error creando PDF desde documento:', error)
+        return false
+      }
+    }
+  )
+
+  // 3. GUARDAR DOCUMENTO .DOCX O .TXT
   ipcMain.handle(
     'guardar-texto-documento',
     async (
@@ -457,8 +784,7 @@ app.whenReady().then(() => {
       rutaOriginal: string
     ) => {
       try {
-        const parsedPath = path.parse(rutaOriginal)
-        const newPath = path.join(parsedPath.dir, `${parsedPath.name}_orbit.${formatoDestino}`)
+        const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
 
         if (formatoDestino === 'txt') {
           const lineasTxt: string[] = []
@@ -482,14 +808,12 @@ app.whenReady().then(() => {
           const contenidoFinal =
             lineasTxt.length > 0
               ? lineasTxt.join('\r\n')
-              : '[Este PDF contiene únicamente imágenes sin texto seleccionable]'
-          await fs.promises.writeFile(newPath, contenidoFinal, 'utf8')
+              : '[Este documento contiene únicamente imágenes sin texto seleccionable]'
+          guardarYRefrescarEscritorio(outPath, contenidoFinal)
         } else {
           const docxBuffer = generarDocxEstructurado(bloques)
-          await fs.promises.writeFile(newPath, docxBuffer)
+          guardarYRefrescarEscritorio(outPath, docxBuffer)
         }
-
-        setTimeout(() => shell.showItemInFolder(newPath), 10)
         return true
       } catch (error) {
         console.error('Error al guardar documento:', error)
@@ -498,12 +822,38 @@ app.whenReady().then(() => {
     }
   )
 
+  // 4. LEER ARCHIVOS .DOCX (CON IMÁGENES Y TABLAS) O .TXT DESDE EL DISCO
+  ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
+    try {
+      const ext = path.extname(rutaOriginal).toLowerCase()
+      if (ext === '.docx') {
+        return await parsearDocxABloques(rutaOriginal)
+      } else {
+        const contenido = await fs.promises.readFile(rutaOriginal, 'utf8')
+        const lineas = contenido.split(/\r?\n/)
+        const bloques: BloqueDocumento[] = lineas.map((linea) => ({
+          tipo: 'texto',
+          texto: linea,
+          segmentos: [{ texto: linea, fontSize: 11, bold: false }],
+          fontSize: 11,
+          bold: false,
+          align: 'left',
+          espacioDespues: 60
+        }))
+        return bloques
+      }
+    } catch (error) {
+      console.error('Error leyendo documento:', error)
+      return []
+    }
+  })
+
+  // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES EN BACKEND
   ipcMain.handle(
     'convertir-imagen-backend',
     async (_, rutaOriginal: string, formatoDestino: string) => {
       try {
-        const parsedPath = path.parse(rutaOriginal)
-        const newPath = path.join(parsedPath.dir, `${parsedPath.name}_orbit.${formatoDestino}`)
+        const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
 
         if (formatoDestino === 'pdf') {
           const pngBuffer = await sharp(rutaOriginal).rotate().png().toBuffer()
@@ -514,20 +864,22 @@ app.whenReady().then(() => {
           page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
 
           const pdfBytes = await pdfDoc.save()
-          await fs.promises.writeFile(newPath, pdfBytes)
+          guardarYRefrescarEscritorio(outPath, Buffer.from(pdfBytes))
         } else if (formatoDestino === 'jpg') {
-          await sharp(rutaOriginal)
+          const outBuf = await sharp(rutaOriginal)
             .rotate()
             .flatten({ background: '#ffffff' })
             .jpeg({ quality: 92 })
-            .toFile(newPath)
+            .toBuffer()
+          guardarYRefrescarEscritorio(outPath, outBuf)
         } else if (formatoDestino === 'png') {
-          await sharp(rutaOriginal).rotate().png().toFile(newPath)
+          const outBuf = await sharp(rutaOriginal).rotate().png().toBuffer()
+          guardarYRefrescarEscritorio(outPath, outBuf)
         } else if (formatoDestino === 'webp') {
-          await sharp(rutaOriginal).rotate().webp({ quality: 92 }).toFile(newPath)
+          const outBuf = await sharp(rutaOriginal).rotate().webp({ quality: 92 }).toBuffer()
+          guardarYRefrescarEscritorio(outPath, outBuf)
         }
 
-        setTimeout(() => shell.showItemInFolder(newPath), 10)
         return true
       } catch (error) {
         console.error('Error convirtiendo imagen:', error)
@@ -539,6 +891,9 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   uIOhook.stop()
+  if (shellNotifierProc) {
+    shellNotifierProc.kill()
+  }
   if (process.platform !== 'darwin') {
     app.quit()
   }
