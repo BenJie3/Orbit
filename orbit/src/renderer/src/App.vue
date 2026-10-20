@@ -3,7 +3,6 @@ import { ref, computed, onMounted } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
 
-// --- 1. PARCHES DE COMPATIBILIDAD PARA CHROMIUM / ELECTRON CON PDF.JS MODERNO ---
 if (typeof (Promise as any).try !== 'function') {
   ;(Promise as any).try = function (callback: Function, ...args: any[]) {
     return new Promise((resolve) => resolve(callback(...args)))
@@ -60,13 +59,39 @@ if (typeof (RegExp as any).escape !== 'function') {
   }
 }
 
-// --- 2. CONFIGURACIÓN DEL MOTOR PDF.JS EN HILO PRINCIPAL CON URL REAL DE VITE ---
 ;(window as any).Worker = undefined
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
-// Evita que Chromium pause el renderizado por estar en una ventana sin foco
 window.requestAnimationFrame = (cb: FrameRequestCallback): number => {
   return window.setTimeout(() => cb(performance.now()), 0)
+}
+
+interface SegmentoTexto {
+  texto: string
+  bold?: boolean
+  fontSize?: number
+}
+
+interface BloqueDocumento {
+  tipo: 'texto' | 'imagen' | 'tabla' | 'salto_pagina'
+  texto?: string
+  segmentos?: SegmentoTexto[]
+  filasTabla?: SegmentoTexto[][][]
+  fontSize?: number
+  bold?: boolean
+  align?: 'left' | 'center' | 'right' | 'both'
+  indentLeft?: number
+  espacioAntes?: number
+  espacioDespues?: number
+  pngBytes?: Uint8Array
+  width?: number
+  height?: number
+}
+
+interface BloqueConPosicion {
+  pdfY: number
+  pdfBottomY: number
+  bloque: BloqueDocumento
 }
 
 declare global {
@@ -80,7 +105,7 @@ declare global {
         rutaOriginal: string
       ) => Promise<boolean>
       guardarTextoDocumento: (
-        parrafos: string[],
+        bloques: BloqueDocumento[],
         formatoDestino: 'txt' | 'docx',
         rutaOriginal: string
       ) => Promise<boolean>
@@ -219,13 +244,440 @@ const canvasToUint8ArrayDirecto = (
   })
 }
 
-const conTimeout = <T>(promesa: Promise<T>, nombrePaso: string, ms = 10000): Promise<T> => {
-  return Promise.race([
-    promesa,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`TIMEOUT: Se quedó colgado en -> ${nombrePaso}`)), ms)
-    )
-  ])
+const renderizarPaginaACanvas = async (
+  page: any,
+  maxLado = 1400
+): Promise<{ canvas: HTMLCanvasElement; scale: number; pageWidth: number; pageHeight: number }> => {
+  const baseVp = page.getViewport({ scale: 1.0 })
+  const ladoMayor = Math.max(baseVp.width, baseVp.height)
+  const scale = Math.min(2.0, Math.max(1.2, maxLado / ladoMayor))
+  const viewport = page.getViewport({ scale })
+
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d', { alpha: false })
+  if (!context) throw new Error('Error en canvas 2D')
+
+  canvas.width = Math.floor(viewport.width)
+  canvas.height = Math.floor(viewport.height)
+  context.fillStyle = '#FFFFFF'
+  context.fillRect(0, 0, canvas.width, canvas.height)
+
+  const renderTask = page.render({ canvasContext: context, viewport } as any)
+  await renderTask.promise
+
+  return { canvas, scale, pageWidth: baseVp.width, pageHeight: baseVp.height }
+}
+
+// --- DETECTOR DE NEGRITAS REALES LEYENDO LOS OBJETOS DE FUENTE INTERNOS DEL PDF ---
+const esFuenteNegrita = (page: any, styles: any, fontKey: string, fontSize: number): boolean => {
+  let nombreReal = String(fontKey || '').toLowerCase()
+  const styleFamily = String(styles[fontKey]?.fontFamily || '').toLowerCase()
+
+  try {
+    if (page.commonObjs && page.commonObjs.has(fontKey)) {
+      const fontObj = page.commonObjs.get(fontKey)
+      if (fontObj) {
+        if (fontObj.bold || fontObj.black) return true
+        if (fontObj.name) nombreReal += ' ' + String(fontObj.name).toLowerCase()
+      }
+    }
+  } catch {}
+
+  return (
+    nombreReal.includes('bold') ||
+    nombreReal.includes('black') ||
+    nombreReal.includes('heavy') ||
+    nombreReal.includes('demi') ||
+    nombreReal.includes('semibold') ||
+    nombreReal.includes('-b') ||
+    nombreReal.includes(',b') ||
+    styleFamily.includes('bold') ||
+    fontSize >= 13.5
+  )
+}
+
+// --- ANALIZADOR DE ESTRUCTURA VISUAL DEL PDF (Texto rico, Tablas y Cajas para Recorte Gráfico) ---
+const analizarPaginaCompleta = async (
+  page: any,
+  textContent: any,
+  formatoDestino: 'txt' | 'docx'
+): Promise<BloqueDocumento[]> => {
+  // Renderizamos primero la página para poblar commonObjs (fuentes reales) y tener el lienzo para recortar logos/firmas
+  const { canvas, scale, pageWidth, pageHeight } = await renderizarPaginaACanvas(page, 1400)
+  const styles = textContent.styles || {}
+
+  interface ItemTexto {
+    str: string
+    x: number
+    y: number
+    w: number
+    fontSize: number
+    bold: boolean
+  }
+
+  const items: ItemTexto[] = []
+  for (const raw of textContent.items) {
+    const str = raw.str || ''
+    if (!str.trim()) continue
+
+    const tx = raw.transform || [10, 0, 0, 10, 0, 0]
+    const rawSize = Math.hypot(tx[0], tx[1]) || raw.height || 10
+    const fontSize = Math.max(7.5, Math.min(28, Math.round(rawSize * 2) / 2))
+    const bold = esFuenteNegrita(page, styles, raw.fontName, fontSize)
+
+    items.push({
+      str,
+      x: tx[4],
+      y: tx[5],
+      w: raw.width || str.length * (fontSize * 0.52),
+      fontSize,
+      bold
+    })
+  }
+
+  // Si la página es 100% imagen escaneada sin nada de texto
+  if (items.length === 0) {
+    if (formatoDestino === 'docx') {
+      const bytes = await canvasToUint8ArrayDirecto(canvas, 'png')
+      return [{ tipo: 'imagen', pngBytes: bytes, width: canvas.width, height: canvas.height }]
+    }
+    return []
+  }
+
+  // 1. Ordenar de arriba hacia abajo (Y descendente) y de izquierda a derecha (X ascendente)
+  items.sort((a, b) => {
+    const tol = Math.max(a.fontSize, b.fontSize) * 0.42
+    if (Math.abs(a.y - b.y) <= tol) return a.x - b.x
+    return b.y - a.y
+  })
+
+  // 2. Agrupar en renglones
+  interface Renglon {
+    y: number
+    minX: number
+    maxX: number
+    fontSize: number
+    bold: boolean
+    items: ItemTexto[]
+    celdas: SegmentoTexto[][]
+    textoPlano: string
+  }
+
+  const renglones: Renglon[] = []
+  for (const item of items) {
+    const ultimo = renglones[renglones.length - 1]
+    const tolY = ultimo ? Math.max(ultimo.fontSize, item.fontSize) * 0.45 : 0
+
+    if (ultimo && Math.abs(item.y - ultimo.y) <= tolY) {
+      ultimo.items.push(item)
+      ultimo.minX = Math.min(ultimo.minX, item.x)
+      ultimo.maxX = Math.max(ultimo.maxX, item.x + item.w)
+      if (item.fontSize > ultimo.fontSize) ultimo.fontSize = item.fontSize
+      if (item.bold) ultimo.bold = true
+    } else {
+      renglones.push({
+        y: item.y,
+        minX: item.x,
+        maxX: item.x + item.w,
+        fontSize: item.fontSize,
+        bold: item.bold,
+        items: [item],
+        celdas: [],
+        textoPlano: ''
+      })
+    }
+  }
+
+  // 3. Construir segmentos con negritas mixtas y detectar columnas de tabla
+  for (const r of renglones) {
+    r.items.sort((a, b) => a.x - b.x)
+    const celdas: SegmentoTexto[][] = [[]]
+    let textoPlano = ''
+
+    for (let i = 0; i < r.items.length; i++) {
+      const actual = r.items[i]
+      let prefijo = ''
+
+      if (i > 0) {
+        const prev = r.items[i - 1]
+        const gap = actual.x - (prev.x + prev.w)
+
+        // Si hay un salto horizontal grande hacia la mitad de la página, es una nueva columna de tabla
+        if (gap > r.fontSize * 2.1 && actual.x > pageWidth * 0.35) {
+          celdas.push([])
+          textoPlano += '    '
+        } else if (
+          gap > r.fontSize * 0.12 &&
+          !textoPlano.endsWith(' ') &&
+          !actual.str.startsWith(' ')
+        ) {
+          prefijo = ' '
+          textoPlano += ' '
+        }
+      }
+
+      const celdaActual = celdas[celdas.length - 1]
+      const textoConEspacio = prefijo + actual.str
+      textoPlano += actual.str
+
+      const ultimoSeg = celdaActual[celdaActual.length - 1]
+      if (
+        ultimoSeg &&
+        ultimoSeg.bold === actual.bold &&
+        Math.abs((ultimoSeg.fontSize || r.fontSize) - actual.fontSize) <= 0.5
+      ) {
+        ultimoSeg.texto += textoConEspacio
+      } else {
+        celdaActual.push({
+          texto: textoConEspacio,
+          bold: actual.bold,
+          fontSize: actual.fontSize
+        })
+      }
+    }
+
+    r.celdas = celdas
+    r.textoPlano = textoPlano.trim()
+  }
+
+  const minXPagina = Math.min(...renglones.map((r) => r.minX))
+  const maxXPagina = Math.max(...renglones.map((r) => r.maxX))
+  const anchoUtil = Math.max(200, maxXPagina - minXPagina)
+
+  // 4. Construir bloques de texto y agrupar filas de tablas (<w:tbl>)
+  const bloquesPosicion: BloqueConPosicion[] = []
+  const cajasTablaPdf: { topY: number; bottomY: number }[] = []
+
+  let i = 0
+  while (i < renglones.length) {
+    const r = renglones[i]
+
+    // Si este renglón tiene 2 o más columnas (ej. Tabla de Dirección / Teléfono / Correo)
+    if (r.celdas.length >= 2) {
+      const filasTabla: SegmentoTexto[][][] = [r.celdas]
+      const topY = r.y + r.fontSize * 1.2
+      let bottomY = r.y - r.fontSize * 1.6
+
+      let j = i + 1
+      while (j < renglones.length && renglones[j].celdas.length >= 2) {
+        filasTabla.push(renglones[j].celdas)
+        bottomY = renglones[j].y - renglones[j].fontSize * 1.6
+        j++
+      }
+
+      cajasTablaPdf.push({ topY, bottomY })
+      bloquesPosicion.push({
+        pdfY: r.y,
+        pdfBottomY: bottomY,
+        bloque: {
+          tipo: 'tabla',
+          filasTabla
+        }
+      })
+
+      i = j
+      continue
+    }
+
+    const prev = i > 0 ? renglones[i - 1] : null
+    const deltaY = prev ? prev.y - r.y : 0
+
+    const centroRenglon = (r.minX + r.maxX) / 2
+    const centroPagina = pageWidth / 2
+    const anchoRenglon = r.maxX - r.minX
+
+    // Detectar alineación Derecha (ej. Fecha "Acapulco, Gro..." y Subencabezado derecho)
+    const esDerecha =
+      r.minX > pageWidth * 0.44 &&
+      r.maxX >= maxXPagina - 55 &&
+      anchoRenglon < anchoUtil * 0.65
+
+    // Detectar alineación Centrada (ej. Título "SOLICITUD DEL ESTUDIANTE" o pie de página centrado)
+    const esCentrado =
+      !esDerecha &&
+      anchoRenglon < anchoUtil * 0.82 &&
+      Math.abs(centroRenglon - centroPagina) < pageWidth * 0.08 &&
+      r.minX - minXPagina > 22
+
+    const align: 'left' | 'center' | 'right' | 'both' = esDerecha
+      ? 'right'
+      : esCentrado
+        ? 'center'
+        : 'left'
+
+    const esLista = /^([a-zA-Z0-9][\.\)]|\u2022|-|\*)\s/.test(r.textoPlano)
+
+    // Solo unir renglones si son un párrafo largo corrido de margen a margen
+    const ultimoItem = bloquesPosicion[bloquesPosicion.length - 1]
+    const prevEraTextoLargo =
+      prev &&
+      prev.celdas.length === 1 &&
+      prev.minX < minXPagina + 25 &&
+      prev.maxX > minXPagina + anchoUtil * 0.82
+
+    const puedeUnirse =
+      ultimoItem &&
+      ultimoItem.bloque.tipo === 'texto' &&
+      ultimoItem.bloque.align !== 'center' &&
+      ultimoItem.bloque.align !== 'right' &&
+      align === 'left' &&
+      prevEraTextoLargo &&
+      !esLista &&
+      prev &&
+      Math.abs(prev.fontSize - r.fontSize) <= 0.5 &&
+      prev.bold === r.bold &&
+      deltaY > 0 &&
+      deltaY <= r.fontSize * 1.45
+
+    if (puedeUnirse && ultimoItem.bloque.segmentos) {
+      ultimoItem.bloque.segmentos.push({
+        texto: ' ' + r.textoPlano,
+        bold: r.bold,
+        fontSize: r.fontSize
+      })
+      ultimoItem.bloque.texto = (ultimoItem.bloque.texto || '') + ' ' + r.textoPlano
+      ultimoItem.bloque.align = 'both'
+      ultimoItem.pdfBottomY = r.y - r.fontSize
+    } else {
+      const espacioAntes =
+        prev && deltaY > r.fontSize * 1.75
+          ? Math.min(220, Math.round((deltaY - r.fontSize) * 8.5))
+          : 0
+
+      const sangriaPuntos = align === 'left' ? Math.max(0, r.minX - minXPagina) : 0
+      const indentLeft = sangriaPuntos > 18 ? Math.min(2400, Math.round(sangriaPuntos * 16)) : 0
+
+      bloquesPosicion.push({
+        pdfY: r.y,
+        pdfBottomY: r.y - r.fontSize,
+        bloque: {
+          tipo: 'texto',
+          texto: r.textoPlano,
+          segmentos: r.celdas[0],
+          fontSize: r.fontSize,
+          bold: r.bold,
+          align,
+          indentLeft,
+          espacioAntes,
+          espacioDespues: r.fontSize >= 12 ? 60 : 25
+        }
+      })
+    }
+
+    i++
+  }
+
+  // 5. EXTRACCIÓN AUTOMÁTICA DE LOGOS, FIRMAS Y PLECAS GRÁFICAS PARA WORD (.DOCX)
+  if (formatoDestino === 'docx') {
+    const ctx = canvas.getContext('2d')
+    if (ctx) {
+      ctx.fillStyle = '#FFFFFF'
+
+      // Borramos del lienzo todas las letras que ya convertimos a texto editable
+      for (const item of items) {
+        const cx = item.x * scale - 4
+        const cy = canvas.height - item.y * scale - item.fontSize * scale * 1.05
+        const cw = item.w * scale + 8
+        const ch = item.fontSize * scale * 1.4
+        ctx.fillRect(cx, cy, cw, ch)
+      }
+
+      // Borramos del lienzo las líneas de borde de las tablas que ya convertimos a <w:tbl>
+      for (const caja of cajasTablaPdf) {
+        const topPx = canvas.height - caja.topY * scale - 4
+        const bottomPx = canvas.height - caja.bottomY * scale + 12
+        ctx.fillRect(0, topPx, canvas.width, Math.max(10, bottomPx - topPx))
+      }
+
+      // Escaneamos qué franjas horizontales tienen gráficos (Logos superiores, firma, logos inferiores)
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height).data
+      const filasConGrafico: boolean[] = new Array(canvas.height).fill(false)
+
+      const margenBorde = Math.floor(canvas.width * 0.03)
+      for (let py = 8; py < canvas.height - 8; py++) {
+        let pixelesNoBlancos = 0
+        for (let px = margenBorde; px < canvas.width - margenBorde; px++) {
+          const idx = (py * canvas.width + px) * 4
+          if (imgData[idx] < 242 || imgData[idx + 1] < 242 || imgData[idx + 2] < 242) {
+            pixelesNoBlancos++
+            if (pixelesNoBlancos >= 4) {
+              filasConGrafico[py] = true
+              break
+            }
+          }
+        }
+      }
+
+      // Agrupar filas contiguas en bandas gráficas
+      const bandas: { startY: number; endY: number }[] = []
+      let enBanda = false
+      let inicioActual = 0
+      let huecos = 0
+
+      for (let py = 0; py < canvas.height; py++) {
+        if (filasConGrafico[py]) {
+          if (!enBanda) {
+            enBanda = true
+            inicioActual = py
+          }
+          huecos = 0
+        } else if (enBanda) {
+          huecos++
+          if (huecos > Math.round(14 * scale)) {
+            bandas.push({ startY: inicioActual, endY: py - huecos })
+            enBanda = false
+          }
+        }
+      }
+      if (enBanda) {
+        bandas.push({ startY: inicioActual, endY: canvas.height - 1 })
+      }
+
+      const cropLeft = Math.floor(Math.max(0, (minXPagina - 10) * scale))
+      const cropRight = Math.min(canvas.width, Math.ceil((maxXPagina + 15) * scale))
+      const cropWidth = Math.max(200, cropRight - cropLeft)
+
+      for (const banda of bandas) {
+        const altoBanda = banda.endY - banda.startY
+        if (altoBanda < Math.round(12 * scale)) continue
+
+        const padY = 4
+        const sy = Math.max(0, banda.startY - padY)
+        const sh = Math.min(canvas.height - sy, altoBanda + padY * 2)
+
+        const subCanvas = document.createElement('canvas')
+        subCanvas.width = cropWidth
+        subCanvas.height = sh
+        const subCtx = subCanvas.getContext('2d', { alpha: false })
+        if (!subCtx) continue
+
+        subCtx.fillStyle = '#FFFFFF'
+        subCtx.fillRect(0, 0, cropWidth, sh)
+        subCtx.drawImage(canvas, cropLeft, sy, cropWidth, sh, 0, 0, cropWidth, sh)
+
+        const pngBytes = await canvasToUint8ArrayDirecto(subCanvas, 'png')
+        // Calculamos la coordenada Y del PDF equivalente a la parte superior de la imagen para insertarla en orden exacto
+        const pdfYImagen = (canvas.height - (banda.startY + altoBanda * 0.35)) / scale
+
+        bloquesPosicion.push({
+          pdfY: pdfYImagen,
+          pdfBottomY: (canvas.height - banda.endY) / scale,
+          bloque: {
+            tipo: 'imagen',
+            pngBytes,
+            width: Math.round(cropWidth / scale),
+            height: Math.round(sh / scale),
+            align: 'center'
+          }
+        })
+      }
+    }
+  }
+
+  // Ordenar todos los bloques (Imágenes, Textos y Tablas) de arriba hacia abajo según su posición Y en la hoja
+  bloquesPosicion.sort((a, b) => b.pdfY - a.pdfY)
+
+  return bloquesPosicion.map((item) => item.bloque)
 }
 
 const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
@@ -252,8 +704,7 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
 
     // 1. PDF -> IMAGEN (JPG / PNG / WEBP)
     if (esPdf && ['jpg', 'png', 'webp'].includes(formatoDestino)) {
-      console.log(`[PASO 1] Abriendo PDF para convertir a ${formatoDestino.toUpperCase()}...`)
-      const arrayBuffer = await conTimeout(file.arrayBuffer(), 'file.arrayBuffer()')
+      const arrayBuffer = await file.arrayBuffer()
       const loadingTask = pdfjsLib.getDocument({
         data: new Uint8Array(arrayBuffer),
         isEvalSupported: false,
@@ -262,95 +713,58 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
         isOffscreenCanvasSupported: false
       } as any)
 
-      const pdf = await conTimeout(loadingTask.promise, 'pdfjsLib.getDocument().promise')
-      console.log(`[PASO 2] PDF cargado (${pdf.numPages} págs). Renderizando página 1...`)
-      const page = await conTimeout(pdf.getPage(1), 'pdf.getPage(1)')
+      const pdf = await loadingTask.promise
+      const page = await pdf.getPage(1)
 
-      const baseVp = page.getViewport({ scale: 1.0 })
-      const ladoMayor = Math.max(baseVp.width, baseVp.height)
-      const escalaOptima = Math.min(2.0, Math.max(1.0, 1600 / ladoMayor))
-      const viewport = page.getViewport({ scale: escalaOptima })
-
-      const canvas = document.createElement('canvas')
-      const context = canvas.getContext('2d', { alpha: false })
-      if (!context) throw new Error('Error en canvas 2D')
-
-      canvas.width = Math.floor(viewport.width)
-      canvas.height = Math.floor(viewport.height)
-      context.fillStyle = '#FFFFFF'
-      context.fillRect(0, 0, canvas.width, canvas.height)
-
-      const renderTask = page.render({ canvasContext: context, viewport } as any)
-      await conTimeout(renderTask.promise, 'page.render().promise')
-
-      console.log('[PASO 3] Guardando imagen en disco...')
-      const bytes = await conTimeout(
-        canvasToUint8ArrayDirecto(canvas, formatoDestino),
-        'canvasToBlob'
-      )
-      await conTimeout(
-        window.api.guardarBytesDirecto(bytes, formatoDestino, rutaReal),
-        'guardarBytesDirecto'
-      )
-      console.log('[PASO 4] ¡Conversión de PDF a Imagen completada!')
+      const { canvas } = await renderizarPaginaACanvas(page, 1600)
+      const bytes = await canvasToUint8ArrayDirecto(canvas, formatoDestino)
+      await window.api.guardarBytesDirecto(bytes, formatoDestino, rutaReal)
     }
 
-    // 2. PDF -> DOCX o TXT
+    // 2. PDF -> DOCX (CON LOGOS, FIRMA, TABLAS Y FORMATO) O TXT
     else if (esPdf && (formatoDestino === 'txt' || formatoDestino === 'docx')) {
-      console.log(`[PASO 1] Abriendo PDF para extraer texto a ${formatoDestino.toUpperCase()}...`)
-      const arrayBuffer = await conTimeout(file.arrayBuffer(), 'file.arrayBuffer()')
+      const arrayBuffer = await file.arrayBuffer()
       const loadingTask = pdfjsLib.getDocument({
         data: new Uint8Array(arrayBuffer),
         isEvalSupported: false,
+        useSystemFonts: true,
         disableFontFace: true,
         isOffscreenCanvasSupported: false
       } as any)
 
-      const pdf = await conTimeout(loadingTask.promise, 'pdfjsLib.getDocument().promise')
-      console.log(`[PASO 2] Extrayendo texto de ${pdf.numPages} páginas...`)
-      const parrafos: string[] = []
+      const pdf = await loadingTask.promise
+      const bloquesTotales: BloqueDocumento[] = []
 
       for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await conTimeout(pdf.getPage(i), `pdf.getPage(${i})`)
-        const textContent = await conTimeout(page.getTextContent(), `page.getTextContent(${i})`)
-        const textoPagina = textContent.items
-          .map((item: any) => item.str || '')
-          .join(' ')
-          .replace(/\s+/g, ' ')
-          .trim()
+        if (i > 1) {
+          bloquesTotales.push({ tipo: 'salto_pagina' })
+        }
 
-        if (textoPagina) parrafos.push(textoPagina)
+        const page = await pdf.getPage(i)
+        const textContent = await page.getTextContent()
+        const bloquesPagina = await analizarPaginaCompleta(
+          page,
+          textContent,
+          formatoDestino as 'txt' | 'docx'
+        )
+        bloquesTotales.push(...bloquesPagina)
       }
 
-      if (parrafos.length === 0) {
-        parrafos.push('[Documento PDF basado en imagen sin texto seleccionable]')
-      }
-
-      console.log('[PASO 3] Guardando documento...')
-      await conTimeout(
-        window.api.guardarTextoDocumento(
-          parrafos,
-          formatoDestino as 'txt' | 'docx',
-          rutaReal
-        ),
-        'guardarTextoDocumento'
+      await window.api.guardarTextoDocumento(
+        bloquesTotales,
+        formatoDestino as 'txt' | 'docx',
+        rutaReal
       )
-      console.log('[PASO 4] ¡Documento guardado con éxito!')
     }
 
     // 3. IMAGEN -> PDF / JPG / PNG / WEBP
     else if (!esPdf) {
-      await conTimeout(
-        window.api.convertirImagenBackend(rutaReal, formatoDestino),
-        'convertirImagenBackend'
-      )
+      await window.api.convertirImagenBackend(rutaReal, formatoDestino)
     }
   } catch (error: any) {
     const detalle =
-      error instanceof Error
-        ? `${error.name}: ${error.message} | Stack: ${error.stack}`
-        : JSON.stringify(error, Object.getOwnPropertyNames(error || {}))
-    console.error(`[ERROR DETALLADO EN CONVERSIÓN]: ${detalle}`)
+      error instanceof Error ? `${error.name}: ${error.message}` : JSON.stringify(error)
+    console.error(`[ERROR EN CONVERSIÓN]: ${detalle}`)
   } finally {
     procesando.value = false
     showMenu.value = false

@@ -4,6 +4,28 @@ if (!process.contextIsolated) {
   throw new Error('contextIsolation must be enabled in the BrowserWindow')
 }
 
+export interface SegmentoTexto {
+  texto: string
+  bold?: boolean
+  fontSize?: number
+}
+
+export interface BloqueDocumento {
+  tipo: 'texto' | 'imagen' | 'tabla' | 'salto_pagina'
+  texto?: string
+  segmentos?: SegmentoTexto[]
+  filasTabla?: SegmentoTexto[][][]
+  fontSize?: number
+  bold?: boolean
+  align?: 'left' | 'center' | 'right' | 'both'
+  indentLeft?: number
+  espacioAntes?: number
+  espacioDespues?: number
+  pngBytes?: Uint8Array
+  width?: number
+  height?: number
+}
+
 contextBridge.exposeInMainWorld('api', {
   onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => {
     ipcRenderer.removeAllListeners('toggle-menu')
@@ -18,21 +40,18 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
-  // Guarda directamente los bytes de la imagen renderizada sin pasar por Sharp (Instantáneo)
   guardarBytesDirecto: (
     bufferData: Uint8Array,
     formatoDestino: string,
     rutaOriginal: string
   ) => ipcRenderer.invoke('guardar-bytes-directo', bufferData, formatoDestino, rutaOriginal),
 
-  // Guarda texto extraído del PDF en formato .TXT o .DOCX (Word nativo)
   guardarTextoDocumento: (
-    parrafos: string[],
+    bloques: BloqueDocumento[],
     formatoDestino: 'txt' | 'docx',
     rutaOriginal: string
-  ) => ipcRenderer.invoke('guardar-texto-documento', parrafos, formatoDestino, rutaOriginal),
+  ) => ipcRenderer.invoke('guardar-texto-documento', bloques, formatoDestino, rutaOriginal),
 
-  // Convierte Imagen -> PDF o Imagen -> Imagen en el Backend con Sharp
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
 
