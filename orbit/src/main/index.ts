@@ -11,6 +11,8 @@ import zlib from 'zlib'
 
 let mainWindow: BrowserWindow | null = null
 let shiftPresionado = false
+let modoVentanaActivo = false
+let ultimoScrollMs = 0
 let shellNotifierProc: ChildProcessWithoutNullStreams | null = null
 
 interface SegmentoTexto {
@@ -35,8 +37,8 @@ interface BloqueDocumento {
   height?: number
 }
 
-// --- NOTIFICADOR NATIVO DE WINDOWS EXPLORER (SHChangeNotify en shell32.dll) ---
-function iniciarNotificadorEscritorio() {
+// Notifica a Windows Explorer en cualquier carpeta del disco para que el archivo aparezca al instante
+function iniciarNotificadorSistemaArchivos() {
   if (process.platform !== 'win32') return
 
   const psScript = `
@@ -74,22 +76,20 @@ while ($true) {
   }
 }
 
-function guardarYRefrescarEscritorio(rutaArchivo: string, datos: Buffer | string) {
+// Guardado asíncrono sin bloquear el hilo principal + notificación instantánea a la carpeta de origen
+async function guardarEnOrigenYRefrescar(rutaArchivo: string, datos: Buffer | string) {
   if (typeof datos === 'string') {
-    fs.writeFileSync(rutaArchivo, datos, 'utf8')
+    await fs.promises.writeFile(rutaArchivo, datos, 'utf8')
   } else {
-    const fd = fs.openSync(rutaArchivo, 'w')
-    fs.writeFileSync(fd, datos)
-    fs.fsyncSync(fd)
-    fs.closeSync(fd)
+    await fs.promises.writeFile(rutaArchivo, datos)
   }
 
-  // Dispara el refresco instantáneo del Escritorio en Windows
   if (shellNotifierProc && shellNotifierProc.stdin.writable) {
     shellNotifierProc.stdin.write(`${rutaArchivo}\n`)
   }
 }
 
+// Detecta siempre el directorio de origen real del archivo y genera un nombre disponible
 function obtenerRutaSalida(rutaOriginal: string, extDestino: string, sufijo = ''): string {
   const parsed = path.parse(rutaOriginal)
   const base = `${parsed.name}${sufijo}`
@@ -103,7 +103,6 @@ function obtenerRutaSalida(rutaOriginal: string, extDestino: string, sufijo = ''
   return candidato
 }
 
-// --- EXTRACTOR BINARIO Y XML DE ARCHIVOS ZIP (.DOCX) ---
 function extraerBufferDeZip(zipBuf: Buffer, nombreBuscado: string): Buffer | null {
   let eocdOffset = -1
   for (let i = zipBuf.length - 22; i >= Math.max(0, zipBuf.length - 65557); i--) {
@@ -196,7 +195,6 @@ function extraerSegmentosDeRuns(xmlContenedor: string): {
   return { segmentos, textoCompleto, maxFontSize, tieneBold }
 }
 
-// --- PARSER COMPLETO DE .DOCX (Lee Imágenes incrustadas, Tablas y Texto con formato) ---
 async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]> {
   const zipBuf = await fs.promises.readFile(rutaDocx)
   const docBuf = extraerBufferDeZip(zipBuf, 'word/document.xml')
@@ -204,7 +202,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
 
   const xml = docBuf.toString('utf8')
 
-  // 1. Mapa de relaciones para localizar imágenes (rId -> word/media/imageX.png)
   const relsMap: Record<string, string> = {}
   const relsBuf = extraerBufferDeZip(zipBuf, 'word/_rels/document.xml.rels')
   if (relsBuf) {
@@ -226,12 +223,10 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
   const bodyMatch = xml.match(/<w:body[^>]*>([\s\S]*?)<\/w:body>/i)
   const contenidoBody = bodyMatch ? bodyMatch[1] : xml
 
-  // Recorremos en orden exacto tanto Tablas (<w:tbl>) como Párrafos (<w:p>)
   const elementosRegex = /<w:tbl[\s>][\s\S]*?<\/w:tbl>|<w:p[\s>][\s\S]*?<\/w:p>/g
   const elementos = contenidoBody.match(elementosRegex) || []
 
   for (const elXml of elementos) {
-    // CASO A: TABLA (<w:tbl>)
     if (elXml.startsWith('<w:tbl')) {
       const filasTabla: SegmentoTexto[][][] = []
       const trs = elXml.match(/<w:tr[\s>][\s\S]*?<\/w:tr>/g) || []
@@ -252,7 +247,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
       continue
     }
 
-    // CASO B: PÁRRAFO (<w:p>)
     const pXml = elXml
     if (/<w:br[^>]*w:type="page"/i.test(pXml)) {
       bloques.push({ tipo: 'salto_pagina' })
@@ -273,7 +267,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
       indentLeft = parseInt(indMatch[1], 10)
     }
 
-    // Buscar si el párrafo tiene imágenes incrustadas (<a:blip r:embed="rId..."/>)
     const embedMatches = [...pXml.matchAll(/r:(?:embed|id)="([^"]+)"/gi)]
     for (const match of embedMatches) {
       const rId = match[1]
@@ -290,7 +283,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
         let width = meta.width || 600
         let height = meta.height || 400
 
-        // Respetar proporción definida en Word si existe <wp:extent cx="..." cy="..."/>
         const extentMatch = pXml.match(/<wp:extent[^>]*cx="(\d+)"[^>]*cy="(\d+)"/i)
         if (extentMatch) {
           const cxEmu = parseInt(extentMatch[1], 10)
@@ -313,7 +305,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
       }
     }
 
-    // Extraer texto del párrafo
     const { segmentos, textoCompleto, maxFontSize, tieneBold } = extraerSegmentosDeRuns(pXml)
     if (textoCompleto.trim()) {
       bloques.push({
@@ -332,7 +323,6 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
   return bloques
 }
 
-// --- EMPAQUETADOR ZIP NATIVO PARA CREAR .DOCX ---
 function crc32(buf: Buffer): number {
   let crc = -1
   for (let i = 0; i < buf.length; i++) {
@@ -674,7 +664,7 @@ function createWindow(): BrowserWindow {
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.orbit.converter')
-  iniciarNotificadorEscritorio()
+  iniciarNotificadorSistemaArchivos()
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
@@ -685,7 +675,8 @@ app.whenReady().then(() => {
   uIOhook.on('keydown', (e) => {
     if (
       (e.keycode === UiohookKey.Shift || e.keycode === UiohookKey.ShiftRight) &&
-      !shiftPresionado
+      !shiftPresionado &&
+      !modoVentanaActivo
     ) {
       shiftPresionado = true
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -710,7 +701,7 @@ app.whenReady().then(() => {
   uIOhook.on('keyup', (e) => {
     if (e.keycode === UiohookKey.Shift || e.keycode === UiohookKey.ShiftRight) {
       shiftPresionado = false
-      if (mainWindow && !mainWindow.isDestroyed()) {
+      if (!modoVentanaActivo && mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.setIgnoreMouseEvents(true, { forward: true })
         mainWindow.webContents.send('toggle-menu', {
           mostrar: false,
@@ -721,27 +712,63 @@ app.whenReady().then(() => {
     }
   })
 
+  // Detector nativo de Scroll con filtro de fluidez (evita saturar IPC)
+  uIOhook.on('wheel', (e) => {
+    if (shiftPresionado && !modoVentanaActivo && mainWindow && !mainWindow.isDestroyed()) {
+      const ahora = Date.now()
+      if (ahora - ultimoScrollMs < 60) return
+      ultimoScrollMs = ahora
+
+      const direccion = e.rotation > 0 ? 'down' : 'up'
+      mainWindow.webContents.send('scroll-menu', direccion)
+    }
+  })
+
   uIOhook.start()
+
+  ipcMain.on('activar-modo-ventana', () => {
+    modoVentanaActivo = true
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setIgnoreMouseEvents(false)
+      mainWindow.setFocusable(true)
+      mainWindow.focus()
+    }
+  })
 
   ipcMain.on('forzar-cierre-menu', () => {
     shiftPresionado = false
+    modoVentanaActivo = false
     if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setFocusable(false)
       mainWindow.setIgnoreMouseEvents(true, { forward: true })
     }
   })
 
-  // 1. GUARDAR PÁGINAS DE IMAGEN Y REFRESCAR ESCRITORIO AL INSTANTE
+  // 1. GUARDAR PÁGINAS DE IMAGEN EN LA CARPETA DE ORIGEN DEL ARCHIVO
   ipcMain.handle(
     'guardar-paginas-imagen',
-    async (_, paginasBytes: Uint8Array[], formatoDestino: string, rutaOriginal: string) => {
+    async (
+      _,
+      paginasBytes: Uint8Array[],
+      formatoDestino: string,
+      rutaOriginal: string,
+      sufijoPersonalizado?: string
+    ) => {
       try {
         if (paginasBytes.length === 1) {
-          const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
-          guardarYRefrescarEscritorio(outPath, Buffer.from(paginasBytes[0]))
+          const outPath = obtenerRutaSalida(
+            rutaOriginal,
+            formatoDestino,
+            sufijoPersonalizado || ''
+          )
+          await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[0]))
         } else {
           for (let i = 0; i < paginasBytes.length; i++) {
-            const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino, `_pag${i + 1}`)
-            guardarYRefrescarEscritorio(outPath, Buffer.from(paginasBytes[i]))
+            const sufijo = sufijoPersonalizado
+              ? `${sufijoPersonalizado}_pag${i + 1}`
+              : `_pag${i + 1}`
+            const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino, sufijo)
+            await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[i]))
           }
         }
         return true
@@ -752,29 +779,38 @@ app.whenReady().then(() => {
     }
   )
 
-  // 2. GUARDAR PÁGINAS RENDERIZADAS COMO UN DOCUMENTO .PDF
+  // 2. GUARDAR PÁGINAS RENDERIZADAS O EDITADAS COMO .PDF EN LA CARPETA DE ORIGEN
   ipcMain.handle(
     'guardar-paginas-como-pdf',
-    async (_, paginasPngBytes: Uint8Array[], rutaOriginal: string) => {
+    async (
+      _,
+      paginasPngBytes: Uint8Array[],
+      rutaOriginal: string,
+      dimensiones?: { width: number; height: number }[],
+      sufijoPersonalizado?: string
+    ) => {
       try {
         const pdfDoc = await PDFDocument.create()
-        for (const pngBytes of paginasPngBytes) {
+        for (let i = 0; i < paginasPngBytes.length; i++) {
+          const pngBytes = paginasPngBytes[i]
           const img = await pdfDoc.embedPng(pngBytes)
-          const page = pdfDoc.addPage([612, 792])
-          page.drawImage(img, { x: 0, y: 0, width: 612, height: 792 })
+          const w = dimensiones?.[i]?.width || img.width || 612
+          const h = dimensiones?.[i]?.height || img.height || 792
+          const page = pdfDoc.addPage([w, h])
+          page.drawImage(img, { x: 0, y: 0, width: w, height: h })
         }
         const pdfBytes = await pdfDoc.save()
-        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf')
-        guardarYRefrescarEscritorio(outPath, Buffer.from(pdfBytes))
+        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
+        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
         return true
       } catch (error) {
-        console.error('Error creando PDF desde documento:', error)
+        console.error('Error creando PDF:', error)
         return false
       }
     }
   )
 
-  // 3. GUARDAR DOCUMENTO .DOCX O .TXT
+  // 3. GUARDAR DOCUMENTO .DOCX O .TXT EN LA CARPETA DE ORIGEN
   ipcMain.handle(
     'guardar-texto-documento',
     async (
@@ -791,7 +827,7 @@ app.whenReady().then(() => {
           for (const b of bloques) {
             if (b.tipo === 'salto_pagina') {
               lineasTxt.push('\r\n----------------------------------------\r\n')
-            } else if (b.tipo === 'texto' && b.texto) {
+            } else if (b.tipo === 'texto' && b.texto !== undefined) {
               if ((b.espacioAntes || 0) > 160) lineasTxt.push('')
               lineasTxt.push(b.texto)
             } else if (b.tipo === 'tabla' && b.filasTabla) {
@@ -809,10 +845,10 @@ app.whenReady().then(() => {
             lineasTxt.length > 0
               ? lineasTxt.join('\r\n')
               : '[Este documento contiene únicamente imágenes sin texto seleccionable]'
-          guardarYRefrescarEscritorio(outPath, contenidoFinal)
+          await guardarEnOrigenYRefrescar(outPath, contenidoFinal)
         } else {
           const docxBuffer = generarDocxEstructurado(bloques)
-          guardarYRefrescarEscritorio(outPath, docxBuffer)
+          await guardarEnOrigenYRefrescar(outPath, docxBuffer)
         }
         return true
       } catch (error) {
@@ -822,7 +858,7 @@ app.whenReady().then(() => {
     }
   )
 
-  // 4. LEER ARCHIVOS .DOCX (CON IMÁGENES Y TABLAS) O .TXT DESDE EL DISCO
+  // 4. LEER ARCHIVOS .DOCX O .TXT
   ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
     try {
       const ext = path.extname(rutaOriginal).toLowerCase()
@@ -848,7 +884,7 @@ app.whenReady().then(() => {
     }
   })
 
-  // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES EN BACKEND
+  // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES EN LA CARPETA DE ORIGEN
   ipcMain.handle(
     'convertir-imagen-backend',
     async (_, rutaOriginal: string, formatoDestino: string) => {
@@ -864,20 +900,20 @@ app.whenReady().then(() => {
           page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
 
           const pdfBytes = await pdfDoc.save()
-          guardarYRefrescarEscritorio(outPath, Buffer.from(pdfBytes))
+          await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
         } else if (formatoDestino === 'jpg') {
           const outBuf = await sharp(rutaOriginal)
             .rotate()
             .flatten({ background: '#ffffff' })
             .jpeg({ quality: 92 })
             .toBuffer()
-          guardarYRefrescarEscritorio(outPath, outBuf)
+          await guardarEnOrigenYRefrescar(outPath, outBuf)
         } else if (formatoDestino === 'png') {
           const outBuf = await sharp(rutaOriginal).rotate().png().toBuffer()
-          guardarYRefrescarEscritorio(outPath, outBuf)
+          await guardarEnOrigenYRefrescar(outPath, outBuf)
         } else if (formatoDestino === 'webp') {
           const outBuf = await sharp(rutaOriginal).rotate().webp({ quality: 92 }).toBuffer()
-          guardarYRefrescarEscritorio(outPath, outBuf)
+          await guardarEnOrigenYRefrescar(outPath, outBuf)
         }
 
         return true

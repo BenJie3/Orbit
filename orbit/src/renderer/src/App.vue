@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, nextTick, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
 
@@ -98,15 +98,19 @@ declare global {
   interface Window {
     api: {
       onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => void
+      onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => void
       obtenerRuta: (file: File) => string
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
         formatoDestino: string,
-        rutaOriginal: string
+        rutaOriginal: string,
+        sufijoPersonalizado?: string
       ) => Promise<boolean>
       guardarPaginasComoPdf: (
         paginasPngBytes: Uint8Array[],
-        rutaOriginal: string
+        rutaOriginal: string,
+        dimensiones?: { width: number; height: number }[],
+        sufijoPersonalizado?: string
       ) => Promise<boolean>
       guardarTextoDocumento: (
         bloques: BloqueDocumento[],
@@ -115,17 +119,94 @@ declare global {
       ) => Promise<boolean>
       leerDocumentoTexto: (rutaOriginal: string) => Promise<BloqueDocumento[]>
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
+      activarModoVentana: () => void
       cerrarMenu: () => void
     }
   }
 }
 
+// --- ESTADOS DEL MENÚ RADIAL Y SCROLL ---
 const showMenu = ref(false)
 const procesando = ref(false)
 const posX = ref(500)
 const posY = ref(400)
 const opcionActiva = ref<string | null>(null)
 const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen'>('pdf')
+const modoRueda = ref<'conversion' | 'herramientas'>('conversion')
+
+// --- ESTADOS DE LA VENTANA DE HERRAMIENTAS ORBIT ---
+type TipoHerramienta = 'recortar' | 'dibujar' | 'dividir' | 'rotar' | 'ajustar' | 'editar'
+const ventanaAbierta = ref(false)
+const herramientaActual = ref<TipoHerramienta | null>(null)
+const rutaArchivoActivo = ref('')
+const nombreArchivoActivo = ref('')
+const extArchivoActivo = ref('')
+
+// Usamos shallowRef para evitar que Vue cree Proxies pesados sobre los lienzos y píxeles (10x más fluido)
+const paginasCanvases = shallowRef<HTMLCanvasElement[]>([])
+const paginasMiniaturas = shallowRef<string[]>([])
+const historialTrazos = shallowRef<ImageData[]>([])
+
+const paginaIndice = ref(0)
+const paginasSeleccionadas = ref<number[]>([])
+const modoDivisionPdf = ref<'unico' | 'separados'>('unico')
+
+// Estados para DIBUJAR / FIRMAR y ZOOM DE PRECISIÓN
+const contenedorScrollRef = ref<HTMLDivElement | null>(null)
+const canvasInteractivoRef = ref<HTMLCanvasElement | null>(null)
+const colorPincel = ref('#111827')
+const grosorPincel = ref(3)
+const dibujando = ref(false)
+const ultimoPuntoTrazo = ref<{ x: number; y: number } | null>(null)
+
+// Estados de Zoom y Desplazamiento (Pan)
+const zoomNivel = ref(100)
+const modoPan = ref(false)
+const espacioPresionado = ref(false)
+const arrastrandoPan = ref(false)
+const panInicio = ref({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
+const anchoBaseVisual = ref(560)
+const altoBaseVisual = ref(400)
+
+// Estados para RECORTAR
+const arrastrandoRecorte = ref(false)
+const recorteInicio = ref({ x: 0, y: 0 })
+const cajaRecorte = ref({ x: 40, y: 40, w: 260, h: 200, activo: false })
+
+// Estados para ROTAR
+const rotacionGrados = ref(0)
+const voltearH = ref(false)
+const voltearV = ref(false)
+
+// Estados para AJUSTAR IMAGEN (Escala y Calidad)
+const escalaPorcentaje = ref(75)
+const calidadPorcentaje = ref(85)
+
+// Estados para EDITAR TEXTO (DOCX / TXT)
+const textoEditable = ref('')
+
+// Detecta el nombre real de la carpeta de origen del archivo (Ej. "Descargas", "Documentos", "Escritorio", etc.)
+const nombreCarpetaOrigen = computed(() => {
+  if (!rutaArchivoActivo.value) return 'carpeta de origen'
+  const normalizada = rutaArchivoActivo.value.replace(/\\/g, '/')
+  const partes = normalizada.split('/')
+  partes.pop() // Quita el nombre del archivo
+  const carpeta = partes.pop() || ''
+  if (!carpeta) return 'carpeta de origen'
+  if (carpeta.toLowerCase() === 'desktop') return 'Escritorio'
+  if (carpeta.toLowerCase() === 'downloads') return 'Descargas'
+  if (carpeta.toLowerCase() === 'documents') return 'Documentos'
+  return carpeta
+})
+
+// Estilo dinámico del lienzo aplicando el nivel de Zoom
+const estiloCanvasZoom = computed(() => {
+  const factor = zoomNivel.value / 100
+  return {
+    width: `${Math.round(anchoBaseVisual.value * factor)}px`,
+    height: `${Math.round(altoBaseVisual.value * factor)}px`
+  }
+})
 
 function crearPathSegmento(anguloCentralGrados: number): string {
   const cx = 160
@@ -181,7 +262,8 @@ function crearPathSegmento(anguloCentralGrados: number): string {
   ].join(' ')
 }
 
-const catalogoOpciones = {
+// 1. Catálogo de CONVERSIÓN (Scroll Arriba - Inicial)
+const catalogoConversion = {
   pdf: [
     { id: 'docx', label: 'DOCX', angulo: -90, tx: 160, ty: 55 },
     { id: 'jpg', label: 'JPG', angulo: 0, tx: 265, ty: 160 },
@@ -208,29 +290,108 @@ const catalogoOpciones = {
   ]
 }
 
+// 2. Catálogo de HERRAMIENTAS (Scroll Abajo)
+const catalogoHerramientas = {
+  pdf: [
+    { id: 'tool:recortar', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:dibujar', label: 'DIBUJAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:dividir', label: 'DIVIDIR', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:rotar', label: 'ROTAR', angulo: 180, tx: 55, ty: 160 }
+  ],
+  imagen: [
+    { id: 'tool:recortar', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:dibujar', label: 'DIBUJAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:ajustar', label: 'AJUSTAR', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:rotar', label: 'ROTAR', angulo: 180, tx: 55, ty: 160 }
+  ],
+  docx: [
+    { id: 'tool:editar', label: 'EDITAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:dibujar', label: 'FIRMAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:recortar', label: 'RECORTAR', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:rotar', label: 'ROTAR', angulo: 180, tx: 55, ty: 160 }
+  ],
+  txt: [
+    { id: 'tool:editar', label: 'EDITAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:dibujar', label: 'FIRMAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:recortar', label: 'RECORTAR', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:rotar', label: 'ROTAR', angulo: 180, tx: 55, ty: 160 }
+  ]
+}
+
 const etiquetaCentro = computed(() => {
-  if (opcionActiva.value) return opcionActiva.value.toUpperCase()
+  if (opcionActiva.value) {
+    return opcionActiva.value.replace('tool:', '').toUpperCase()
+  }
+  if (modoRueda.value === 'herramientas') return 'TOOLS'
   if (tipoDetectado.value === 'imagen') return 'IMG'
   return tipoDetectado.value.toUpperCase()
 })
 
 const segmentos = computed(() => {
-  const opciones = catalogoOpciones[tipoDetectado.value] || catalogoOpciones.pdf
+  const fuente =
+    modoRueda.value === 'herramientas' ? catalogoHerramientas : catalogoConversion
+  const opciones = fuente[tipoDetectado.value] || fuente.pdf
   return opciones.map((op) => ({
     ...op,
     path: crearPathSegmento(op.angulo)
   }))
 })
 
+const cambiarModoPorScroll = (direccion: 'up' | 'down') => {
+  if (direccion === 'down' && modoRueda.value !== 'herramientas') {
+    modoRueda.value = 'herramientas'
+    opcionActiva.value = null
+  } else if (direccion === 'up' && modoRueda.value !== 'conversion') {
+    modoRueda.value = 'conversion'
+    opcionActiva.value = null
+  }
+}
+
+const onWheelLocal = (e: WheelEvent) => {
+  if (ventanaAbierta.value) return
+  if (e.deltaY > 0) cambiarModoPorScroll('down')
+  else if (e.deltaY < 0) cambiarModoPorScroll('up')
+}
+
 onMounted(() => {
   window.api.onToggleMenu((data) => {
+    if (ventanaAbierta.value) return
     if (data.mostrar) {
       posX.value = data.x
       posY.value = data.y
+      modoRueda.value = 'conversion'
       showMenu.value = true
     } else if (!procesando.value) {
       showMenu.value = false
       opcionActiva.value = null
+      modoRueda.value = 'conversion'
+    }
+  })
+
+  window.api.onScrollMenu((direccion) => {
+    if (showMenu.value && !ventanaAbierta.value) {
+      cambiarModoPorScroll(direccion)
+    }
+  })
+
+  window.addEventListener('keydown', (e) => {
+    if (!ventanaAbierta.value) return
+    if (e.key === 'Escape') {
+      cerrarVentanaHerramienta()
+    } else if (e.code === 'Space' && herramientaActual.value !== 'editar') {
+      espacioPresionado.value = true
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      if (herramientaActual.value === 'dibujar') {
+        e.preventDefault()
+        deshacerTrazo()
+      }
+    }
+  })
+
+  window.addEventListener('keyup', (e) => {
+    if (e.code === 'Space') {
+      espacioPresionado.value = false
+      arrastrandoPan.value = false
     }
   })
 })
@@ -254,7 +415,8 @@ const detectarTipoEnVuelo = (event: DragEvent) => {
 
 const canvasToUint8ArrayDirecto = (
   canvas: HTMLCanvasElement,
-  formato: string
+  formato: string,
+  calidad = 0.92
 ): Promise<Uint8Array> => {
   const mime =
     formato === 'jpg' ? 'image/jpeg' : formato === 'webp' ? 'image/webp' : 'image/png'
@@ -266,7 +428,7 @@ const canvasToUint8ArrayDirecto = (
         resolve(new Uint8Array(ab))
       },
       mime,
-      0.92
+      calidad
     )
   })
 }
@@ -280,25 +442,24 @@ const uint8ToBase64 = (u8Arr: Uint8Array): string => {
   return window.btoa(binary)
 }
 
-// Carga la imagen usando Data URI (base64) permitido por la política CSP de Electron
-const cargarImagenDesdeBytes = (bytes: Uint8Array): Promise<HTMLImageElement> => {
+const cargarImagenDesdeBytes = (bytes: Uint8Array, mime = 'image/png'): Promise<HTMLImageElement> => {
   return new Promise((resolve, reject) => {
     const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes as any)
     const base64 = uint8ToBase64(u8)
     const img = new Image()
     img.onload = () => resolve(img)
     img.onerror = (err) => reject(err)
-    img.src = `data:image/png;base64,${base64}`
+    img.src = `data:${mime};base64,${base64}`
   })
 }
 
 const renderizarPaginaACanvas = async (
   page: any,
-  maxLado = 1400
+  maxLado = 1500
 ): Promise<{ canvas: HTMLCanvasElement; scale: number; pageWidth: number; pageHeight: number }> => {
   const baseVp = page.getViewport({ scale: 1.0 })
   const ladoMayor = Math.max(baseVp.width, baseVp.height)
-  const scale = Math.min(2.0, Math.max(1.2, maxLado / ladoMayor))
+  const scale = Math.min(2.2, Math.max(1.2, maxLado / ladoMayor))
   const viewport = page.getViewport({ scale })
 
   const canvas = document.createElement('canvas')
@@ -316,10 +477,9 @@ const renderizarPaginaACanvas = async (
   return { canvas, scale, pageWidth: baseVp.width, pageHeight: baseVp.height }
 }
 
-const renderizarBloquesAPaginas = async (
-  bloques: BloqueDocumento[],
-  formatoImagen: 'png' | 'jpg'
-): Promise<Uint8Array[]> => {
+const renderizarBloquesACanvases = async (
+  bloques: BloqueDocumento[]
+): Promise<HTMLCanvasElement[]> => {
   const W = 1224
   const H = 1584
   const marginX = 110
@@ -354,7 +514,6 @@ const renderizarBloquesAPaginas = async (
       continue
     }
 
-    // 1. DIBUJAR IMÁGENES INCRUSTADAS EN EL DOCX
     if (b.tipo === 'imagen' && b.pngBytes && b.pngBytes.byteLength > 0) {
       try {
         const img = await cargarImagenDesdeBytes(b.pngBytes)
@@ -389,7 +548,6 @@ const renderizarBloquesAPaginas = async (
       continue
     }
 
-    // 2. DIBUJAR TABLAS CON BORDES (<w:tbl>)
     if (b.tipo === 'tabla' && b.filasTabla && b.filasTabla.length > 0) {
       const numCols = Math.max(...b.filasTabla.map((f) => f.length))
       const colW = maxLineWidth / numCols
@@ -421,7 +579,6 @@ const renderizarBloquesAPaginas = async (
       continue
     }
 
-    // 3. DIBUJAR PÁRRAFOS DE TEXTO CON SOPORTE DE NEGRITAS MIXTAS Y SANGRÍA
     const fontSizePx = Math.round((b.fontSize || 10.5) * 2.0)
     const lineHeight = Math.round(fontSizePx * 1.35)
     const indentPx = b.indentLeft ? Math.min(400, Math.round(b.indentLeft * 0.12)) : 0
@@ -495,6 +652,14 @@ const renderizarBloquesAPaginas = async (
     cursorY += Math.round(fontSizePx * 0.25)
   }
 
+  return canvases
+}
+
+const renderizarBloquesAPaginas = async (
+  bloques: BloqueDocumento[],
+  formatoImagen: 'png' | 'jpg'
+): Promise<Uint8Array[]> => {
+  const canvases = await renderizarBloquesACanvases(bloques)
   const paginasBytes: Uint8Array[] = []
   for (const c of canvases) {
     const bytes = await canvasToUint8ArrayDirecto(c, formatoImagen)
@@ -894,7 +1059,550 @@ const analizarPaginaCompleta = async (
   return bloquesPosicion.map((item) => item.bloque)
 }
 
-const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
+// =========================================================================
+// LÓGICA DE LA VENTANA DE HERRAMIENTAS INTERACTIVAS CON ZOOM Y PRECISIÓN
+// =========================================================================
+
+const cambiarZoom = (delta: number) => {
+  zoomNivel.value = Math.max(100, Math.min(400, zoomNivel.value + delta))
+}
+
+const restablecerZoom = () => {
+  zoomNivel.value = 100
+  modoPan.value = false
+}
+
+const onWheelCanvasZoom = (e: WheelEvent) => {
+  // Permite hacer zoom de precisión con Ctrl + Rueda del ratón o Alt + Rueda
+  if (e.ctrlKey || e.altKey) {
+    e.preventDefault()
+    const paso = e.deltaY < 0 ? 25 : -25
+    cambiarZoom(paso)
+  }
+}
+
+const sincronizarCanvasVistaPrevia = async () => {
+  await nextTick()
+  const dest = canvasInteractivoRef.value
+  const src = paginasCanvases.value[paginaIndice.value]
+  if (!dest || !src) return
+
+  dest.width = src.width
+  dest.height = src.height
+
+  // Calculamos las dimensiones base a 100% de zoom para que encaje perfecto en la ventana
+  const maxW = 660
+  const maxH = 390
+  const ratio = Math.min(maxW / src.width, maxH / src.height)
+  anchoBaseVisual.value = Math.max(180, Math.round(src.width * ratio))
+  altoBaseVisual.value = Math.max(180, Math.round(src.height * ratio))
+
+  const ctx = dest.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return
+
+  ctx.clearRect(0, 0, dest.width, dest.height)
+  ctx.drawImage(src, 0, 0)
+
+  historialTrazos.value = [ctx.getImageData(0, 0, dest.width, dest.height)]
+
+  cajaRecorte.value = {
+    x: Math.round(dest.width * 0.15),
+    y: Math.round(dest.height * 0.15),
+    w: Math.round(dest.width * 0.7),
+    h: Math.round(dest.height * 0.7),
+    activo: true
+  }
+}
+
+watch(paginaIndice, () => {
+  if (ventanaAbierta.value) {
+    sincronizarCanvasVistaPrevia()
+  }
+})
+
+const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: TipoHerramienta) => {
+  procesando.value = true
+  window.api.activarModoVentana()
+
+  rutaArchivoActivo.value = rutaReal
+  nombreArchivoActivo.value = file.name
+  const ext = rutaReal.split('.').pop()?.toLowerCase() || ''
+  extArchivoActivo.value = ext
+  herramientaActual.value = tool
+
+  paginasCanvases.value = []
+  paginasMiniaturas.value = []
+  paginaIndice.value = 0
+  rotacionGrados.value = 0
+  voltearH.value = false
+  voltearV.value = false
+  zoomNivel.value = 100
+  modoPan.value = false
+
+  try {
+    const esPdf = ext === 'pdf' || file.type === 'application/pdf'
+    const esDocTexto = ext === 'docx' || ext === 'txt'
+
+    if (esPdf) {
+      const arrayBuffer = await file.arrayBuffer()
+      const loadingTask = pdfjsLib.getDocument({
+        data: new Uint8Array(arrayBuffer),
+        isEvalSupported: false,
+        useSystemFonts: true,
+        disableFontFace: true,
+        isOffscreenCanvasSupported: false
+      } as any)
+
+      const pdf = await loadingTask.promise
+      const canvases: HTMLCanvasElement[] = []
+      const thumbs: string[] = []
+      const sel: number[] = []
+
+      // Mayor resolución base (1750px) para que al hacer Zoom de 300%-400% se vea súper nítido al firmar
+      const resObjetivo = tool === 'dibujar' || tool === 'recortar' ? 1750 : 1350
+
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i)
+        const { canvas } = await renderizarPaginaACanvas(page, resObjetivo)
+        canvases.push(canvas)
+        thumbs.push(canvas.toDataURL('image/jpeg', 0.75))
+        sel.push(i - 1)
+      }
+
+      paginasCanvases.value = canvases
+      paginasMiniaturas.value = thumbs
+      paginasSeleccionadas.value = sel
+    } else if (esDocTexto) {
+      const bloques = await window.api.leerDocumentoTexto(rutaReal)
+      textoEditable.value = bloques
+        .filter((b) => b.tipo === 'texto' && b.texto !== undefined)
+        .map((b) => b.texto)
+        .join('\n\n')
+
+      if (tool !== 'editar') {
+        const canvases = await renderizarBloquesACanvases(bloques)
+        paginasCanvases.value = canvases
+        paginasMiniaturas.value = canvases.map((c) => c.toDataURL('image/jpeg', 0.75))
+      }
+    } else {
+      const ab = await file.arrayBuffer()
+      const mime = file.type || 'image/png'
+      const img = await cargarImagenDesdeBytes(new Uint8Array(ab), mime)
+      const c = document.createElement('canvas')
+      c.width = img.naturalWidth || 800
+      c.height = img.naturalHeight || 600
+      const ctx = c.getContext('2d', { alpha: false })!
+      ctx.fillStyle = '#FFFFFF'
+      ctx.fillRect(0, 0, c.width, c.height)
+      ctx.drawImage(img, 0, 0)
+      paginasCanvases.value = [c]
+      paginasMiniaturas.value = [c.toDataURL('image/jpeg', 0.8)]
+    }
+
+    showMenu.value = false
+    ventanaAbierta.value = true
+    await sincronizarCanvasVistaPrevia()
+  } catch (error) {
+    console.error('Error abriendo herramienta:', error)
+    cerrarVentanaHerramienta()
+  } finally {
+    procesando.value = false
+  }
+}
+
+const cerrarVentanaHerramienta = () => {
+  ventanaAbierta.value = false
+  herramientaActual.value = null
+  showMenu.value = false
+  opcionActiva.value = null
+  paginasCanvases.value = []
+  paginasMiniaturas.value = []
+  historialTrazos.value = []
+  zoomNivel.value = 100
+  modoPan.value = false
+  window.api.cerrarMenu()
+}
+
+// --- COORDENADAS EXACTAS CON SOPORTE DE ZOOM Y SCROLL ---
+const obtenerCoordenadasCanvas = (e: MouseEvent) => {
+  const c = canvasInteractivoRef.value
+  if (!c) return { x: 0, y: 0 }
+  const rect = c.getBoundingClientRect()
+  const scaleX = c.width / rect.width
+  const scaleY = c.height / rect.height
+  return {
+    x: Math.max(0, Math.min(c.width, (e.clientX - rect.left) * scaleX)),
+    y: Math.max(0, Math.min(c.height, (e.clientY - rect.top) * scaleY))
+  }
+}
+
+const onCanvasMouseDown = (e: MouseEvent) => {
+  const scrollBox = contenedorScrollRef.value
+  // Si está activo el Modo Mano (Mover), o presiona Espacio, o usa clic central/derecho -> desplazar vista con zoom
+  if (
+    modoPan.value ||
+    espacioPresionado.value ||
+    e.button === 1 ||
+    e.button === 2
+  ) {
+    if (scrollBox) {
+      arrastrandoPan.value = true
+      panInicio.value = {
+        x: e.clientX,
+        y: e.clientY,
+        scrollLeft: scrollBox.scrollLeft,
+        scrollTop: scrollBox.scrollTop
+      }
+    }
+    return
+  }
+
+  const pos = obtenerCoordenadasCanvas(e)
+  const c = canvasInteractivoRef.value
+  if (!c) return
+
+  if (herramientaActual.value === 'dibujar') {
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    if (!ctx) return
+    dibujando.value = true
+    ultimoPuntoTrazo.value = pos
+
+    ctx.beginPath()
+    ctx.moveTo(pos.x, pos.y)
+    ctx.lineTo(pos.x + 0.01, pos.y + 0.01)
+    ctx.strokeStyle = colorPincel.value
+    // El grosor se adapta para ser más fino y preciso si el usuario hace mucho zoom
+    const factorPrecisionZoom = Math.max(0.45, 100 / zoomNivel.value)
+    ctx.lineWidth = grosorPincel.value * (c.width / 800) * factorPrecisionZoom
+    ctx.lineCap = 'round'
+    ctx.lineJoin = 'round'
+    ctx.stroke()
+  } else if (herramientaActual.value === 'recortar') {
+    arrastrandoRecorte.value = true
+    recorteInicio.value = pos
+    cajaRecorte.value = { x: pos.x, y: pos.y, w: 1, h: 1, activo: true }
+  }
+}
+
+const onCanvasMouseMove = (e: MouseEvent) => {
+  if (arrastrandoPan.value) {
+    const scrollBox = contenedorScrollRef.value
+    if (scrollBox) {
+      scrollBox.scrollLeft = panInicio.value.scrollLeft - (e.clientX - panInicio.value.x)
+      scrollBox.scrollTop = panInicio.value.scrollTop - (e.clientY - panInicio.value.y)
+    }
+    return
+  }
+
+  const c = canvasInteractivoRef.value
+  if (!c) return
+  const pos = obtenerCoordenadasCanvas(e)
+
+  if (herramientaActual.value === 'dibujar' && dibujando.value) {
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    if (!ctx || !ultimoPuntoTrazo.value) return
+
+    // Trazado curvo suavizado de alta precisión para firmas
+    const midX = (ultimoPuntoTrazo.value.x + pos.x) / 2
+    const midY = (ultimoPuntoTrazo.value.y + pos.y) / 2
+    ctx.quadraticCurveTo(ultimoPuntoTrazo.value.x, ultimoPuntoTrazo.value.y, midX, midY)
+    ctx.stroke()
+    ultimoPuntoTrazo.value = pos
+  } else if (herramientaActual.value === 'recortar' && arrastrandoRecorte.value) {
+    const x = Math.min(recorteInicio.value.x, pos.x)
+    const y = Math.min(recorteInicio.value.y, pos.y)
+    const w = Math.max(20, Math.abs(pos.x - recorteInicio.value.x))
+    const h = Math.max(20, Math.abs(pos.y - recorteInicio.value.y))
+    cajaRecorte.value = { x, y, w, h, activo: true }
+  }
+}
+
+const onCanvasMouseUp = () => {
+  if (arrastrandoPan.value) {
+    arrastrandoPan.value = false
+    return
+  }
+
+  const c = canvasInteractivoRef.value
+  if (!c) return
+
+  if (herramientaActual.value === 'dibujar' && dibujando.value) {
+    dibujando.value = false
+    ultimoPuntoTrazo.value = null
+    const ctx = c.getContext('2d', { willReadFrequently: true })
+    if (ctx) {
+      historialTrazos.value = [
+        ...historialTrazos.value,
+        ctx.getImageData(0, 0, c.width, c.height)
+      ]
+      const pageCanvas = paginasCanvases.value[paginaIndice.value]
+      const pageCtx = pageCanvas?.getContext('2d')
+      if (pageCtx) {
+        pageCtx.clearRect(0, 0, pageCanvas.width, pageCanvas.height)
+        pageCtx.drawImage(c, 0, 0)
+      }
+    }
+  } else if (herramientaActual.value === 'recortar') {
+    arrastrandoRecorte.value = false
+  }
+}
+
+const deshacerTrazo = () => {
+  const c = canvasInteractivoRef.value
+  if (!c || historialTrazos.value.length <= 1) return
+  const nuevoHistorial = historialTrazos.value.slice(0, -1)
+  historialTrazos.value = nuevoHistorial
+  const anterior = nuevoHistorial[nuevoHistorial.length - 1]
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  if (ctx && anterior) {
+    ctx.putImageData(anterior, 0, 0)
+    const pageCanvas = paginasCanvases.value[paginaIndice.value]
+    pageCanvas?.getContext('2d')?.putImageData(anterior, 0, 0)
+  }
+}
+
+const limpiarLienzo = () => {
+  const c = canvasInteractivoRef.value
+  if (!c || historialTrazos.value.length === 0) return
+  const inicial = historialTrazos.value[0]
+  historialTrazos.value = [inicial]
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  if (ctx && inicial) {
+    ctx.putImageData(inicial, 0, 0)
+    const pageCanvas = paginasCanvases.value[paginaIndice.value]
+    pageCanvas?.getContext('2d')?.putImageData(inicial, 0, 0)
+  }
+}
+
+const alternarSeleccionPagina = (idx: number) => {
+  const pos = paginasSeleccionadas.value.indexOf(idx)
+  if (pos >= 0) {
+    if (paginasSeleccionadas.value.length > 1) {
+      paginasSeleccionadas.value.splice(pos, 1)
+    }
+  } else {
+    paginasSeleccionadas.value.push(idx)
+    paginasSeleccionadas.value.sort((a, b) => a - b)
+  }
+}
+
+const estiloOverlayRecorte = computed(() => {
+  const c = canvasInteractivoRef.value
+  if (!c || !c.width || !c.height) return {}
+  return {
+    left: `${(cajaRecorte.value.x / c.width) * 100}%`,
+    top: `${(cajaRecorte.value.y / c.height) * 100}%`,
+    width: `${(cajaRecorte.value.w / c.width) * 100}%`,
+    height: `${(cajaRecorte.value.h / c.height) * 100}%`
+  }
+})
+
+// --- GUARDAR CAMBIOS EN LA CARPETA DE ORIGEN DEL ARCHIVO ---
+const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
+  procesando.value = true
+  try {
+    const esPdfOrigen = extArchivoActivo.value === 'pdf'
+    const formatoImgDestino = ['jpg', 'png', 'webp'].includes(extArchivoActivo.value)
+      ? extArchivoActivo.value
+      : 'png'
+
+    if (herramientaActual.value === 'dibujar') {
+      if (esPdfOrigen || extArchivoActivo.value === 'docx' || extArchivoActivo.value === 'txt') {
+        const bytesList: Uint8Array[] = []
+        const dims: { width: number; height: number }[] = []
+        for (const c of paginasCanvases.value) {
+          bytesList.push(await canvasToUint8ArrayDirecto(c, 'png'))
+          dims.push({ width: Math.round(c.width * 0.5), height: Math.round(c.height * 0.5) })
+        }
+        await window.api.guardarPaginasComoPdf(
+          bytesList,
+          rutaArchivoActivo.value,
+          dims,
+          '_firmado'
+        )
+      } else {
+        const c = paginasCanvases.value[0]
+        const bytes = await canvasToUint8ArrayDirecto(c, formatoImgDestino)
+        await window.api.guardarPaginasImagen(
+          [bytes],
+          formatoImgDestino,
+          rutaArchivoActivo.value,
+          '_editado'
+        )
+      }
+    } else if (herramientaActual.value === 'recortar') {
+      const src = paginasCanvases.value[paginaIndice.value]
+      const cropCanvas = document.createElement('canvas')
+      const cw = Math.max(20, Math.round(cajaRecorte.value.w))
+      const ch = Math.max(20, Math.round(cajaRecorte.value.h))
+      cropCanvas.width = cw
+      cropCanvas.height = ch
+      const ctx = cropCanvas.getContext('2d', { alpha: false })!
+      ctx.fillStyle = '#FFFFFF'
+      ctx.fillRect(0, 0, cw, ch)
+      ctx.drawImage(
+        src,
+        Math.round(cajaRecorte.value.x),
+        Math.round(cajaRecorte.value.y),
+        cw,
+        ch,
+        0,
+        0,
+        cw,
+        ch
+      )
+
+      if (esPdfOrigen) {
+        const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
+        await window.api.guardarPaginasComoPdf(
+          [pngBytes],
+          rutaArchivoActivo.value,
+          [{ width: Math.round(cw * 0.5), height: Math.round(ch * 0.5) }],
+          '_recorte'
+        )
+      } else {
+        const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoImgDestino)
+        await window.api.guardarPaginasImagen(
+          [bytes],
+          formatoImgDestino,
+          rutaArchivoActivo.value,
+          '_recorte'
+        )
+      }
+    } else if (herramientaActual.value === 'rotar') {
+      const rotadosBytes: Uint8Array[] = []
+      const dims: { width: number; height: number }[] = []
+
+      for (const src of paginasCanvases.value) {
+        const rad = ((rotacionGrados.value % 360) * Math.PI) / 180
+        const intercambiaLados = Math.abs(rotacionGrados.value % 180) === 90
+        const outCanvas = document.createElement('canvas')
+        outCanvas.width = intercambiaLados ? src.height : src.width
+        outCanvas.height = intercambiaLados ? src.width : src.height
+
+        const ctx = outCanvas.getContext('2d', { alpha: false })!
+        ctx.fillStyle = '#FFFFFF'
+        ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+
+        ctx.save()
+        ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
+        ctx.rotate(rad)
+        ctx.scale(voltearH.value ? -1 : 1, voltearV.value ? -1 : 1)
+        ctx.drawImage(src, -src.width / 2, -src.height / 2)
+        ctx.restore()
+
+        const fmt = esPdfOrigen ? 'png' : formatoImgDestino
+        rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt))
+        dims.push({
+          width: Math.round(outCanvas.width * 0.5),
+          height: Math.round(outCanvas.height * 0.5)
+        })
+      }
+
+      if (esPdfOrigen) {
+        await window.api.guardarPaginasComoPdf(
+          rotadosBytes,
+          rutaArchivoActivo.value,
+          dims,
+          '_rotado'
+        )
+      } else {
+        await window.api.guardarPaginasImagen(
+          rotadosBytes,
+          formatoImgDestino,
+          rutaArchivoActivo.value,
+          '_rotado'
+        )
+      }
+    } else if (herramientaActual.value === 'dividir') {
+      if (modoDivisionPdf.value === 'unico') {
+        const bytesList: Uint8Array[] = []
+        const dims: { width: number; height: number }[] = []
+        for (const idx of paginasSeleccionadas.value) {
+          const c = paginasCanvases.value[idx]
+          if (!c) continue
+          bytesList.push(await canvasToUint8ArrayDirecto(c, 'png'))
+          dims.push({ width: Math.round(c.width * 0.5), height: Math.round(c.height * 0.5) })
+        }
+        await window.api.guardarPaginasComoPdf(
+          bytesList,
+          rutaArchivoActivo.value,
+          dims,
+          '_extraido'
+        )
+      } else {
+        for (const idx of paginasSeleccionadas.value) {
+          const c = paginasCanvases.value[idx]
+          if (!c) continue
+          const bytes = await canvasToUint8ArrayDirecto(c, 'png')
+          await window.api.guardarPaginasComoPdf(
+            [bytes],
+            rutaArchivoActivo.value,
+            [{ width: Math.round(c.width * 0.5), height: Math.round(c.height * 0.5) }],
+            `_pag${idx + 1}`
+          )
+        }
+      }
+    } else if (herramientaActual.value === 'ajustar') {
+      const src = paginasCanvases.value[0]
+      const factor = escalaPorcentaje.value / 100
+      const outCanvas = document.createElement('canvas')
+      outCanvas.width = Math.max(16, Math.round(src.width * factor))
+      outCanvas.height = Math.max(16, Math.round(src.height * factor))
+      const ctx = outCanvas.getContext('2d', { alpha: false })!
+      ctx.fillStyle = '#FFFFFF'
+      ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+      ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
+
+      const fmt = formatoSalidaOpcional || formatoImgDestino
+      const bytes = await canvasToUint8ArrayDirecto(
+        outCanvas,
+        fmt,
+        calidadPorcentaje.value / 100
+      )
+      await window.api.guardarPaginasImagen(
+        [bytes],
+        fmt,
+        rutaArchivoActivo.value,
+        `_${escalaPorcentaje.value}pct`
+      )
+    } else if (herramientaActual.value === 'editar') {
+      const lineas = textoEditable.value.split(/\r?\n/)
+      const bloques: BloqueDocumento[] = lineas.map((l) => ({
+        tipo: 'texto',
+        texto: l,
+        segmentos: [{ texto: l, fontSize: 11, bold: false }],
+        fontSize: 11,
+        bold: false,
+        align: 'left',
+        espacioDespues: 60
+      }))
+
+      const destino = (formatoSalidaOpcional || extArchivoActivo.value || 'docx') as
+        | 'docx'
+        | 'txt'
+        | 'pdf'
+      if (destino === 'pdf') {
+        const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
+        await window.api.guardarPaginasComoPdf(
+          paginasPng,
+          rutaArchivoActivo.value,
+          undefined,
+          '_editado'
+        )
+      } else {
+        await window.api.guardarTextoDocumento(bloques, destino, rutaArchivoActivo.value)
+      }
+    }
+  } catch (error) {
+    console.error('Error guardando desde herramienta:', error)
+  } finally {
+    procesando.value = false
+    cerrarVentanaHerramienta()
+  }
+}
+
+const procesarArchivo = async (event: DragEvent, opcionId: string) => {
   event.preventDefault()
   const files = event.dataTransfer?.files
   if (!files || files.length === 0) return
@@ -903,6 +1611,13 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
   const rutaReal = window.api.obtenerRuta(file)
   if (!rutaReal) return
 
+  if (opcionId.startsWith('tool:')) {
+    const toolName = opcionId.replace('tool:', '') as TipoHerramienta
+    await abrirHerramientaConArchivo(file, rutaReal, toolName)
+    return
+  }
+
+  const formatoDestino = opcionId
   const ext = rutaReal.split('.').pop()?.toLowerCase() || ''
   if (ext === formatoDestino || (ext === 'jpeg' && formatoDestino === 'jpg')) {
     showMenu.value = false
@@ -1006,7 +1721,11 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
   <div
     class="w-screen h-screen overflow-hidden bg-transparent select-none"
     @dragover="detectarTipoEnVuelo"
+    @wheel="onWheelLocal"
   >
+    <!-- =================================================================== -->
+    <!-- 1. RUEDA RADIAL ORBIT (INTACTA)                                     -->
+    <!-- =================================================================== -->
     <Transition
       enter-active-class="transition duration-150 ease-out"
       enter-from-class="opacity-0 scale-50"
@@ -1016,7 +1735,7 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
       leave-to-class="opacity-0 scale-75"
     >
       <div
-        v-if="showMenu"
+        v-if="showMenu && !ventanaAbierta"
         :style="{ left: `${posX}px`, top: `${posY}px` }"
         class="fixed -translate-x-1/2 -translate-y-1/2 w-[320px] h-[320px] flex items-center justify-center pointer-events-auto"
       >
@@ -1026,7 +1745,7 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
 
         <svg
           viewBox="0 0 320 320"
-          class="relative z-10 w-full h-full overflow-visible"
+          class="relative z-10 w-full h-full overflow-visible transition-transform duration-200"
         >
           <defs>
             <linearGradient id="activeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -1080,7 +1799,8 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
               :y="seg.ty"
               text-anchor="middle"
               dominant-baseline="central"
-              class="pointer-events-none font-extrabold text-[15px] tracking-wider transition-colors duration-150"
+              class="pointer-events-none font-extrabold tracking-wider transition-colors duration-150"
+              :class="seg.label.length > 5 ? 'text-[12px]' : 'text-[15px]'"
               :fill="opcionActiva === seg.id ? '#FFFFFF' : '#1c1917'"
             >
               {{ seg.label }}
@@ -1089,20 +1809,473 @@ const procesarArchivo = async (event: DragEvent, formatoDestino: string) => {
         </svg>
 
         <div
-          class="absolute z-20 pointer-events-none flex items-center justify-center"
+          class="absolute z-20 pointer-events-none flex flex-col items-center justify-center"
         >
           <div
             v-if="procesando"
             class="w-9 h-9 border-[3px] border-white border-t-transparent rounded-full animate-spin"
           ></div>
 
-          <div
-            v-else
-            class="px-5 py-2 rounded-full bg-amber-200/55 border border-white/50 shadow-inner backdrop-blur-md flex items-center justify-center min-w-[74px]"
-          >
-            <span class="text-[#1c1917] font-extrabold text-xs tracking-wider uppercase">
-              {{ etiquetaCentro }}
+          <template v-else>
+            <div
+              class="px-4 py-1.5 rounded-full bg-amber-200/55 border border-white/50 shadow-inner backdrop-blur-md flex items-center justify-center min-w-[76px]"
+            >
+              <span class="text-[#1c1917] font-extrabold text-[11px] tracking-wider uppercase">
+                {{ etiquetaCentro }}
+              </span>
+            </div>
+
+            <div class="flex items-center gap-1.5 mt-1.5">
+              <span
+                class="w-1.5 h-1.5 rounded-full transition-all duration-200"
+                :class="
+                  modoRueda === 'conversion'
+                    ? 'bg-orange-500 scale-125 shadow-[0_0_6px_#f97316]'
+                    : 'bg-white/40'
+                "
+              ></span>
+              <span
+                class="w-1.5 h-1.5 rounded-full transition-all duration-200"
+                :class="
+                  modoRueda === 'herramientas'
+                    ? 'bg-orange-500 scale-125 shadow-[0_0_6px_#f97316]'
+                    : 'bg-white/40'
+                "
+              ></span>
+            </div>
+          </template>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- =================================================================== -->
+    <!-- 2. VENTANA DE HERRAMIENTAS CON ZOOM DE PRECISIÓN Y RUTA DE ORIGEN   -->
+    <!-- =================================================================== -->
+    <Transition
+      enter-active-class="transition duration-200 ease-out"
+      enter-from-class="opacity-0 scale-90"
+      enter-to-class="opacity-100 scale-100"
+      leave-active-class="transition duration-150 ease-in"
+      leave-from-class="opacity-100 scale-100"
+      leave-to-class="opacity-0 scale-90"
+    >
+      <div
+        v-if="ventanaAbierta"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm pointer-events-auto"
+      >
+        <div
+          class="relative w-[820px] max-h-[90vh] rounded-[34px] bg-orange-950/35 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_25px_70px_rgba(0,0,0,0.65)] flex flex-col overflow-hidden p-5"
+        >
+          <!-- Barra Superior -->
+          <div class="flex items-center justify-between mb-3 pb-3 border-b border-white/25">
+            <div class="flex items-center gap-3">
+              <div
+                class="px-4 py-1.5 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] border border-white/75 text-white font-extrabold text-xs tracking-wider uppercase shadow-[0_0_15px_rgba(234,88,12,0.5)]"
+              >
+                {{ herramientaActual }}
+              </div>
+              <div class="flex flex-col">
+                <span class="text-white/95 font-bold text-sm truncate max-w-[300px]">
+                  {{ nombreArchivoActivo }}
+                </span>
+                <span class="text-amber-200/80 text-[11px] font-medium truncate max-w-[300px]">
+                  Origen: {{ nombreCarpetaOrigen }}
+                </span>
+              </div>
+            </div>
+
+            <!-- Controles de Zoom de Precisión (En Dibujar, Firmar y Recortar) -->
+            <div
+              v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'"
+              class="flex items-center gap-1.5 bg-[#fde68a]/60 border border-white/55 rounded-full px-3 py-1 shadow-inner"
+            >
+              <button
+                @click="cambiarZoom(-25)"
+                class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
+                title="Alejar"
+              >
+                −
+              </button>
+              <button
+                @click="restablecerZoom"
+                class="px-2 text-[#1c1917] font-extrabold text-xs min-w-[48px] text-center cursor-pointer hover:underline"
+                title="Restablecer a 100%"
+              >
+                {{ zoomNivel }}%
+              </button>
+              <button
+                @click="cambiarZoom(25)"
+                class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
+                title="Acercar para mayor precisión"
+              >
+                +
+              </button>
+
+              <!-- Botón Modo Mano (Mover vista con zoom) -->
+              <button
+                v-if="zoomNivel > 100"
+                @click="modoPan = !modoPan"
+                class="ml-1 px-2.5 py-0.5 rounded-full text-[11px] font-extrabold border transition-all cursor-pointer"
+                :class="
+                  modoPan || espacioPresionado
+                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                    : 'bg-white/50 text-[#1c1917] border-white/60'
+                "
+                title="También puedes mantener presionada la barra espaciadora o clic derecho para mover"
+              >
+                ✋ {{ modoPan ? 'Moviendo' : 'Mover' }}
+              </button>
+            </div>
+
+            <!-- Selector de Páginas (Si es PDF de varias hojas) -->
+            <div
+              v-if="paginasCanvases.length > 1 && herramientaActual !== 'dividir' && herramientaActual !== 'editar'"
+              class="flex items-center gap-2 bg-[#fde68a]/55 border border-white/50 rounded-full px-3 py-1"
+            >
+              <button
+                @click="paginaIndice = Math.max(0, paginaIndice - 1)"
+                class="text-[#1c1917] font-extrabold text-xs px-1.5 hover:text-orange-700 cursor-pointer"
+              >
+                ◀
+              </button>
+              <span class="text-[#1c1917] font-extrabold text-xs">
+                Pág {{ paginaIndice + 1 }} / {{ paginasCanvases.length }}
+              </span>
+              <button
+                @click="paginaIndice = Math.min(paginasCanvases.length - 1, paginaIndice + 1)"
+                class="text-[#1c1917] font-extrabold text-xs px-1.5 hover:text-orange-700 cursor-pointer"
+              >
+                ▶
+              </button>
+            </div>
+
+            <!-- Botón Cerrar -->
+            <button
+              @click="cerrarVentanaHerramienta"
+              class="w-9 h-9 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-sm flex items-center justify-center transition-colors cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+
+          <!-- CONTENIDO SEGÚN LA HERRAMIENTA SELECCIONADA -->
+          <div class="flex-1 overflow-hidden flex flex-col items-center justify-center min-h-[400px]">
+            <!-- A. VISTA PARA RECORTAR / DIBUJAR / ROTAR / AJUSTAR -->
+            <div
+              v-if="
+                herramientaActual === 'dibujar' ||
+                herramientaActual === 'recortar' ||
+                herramientaActual === 'rotar' ||
+                herramientaActual === 'ajustar'
+              "
+              class="w-full flex flex-col items-center gap-3"
+            >
+              <!-- Controles Superiores de Dibujo -->
+              <div
+                v-if="herramientaActual === 'dibujar'"
+                class="flex flex-wrap items-center justify-center gap-2.5 bg-black/20 border border-white/25 rounded-full px-5 py-1.5"
+              >
+                <button
+                  v-for="col in [
+                    { hex: '#111827', nombre: 'Negro' },
+                    { hex: '#1d4ed8', nombre: 'Azul Firma' },
+                    { hex: '#dc2626', nombre: 'Rojo' },
+                    { hex: '#ea580c', nombre: 'Naranja' }
+                  ]"
+                  :key="col.hex"
+                  @click="colorPincel = col.hex; modoPan = false"
+                  class="w-6 h-6 rounded-full border-2 transition-transform cursor-pointer"
+                  :style="{ backgroundColor: col.hex }"
+                  :class="
+                    colorPincel === col.hex ? 'scale-125 border-white shadow-md' : 'border-white/40'
+                  "
+                ></button>
+
+                <div class="h-4 w-[1px] bg-white/30 mx-1"></div>
+
+                <button
+                  v-for="g in [
+                    { val: 1.5, label: 'Pluma Fina' },
+                    { val: 3.5, label: 'Medio' },
+                    { val: 7, label: 'Marcador' }
+                  ]"
+                  :key="g.val"
+                  @click="grosorPincel = g.val; modoPan = false"
+                  class="px-3 py-1 rounded-full text-xs font-extrabold border transition-all cursor-pointer"
+                  :class="
+                    grosorPincel === g.val
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                      : 'bg-[#fde68a]/60 text-[#1c1917] border-white/40'
+                  "
+                >
+                  {{ g.label }}
+                </button>
+
+                <div class="h-4 w-[1px] bg-white/30 mx-1"></div>
+
+                <button
+                  @click="deshacerTrazo"
+                  class="px-3 py-1 rounded-full bg-[#fde68a]/60 hover:bg-[#fde68a] text-[#1c1917] text-xs font-extrabold border border-white/50 cursor-pointer"
+                >
+                  ↶ Deshacer
+                </button>
+                <button
+                  @click="limpiarLienzo"
+                  class="px-3 py-1 rounded-full bg-[#fde68a]/60 hover:bg-[#fde68a] text-[#1c1917] text-xs font-extrabold border border-white/50 cursor-pointer"
+                >
+                  Limpiar
+                </button>
+              </div>
+
+              <!-- Controles Superiores de Rotación -->
+              <div
+                v-if="herramientaActual === 'rotar'"
+                class="flex items-center gap-3 bg-black/20 border border-white/25 rounded-full px-5 py-2"
+              >
+                <button
+                  @click="rotacionGrados = (rotacionGrados - 90) % 360"
+                  class="px-4 py-1.5 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs border border-white/50 cursor-pointer"
+                >
+                  ↺ -90°
+                </button>
+                <button
+                  @click="rotacionGrados = (rotacionGrados + 90) % 360"
+                  class="px-4 py-1.5 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs border border-white/50 cursor-pointer"
+                >
+                  ↻ +90°
+                </button>
+                <button
+                  @click="voltearH = !voltearH"
+                  class="px-4 py-1.5 rounded-full font-extrabold text-xs border transition-colors cursor-pointer"
+                  :class="
+                    voltearH
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/50'
+                  "
+                >
+                  ⇄ Voltear H
+                </button>
+                <button
+                  @click="voltearV = !voltearV"
+                  class="px-4 py-1.5 rounded-full font-extrabold text-xs border transition-colors cursor-pointer"
+                  :class="
+                    voltearV
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/50'
+                  "
+                >
+                  ⇅ Voltear V
+                </button>
+              </div>
+
+              <!-- Controles de Escala y Compresión (AJUSTAR) -->
+              <div
+                v-if="herramientaActual === 'ajustar'"
+                class="flex flex-wrap items-center justify-center gap-4 bg-black/20 border border-white/25 rounded-full px-6 py-2"
+              >
+                <div class="flex items-center gap-2">
+                  <span class="text-white text-xs font-extrabold uppercase">Tamaño:</span>
+                  <button
+                    v-for="pct in [25, 50, 75, 100]"
+                    :key="pct"
+                    @click="escalaPorcentaje = pct"
+                    class="px-3 py-1 rounded-full text-xs font-extrabold border cursor-pointer"
+                    :class="
+                      escalaPorcentaje === pct
+                        ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                        : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                    "
+                  >
+                    {{ pct }}%
+                  </button>
+                </div>
+
+                <div class="h-4 w-[1px] bg-white/30"></div>
+
+                <div class="flex items-center gap-2">
+                  <span class="text-white text-xs font-extrabold uppercase">Calidad:</span>
+                  <button
+                    v-for="cal in [
+                      { v: 60, l: 'Ligera' },
+                      { v: 85, l: 'Óptima' },
+                      { v: 98, l: 'Máxima' }
+                    ]"
+                    :key="cal.v"
+                    @click="calidadPorcentaje = cal.v"
+                    class="px-3 py-1 rounded-full text-xs font-extrabold border cursor-pointer"
+                    :class="
+                      calidadPorcentaje === cal.v
+                        ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                        : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                    "
+                  >
+                    {{ cal.l }}
+                  </button>
+                </div>
+              </div>
+
+              <!-- Contenedor con Scroll y Zoom para precisión al firmar o recortar -->
+              <div
+                ref="contenedorScrollRef"
+                @wheel="onWheelCanvasZoom"
+                @contextmenu.prevent
+                class="relative w-full h-[410px] overflow-auto bg-black/25 rounded-2xl p-4 border border-white/25 flex"
+              >
+                <div
+                  class="m-auto relative inline-block transition-transform duration-150"
+                  :style="{
+                    transform: `rotate(${rotacionGrados}deg) scaleX(${voltearH ? -1 : 1}) scaleY(${voltearV ? -1 : 1})`
+                  }"
+                >
+                  <canvas
+                    ref="canvasInteractivoRef"
+                    :style="estiloCanvasZoom"
+                    class="rounded-lg shadow-xl bg-white block"
+                    :class="{
+                      'cursor-grab': modoPan || espacioPresionado,
+                      'cursor-grabbing': arrastrandoPan,
+                      'cursor-crosshair':
+                        !modoPan &&
+                        !espacioPresionado &&
+                        (herramientaActual === 'dibujar' || herramientaActual === 'recortar')
+                    }"
+                    @mousedown="onCanvasMouseDown"
+                    @mousemove="onCanvasMouseMove"
+                    @mouseup="onCanvasMouseUp"
+                    @mouseleave="onCanvasMouseUp"
+                  ></canvas>
+
+                  <!-- Cuadro Naranja de Recorte Interactivo -->
+                  <div
+                    v-if="herramientaActual === 'recortar' && cajaRecorte.activo"
+                    :style="estiloOverlayRecorte"
+                    class="absolute border-[2.5px] border-dashed border-orange-500 bg-orange-500/20 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] pointer-events-none flex items-end justify-end p-1"
+                  >
+                    <span
+                      class="px-2 py-0.5 rounded bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-[10px]"
+                    >
+                      {{ Math.round(cajaRecorte.w) }} × {{ Math.round(cajaRecorte.h) }} px
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- B. VISTA PARA DIVIDIR / EXTRAER PÁGINAS DE UN PDF -->
+            <div
+              v-else-if="herramientaActual === 'dividir'"
+              class="w-full flex flex-col items-center gap-4"
+            >
+              <div
+                class="flex items-center gap-3 bg-black/20 border border-white/25 rounded-full px-5 py-2"
+              >
+                <button
+                  @click="modoDivisionPdf = 'unico'"
+                  class="px-4 py-1.5 rounded-full text-xs font-extrabold border cursor-pointer"
+                  :class="
+                    modoDivisionPdf === 'unico'
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                  "
+                >
+                  Unir seleccionadas en 1 PDF
+                </button>
+                <button
+                  @click="modoDivisionPdf = 'separados'"
+                  class="px-4 py-1.5 rounded-full text-xs font-extrabold border cursor-pointer"
+                  :class="
+                    modoDivisionPdf === 'separados'
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                  "
+                >
+                  Guardar cada página por separado
+                </button>
+              </div>
+
+              <div
+                class="grid grid-cols-4 gap-3.5 w-full max-h-[340px] overflow-y-auto p-3 bg-black/20 rounded-2xl border border-white/20"
+              >
+                <div
+                  v-for="(thumb, idx) in paginasMiniaturas"
+                  :key="idx"
+                  @click="alternarSeleccionPagina(idx)"
+                  class="relative rounded-xl overflow-hidden cursor-pointer border-2 transition-all p-1.5 flex flex-col items-center"
+                  :class="
+                    paginasSeleccionadas.includes(idx)
+                      ? 'border-orange-500 bg-gradient-to-b from-[#f97316]/40 to-[#dc2626]/40 scale-[1.02] shadow-lg'
+                      : 'border-white/25 bg-white/10 opacity-60 hover:opacity-90'
+                  "
+                >
+                  <img :src="thumb" class="w-full h-32 object-contain rounded bg-white mb-1.5" />
+                  <span class="text-white font-extrabold text-xs">Página {{ idx + 1 }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- C. VISTA PARA EDITAR DOCUMENTO DE TEXTO (DOCX / TXT) -->
+            <div
+              v-else-if="herramientaActual === 'editar'"
+              class="w-full flex flex-col gap-3"
+            >
+              <textarea
+                v-model="textoEditable"
+                rows="12"
+                class="w-full rounded-2xl bg-[#fde68a]/75 text-[#1c1917] font-medium text-sm p-4 border-2 border-white/60 focus:outline-none focus:border-orange-500 shadow-inner resize-none select-text"
+                placeholder="Escribe o edita el contenido del documento..."
+              ></textarea>
+              <div class="flex justify-between text-white/85 text-xs font-bold px-2">
+                <span>Palabras: {{ textoEditable.trim() ? textoEditable.trim().split(/\s+/).length : 0 }}</span>
+                <span>Caracteres: {{ textoEditable.length }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Barra Inferior de Acciones (Guarda siempre en la carpeta de origen detectada) -->
+          <div class="flex items-center justify-between mt-3 pt-3 border-t border-white/25">
+            <span class="text-white/70 text-xs font-medium">
+              <template v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">
+                Tip: Usa <b>Ctrl + Rueda</b> para hacer zoom y <b>Espacio + Arrastrar</b> para mover
+              </template>
             </span>
+
+            <div class="flex items-center gap-3">
+              <button
+                @click="cerrarVentanaHerramienta"
+                class="px-5 py-2 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/55 transition-transform hover:scale-105 cursor-pointer"
+              >
+                Cancelar
+              </button>
+
+              <template v-if="herramientaActual === 'editar'">
+                <button
+                  @click="guardarResultadoHerramienta('txt')"
+                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                >
+                  Guardar TXT
+                </button>
+                <button
+                  @click="guardarResultadoHerramienta('pdf')"
+                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                >
+                  Guardar PDF
+                </button>
+                <button
+                  @click="guardarResultadoHerramienta('docx')"
+                  class="px-6 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/80 shadow-[0_0_16px_rgba(234,88,12,0.65)] hover:scale-105 transition-transform cursor-pointer"
+                >
+                  Guardar DOCX en {{ nombreCarpetaOrigen }}
+                </button>
+              </template>
+
+              <button
+                v-else
+                @click="guardarResultadoHerramienta()"
+                class="px-7 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 shadow-[0_0_18px_rgba(234,88,12,0.7)] hover:scale-105 transition-transform cursor-pointer"
+              >
+                Guardar en {{ nombreCarpetaOrigen }}
+              </button>
+            </div>
           </div>
         </div>
       </div>

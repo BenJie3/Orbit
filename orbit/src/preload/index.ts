@@ -26,10 +26,22 @@ export interface BloqueDocumento {
   height?: number
 }
 
+export interface PaginaPdfRender {
+  pngBytes: Uint8Array
+  width: number
+  height: number
+}
+
 contextBridge.exposeInMainWorld('api', {
   onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => {
     ipcRenderer.removeAllListeners('toggle-menu')
     ipcRenderer.on('toggle-menu', (_, data) => callback(data))
+  },
+
+  // Escucha el scroll del ratón hacia abajo ('down') o hacia arriba ('up')
+  onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => {
+    ipcRenderer.removeAllListeners('scroll-menu')
+    ipcRenderer.on('scroll-menu', (_, direccion: 'up' | 'down') => callback(direccion))
   },
 
   obtenerRuta: (file: File) => {
@@ -40,31 +52,48 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
-  // Guarda una o varias páginas de imagen directamente en la carpeta original
   guardarPaginasImagen: (
     paginasBytes: Uint8Array[],
     formatoDestino: string,
-    rutaOriginal: string
-  ) => ipcRenderer.invoke('guardar-paginas-imagen', paginasBytes, formatoDestino, rutaOriginal),
+    rutaOriginal: string,
+    sufijoPersonalizado?: string
+  ) =>
+    ipcRenderer.invoke(
+      'guardar-paginas-imagen',
+      paginasBytes,
+      formatoDestino,
+      rutaOriginal,
+      sufijoPersonalizado
+    ),
 
-  // Guarda páginas renderizadas dentro de un archivo PDF nuevo
-  guardarPaginasComoPdf: (paginasPngBytes: Uint8Array[], rutaOriginal: string) =>
-    ipcRenderer.invoke('guardar-paginas-como-pdf', paginasPngBytes, rutaOriginal),
+  guardarPaginasComoPdf: (
+    paginasPngBytes: Uint8Array[],
+    rutaOriginal: string,
+    dimensiones?: { width: number; height: number }[],
+    sufijoPersonalizado?: string
+  ) =>
+    ipcRenderer.invoke(
+      'guardar-paginas-como-pdf',
+      paginasPngBytes,
+      rutaOriginal,
+      dimensiones,
+      sufijoPersonalizado
+    ),
 
-  // Guarda bloques estructurados en formato .TXT o .DOCX
   guardarTextoDocumento: (
     bloques: BloqueDocumento[],
     formatoDestino: 'txt' | 'docx',
     rutaOriginal: string
   ) => ipcRenderer.invoke('guardar-texto-documento', bloques, formatoDestino, rutaOriginal),
 
-  // Lee archivos .DOCX o .TXT del disco y devuelve sus párrafos y formatos
   leerDocumentoTexto: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-documento-texto', rutaOriginal),
 
-  // Convierte Imagen -> PDF / JPG / PNG / WEBP con Sharp
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
+
+  // Mantiene la ventana interactiva abierta cuando se abre una herramienta (Recortar, Dibujar, etc.)
+  activarModoVentana: () => ipcRenderer.send('activar-modo-ventana'),
 
   cerrarMenu: () => ipcRenderer.send('forzar-cierre-menu')
 })
