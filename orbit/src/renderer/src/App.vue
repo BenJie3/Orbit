@@ -94,11 +94,34 @@ interface BloqueConPosicion {
   bloque: BloqueDocumento
 }
 
+interface EstadoTrayOrbit {
+  mostrar: boolean
+  x: number
+  y: number
+  pausadoGaming: boolean
+  minutosTimer: number
+  modoTeclaActual: 'shift' | 'doble-shift' | 'alt' | 'ctrl'
+  archivosRecientes: { nombre: string; ruta: string }[]
+  iniciarConWindows: boolean
+}
+
 declare global {
   interface Window {
     api: {
       onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => void
       onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => void
+      onTrayMenu: (callback: (estado: EstadoTrayOrbit) => void) => void
+      actualizarConfigTray: (accion: {
+        tipo:
+          | 'toggle-gaming'
+          | 'timer'
+          | 'tecla'
+          | 'autostart'
+          | 'abrir-reciente'
+          | 'limpiar-recientes'
+          | 'salir'
+        valor?: any
+      }) => Promise<EstadoTrayOrbit>
       obtenerRuta: (file: File) => string
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
@@ -134,6 +157,16 @@ const opcionActiva = ref<string | null>(null)
 const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen'>('pdf')
 const modoRueda = ref<'conversion' | 'herramientas'>('conversion')
 
+// --- ESTADOS DEL PANEL DE BANDEJA ORBIT (TRAY MENU) ---
+const trayMenuAbierto = ref(false)
+const trayPosX = ref(0)
+const trayPosY = ref(0)
+const trayPausado = ref(false)
+const trayMinutosTimer = ref(0)
+const trayModoTecla = ref<'shift' | 'doble-shift' | 'alt' | 'ctrl'>('shift')
+const trayArchivosRecientes = ref<{ nombre: string; ruta: string }[]>([])
+const trayIniciarConWindows = ref(false)
+
 // --- ESTADOS DE LA VENTANA DE HERRAMIENTAS ORBIT ---
 type TipoHerramienta = 'recortar' | 'dibujar' | 'dividir' | 'rotar' | 'ajustar' | 'editar'
 const ventanaAbierta = ref(false)
@@ -142,7 +175,6 @@ const rutaArchivoActivo = ref('')
 const nombreArchivoActivo = ref('')
 const extArchivoActivo = ref('')
 
-// Usamos shallowRef para evitar que Vue cree Proxies pesados sobre los lienzos y píxeles (10x más fluido)
 const paginasCanvases = shallowRef<HTMLCanvasElement[]>([])
 const paginasMiniaturas = shallowRef<string[]>([])
 const historialTrazos = shallowRef<ImageData[]>([])
@@ -151,7 +183,6 @@ const paginaIndice = ref(0)
 const paginasSeleccionadas = ref<number[]>([])
 const modoDivisionPdf = ref<'unico' | 'separados'>('unico')
 
-// Estados para DIBUJAR / FIRMAR y ZOOM DE PRECISIÓN
 const contenedorScrollRef = ref<HTMLDivElement | null>(null)
 const canvasInteractivoRef = ref<HTMLCanvasElement | null>(null)
 const colorPincel = ref('#111827')
@@ -159,7 +190,6 @@ const grosorPincel = ref(3)
 const dibujando = ref(false)
 const ultimoPuntoTrazo = ref<{ x: number; y: number } | null>(null)
 
-// Estados de Zoom y Desplazamiento (Pan)
 const zoomNivel = ref(100)
 const modoPan = ref(false)
 const espacioPresionado = ref(false)
@@ -168,29 +198,24 @@ const panInicio = ref({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
 const anchoBaseVisual = ref(560)
 const altoBaseVisual = ref(400)
 
-// Estados para RECORTAR
 const arrastrandoRecorte = ref(false)
 const recorteInicio = ref({ x: 0, y: 0 })
 const cajaRecorte = ref({ x: 40, y: 40, w: 260, h: 200, activo: false })
 
-// Estados para ROTAR
 const rotacionGrados = ref(0)
 const voltearH = ref(false)
 const voltearV = ref(false)
 
-// Estados para AJUSTAR IMAGEN (Escala y Calidad)
 const escalaPorcentaje = ref(75)
 const calidadPorcentaje = ref(85)
 
-// Estados para EDITAR TEXTO (DOCX / TXT)
 const textoEditable = ref('')
 
-// Detecta el nombre real de la carpeta de origen del archivo (Ej. "Descargas", "Documentos", "Escritorio", etc.)
 const nombreCarpetaOrigen = computed(() => {
   if (!rutaArchivoActivo.value) return 'carpeta de origen'
   const normalizada = rutaArchivoActivo.value.replace(/\\/g, '/')
   const partes = normalizada.split('/')
-  partes.pop() // Quita el nombre del archivo
+  partes.pop()
   const carpeta = partes.pop() || ''
   if (!carpeta) return 'carpeta de origen'
   if (carpeta.toLowerCase() === 'desktop') return 'Escritorio'
@@ -199,7 +224,6 @@ const nombreCarpetaOrigen = computed(() => {
   return carpeta
 })
 
-// Estilo dinámico del lienzo aplicando el nivel de Zoom
 const estiloCanvasZoom = computed(() => {
   const factor = zoomNivel.value / 100
   return {
@@ -262,7 +286,6 @@ function crearPathSegmento(anguloCentralGrados: number): string {
   ].join(' ')
 }
 
-// 1. Catálogo de CONVERSIÓN (Scroll Arriba - Inicial)
 const catalogoConversion = {
   pdf: [
     { id: 'docx', label: 'DOCX', angulo: -90, tx: 160, ty: 55 },
@@ -290,7 +313,6 @@ const catalogoConversion = {
   ]
 }
 
-// 2. Catálogo de HERRAMIENTAS (Scroll Abajo)
 const catalogoHerramientas = {
   pdf: [
     { id: 'tool:recortar', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
@@ -348,14 +370,48 @@ const cambiarModoPorScroll = (direccion: 'up' | 'down') => {
 }
 
 const onWheelLocal = (e: WheelEvent) => {
-  if (ventanaAbierta.value) return
+  if (ventanaAbierta.value || trayMenuAbierto.value) return
   if (e.deltaY > 0) cambiarModoPorScroll('down')
   else if (e.deltaY < 0) cambiarModoPorScroll('up')
 }
 
+// --- FUNCIONES DEL PANEL DE BANDEJA ORBIT ---
+const aplicarEstadoTray = (estado: EstadoTrayOrbit) => {
+  if (estado.x) trayPosX.value = estado.x
+  if (estado.y) trayPosY.value = estado.y
+  trayPausado.value = estado.pausadoGaming
+  trayMinutosTimer.value = estado.minutosTimer
+  trayModoTecla.value = estado.modoTeclaActual
+  trayArchivosRecientes.value = estado.archivosRecientes
+  trayIniciarConWindows.value = estado.iniciarConWindows
+}
+
+const ejecutarAccionTray = async (
+  tipo:
+    | 'toggle-gaming'
+    | 'timer'
+    | 'tecla'
+    | 'autostart'
+    | 'abrir-reciente'
+    | 'limpiar-recientes'
+    | 'salir',
+  valor?: any
+) => {
+  const nuevoEstado = await window.api.actualizarConfigTray({ tipo, valor })
+  aplicarEstadoTray(nuevoEstado)
+  if (tipo === 'abrir-reciente') {
+    cerrarMenuTray()
+  }
+}
+
+const cerrarMenuTray = () => {
+  trayMenuAbierto.value = false
+  window.api.cerrarMenu()
+}
+
 onMounted(() => {
   window.api.onToggleMenu((data) => {
-    if (ventanaAbierta.value) return
+    if (ventanaAbierta.value || trayMenuAbierto.value) return
     if (data.mostrar) {
       posX.value = data.x
       posY.value = data.y
@@ -369,18 +425,28 @@ onMounted(() => {
   })
 
   window.api.onScrollMenu((direccion) => {
-    if (showMenu.value && !ventanaAbierta.value) {
+    if (showMenu.value && !ventanaAbierta.value && !trayMenuAbierto.value) {
       cambiarModoPorScroll(direccion)
     }
   })
 
+  window.api.onTrayMenu((estado) => {
+    showMenu.value = false
+    aplicarEstadoTray(estado)
+    trayMenuAbierto.value = estado.mostrar
+  })
+
   window.addEventListener('keydown', (e) => {
-    if (!ventanaAbierta.value) return
     if (e.key === 'Escape') {
-      cerrarVentanaHerramienta()
-    } else if (e.code === 'Space' && herramientaActual.value !== 'editar') {
+      if (trayMenuAbierto.value) cerrarMenuTray()
+      else if (ventanaAbierta.value) cerrarVentanaHerramienta()
+    } else if (ventanaAbierta.value && e.code === 'Space' && herramientaActual.value !== 'editar') {
       espacioPresionado.value = true
-    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+    } else if (
+      ventanaAbierta.value &&
+      (e.ctrlKey || e.metaKey) &&
+      e.key.toLowerCase() === 'z'
+    ) {
       if (herramientaActual.value === 'dibujar') {
         e.preventDefault()
         deshacerTrazo()
@@ -1059,10 +1125,6 @@ const analizarPaginaCompleta = async (
   return bloquesPosicion.map((item) => item.bloque)
 }
 
-// =========================================================================
-// LÓGICA DE LA VENTANA DE HERRAMIENTAS INTERACTIVAS CON ZOOM Y PRECISIÓN
-// =========================================================================
-
 const cambiarZoom = (delta: number) => {
   zoomNivel.value = Math.max(100, Math.min(400, zoomNivel.value + delta))
 }
@@ -1073,7 +1135,6 @@ const restablecerZoom = () => {
 }
 
 const onWheelCanvasZoom = (e: WheelEvent) => {
-  // Permite hacer zoom de precisión con Ctrl + Rueda del ratón o Alt + Rueda
   if (e.ctrlKey || e.altKey) {
     e.preventDefault()
     const paso = e.deltaY < 0 ? 25 : -25
@@ -1090,7 +1151,6 @@ const sincronizarCanvasVistaPrevia = async () => {
   dest.width = src.width
   dest.height = src.height
 
-  // Calculamos las dimensiones base a 100% de zoom para que encaje perfecto en la ventana
   const maxW = 660
   const maxH = 390
   const ratio = Math.min(maxW / src.width, maxH / src.height)
@@ -1158,7 +1218,6 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
       const thumbs: string[] = []
       const sel: number[] = []
 
-      // Mayor resolución base (1750px) para que al hacer Zoom de 300%-400% se vea súper nítido al firmar
       const resObjetivo = tool === 'dibujar' || tool === 'recortar' ? 1750 : 1350
 
       for (let i = 1; i <= pdf.numPages; i++) {
@@ -1223,7 +1282,6 @@ const cerrarVentanaHerramienta = () => {
   window.api.cerrarMenu()
 }
 
-// --- COORDENADAS EXACTAS CON SOPORTE DE ZOOM Y SCROLL ---
 const obtenerCoordenadasCanvas = (e: MouseEvent) => {
   const c = canvasInteractivoRef.value
   if (!c) return { x: 0, y: 0 }
@@ -1238,7 +1296,6 @@ const obtenerCoordenadasCanvas = (e: MouseEvent) => {
 
 const onCanvasMouseDown = (e: MouseEvent) => {
   const scrollBox = contenedorScrollRef.value
-  // Si está activo el Modo Mano (Mover), o presiona Espacio, o usa clic central/derecho -> desplazar vista con zoom
   if (
     modoPan.value ||
     espacioPresionado.value ||
@@ -1271,7 +1328,6 @@ const onCanvasMouseDown = (e: MouseEvent) => {
     ctx.moveTo(pos.x, pos.y)
     ctx.lineTo(pos.x + 0.01, pos.y + 0.01)
     ctx.strokeStyle = colorPincel.value
-    // El grosor se adapta para ser más fino y preciso si el usuario hace mucho zoom
     const factorPrecisionZoom = Math.max(0.45, 100 / zoomNivel.value)
     ctx.lineWidth = grosorPincel.value * (c.width / 800) * factorPrecisionZoom
     ctx.lineCap = 'round'
@@ -1302,7 +1358,6 @@ const onCanvasMouseMove = (e: MouseEvent) => {
     const ctx = c.getContext('2d', { willReadFrequently: true })
     if (!ctx || !ultimoPuntoTrazo.value) return
 
-    // Trazado curvo suavizado de alta precisión para firmas
     const midX = (ultimoPuntoTrazo.value.x + pos.x) / 2
     const midY = (ultimoPuntoTrazo.value.y + pos.y) / 2
     ctx.quadraticCurveTo(ultimoPuntoTrazo.value.x, ultimoPuntoTrazo.value.y, midX, midY)
@@ -1397,7 +1452,6 @@ const estiloOverlayRecorte = computed(() => {
   }
 })
 
-// --- GUARDAR CAMBIOS EN LA CARPETA DE ORIGEN DEL ARCHIVO ---
 const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
   procesando.value = true
   try {
@@ -1724,7 +1778,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     @wheel="onWheelLocal"
   >
     <!-- =================================================================== -->
-    <!-- 1. RUEDA RADIAL ORBIT (INTACTA)                                     -->
+    <!-- 1. RUEDA RADIAL ORBIT                                               -->
     <!-- =================================================================== -->
     <Transition
       enter-active-class="transition duration-150 ease-out"
@@ -1735,7 +1789,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
       leave-to-class="opacity-0 scale-75"
     >
       <div
-        v-if="showMenu && !ventanaAbierta"
+        v-if="showMenu && !ventanaAbierta && !trayMenuAbierto"
         :style="{ left: `${posX}px`, top: `${posY}px` }"
         class="fixed -translate-x-1/2 -translate-y-1/2 w-[320px] h-[320px] flex items-center justify-center pointer-events-auto"
       >
@@ -1849,7 +1903,199 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     </Transition>
 
     <!-- =================================================================== -->
-    <!-- 2. VENTANA DE HERRAMIENTAS CON ZOOM DE PRECISIÓN Y RUTA DE ORIGEN   -->
+    <!-- 2. PANEL DE BANDEJA DEL SISTEMA CON DISEÑO ORBIT                    -->
+    <!-- =================================================================== -->
+    <Transition
+      enter-active-class="transition duration-150 ease-out"
+      enter-from-class="opacity-0 translate-y-4 scale-90"
+      enter-to-class="opacity-100 translate-y-0 scale-100"
+      leave-active-class="transition duration-100 ease-in"
+      leave-from-class="opacity-100 translate-y-0 scale-100"
+      leave-to-class="opacity-0 translate-y-4 scale-90"
+    >
+      <div
+        v-if="trayMenuAbierto"
+        class="fixed inset-0 z-50 pointer-events-auto"
+        @mousedown.self="cerrarMenuTray"
+        @contextmenu.prevent
+      >
+        <div
+          :style="{ left: `${trayPosX}px`, top: `${trayPosY}px` }"
+          class="fixed -translate-x-1/2 -translate-y-1/2 w-[335px] rounded-[30px] bg-orange-950/45 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_22px_60px_rgba(0,0,0,0.7)] p-4 flex flex-col gap-3"
+        >
+          <!-- Encabezado con Estado de Orbit -->
+          <div class="flex items-center justify-between pb-2.5 border-b border-white/25">
+            <div class="flex items-center gap-2.5">
+              <div
+                class="w-9 h-9 rounded-full flex items-center justify-center border border-white/70 shadow-md"
+                :class="
+                  trayPausado
+                    ? 'bg-stone-700/80'
+                    : 'bg-gradient-to-br from-[#f97316] to-[#dc2626] shadow-[0_0_14px_rgba(234,88,12,0.6)]'
+                "
+              >
+                <div class="w-3.5 h-3.5 rounded-full bg-[#fde68a] border border-white/60"></div>
+              </div>
+              <div class="flex flex-col">
+                <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
+                  ORBIT
+                </span>
+                <span
+                  class="text-[11px] font-bold mt-0.5"
+                  :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
+                >
+                  {{
+                    trayPausado
+                      ? trayMinutosTimer > 0
+                        ? `En pausa (${trayMinutosTimer}m)`
+                        : 'En pausa'
+                      : 'Activo en segundo plano'
+                  }}
+                </span>
+              </div>
+            </div>
+
+            <button
+              @click="cerrarMenuTray"
+              class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+
+          <!-- Botón Principal Pausar + Temporizadores -->
+          <div class="flex flex-col gap-2 bg-black/20 rounded-2xl p-2.5 border border-white/20">
+            <button
+              @click="ejecutarAccionTray('toggle-gaming')"
+              class="w-full py-2 px-4 rounded-xl font-extrabold text-xs tracking-wider uppercase border transition-all flex items-center justify-between cursor-pointer"
+              :class="
+                trayPausado
+                  ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-[0_0_16px_rgba(234,88,12,0.6)]'
+                  : 'bg-[#fde68a]/70 hover:bg-[#fde68a] text-[#1c1917] border-white/55'
+              "
+            >
+              <span>{{ trayPausado ? '▶ Reanudar Orbit' : '⏸ Pausar' }}</span>
+              <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/20 text-white">
+                {{ trayPausado ? 'PAUSADO' : 'ACTIVO' }}
+              </span>
+            </button>
+
+            <div class="grid grid-cols-3 gap-1.5">
+              <button
+                v-for="t in [
+                  { min: 30, label: '30 min' },
+                  { min: 60, label: '1 hora' },
+                  { min: 120, label: '2 horas' }
+                ]"
+                :key="t.min"
+                @click="ejecutarAccionTray('timer', t.min)"
+                class="py-1 rounded-full text-[11px] font-extrabold border transition-all cursor-pointer"
+                :class="
+                  trayPausado && trayMinutosTimer === t.min
+                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-md'
+                    : 'bg-[#fde68a]/55 hover:bg-[#fde68a]/85 text-[#1c1917] border-white/40'
+                "
+              >
+                ⏱ {{ t.label }}
+              </button>
+            </div>
+          </div>
+
+          <!-- Selector de Tecla de Activación -->
+          <div class="flex flex-col gap-1.5">
+            <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider px-1">
+              Tecla para abrir la rueda
+            </span>
+            <div class="grid grid-cols-2 gap-1.5">
+              <button
+                v-for="tk in [
+                  { id: 'shift', label: 'Mantener Shift' },
+                  { id: 'doble-shift', label: 'Doble Shift ⚡' },
+                  { id: 'alt', label: 'Mantener Alt' },
+                  { id: 'ctrl', label: 'Mantener Ctrl' }
+                ]"
+                :key="tk.id"
+                @click="ejecutarAccionTray('tecla', tk.id)"
+                class="py-1.5 px-2.5 rounded-xl text-[11px] font-extrabold border transition-all cursor-pointer truncate"
+                :class="
+                  trayModoTecla === tk.id
+                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-[0_0_12px_rgba(234,88,12,0.5)]'
+                    : 'bg-[#fde68a]/60 hover:bg-[#fde68a]/90 text-[#1c1917] border-white/45'
+                "
+              >
+                {{ tk.label }}
+              </button>
+            </div>
+          </div>
+
+          <!-- Historial de Archivos Recientes -->
+          <div class="flex flex-col gap-1.5">
+            <div class="flex items-center justify-between px-1">
+              <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider">
+                Conversiones recientes
+              </span>
+              <button
+                v-if="trayArchivosRecientes.length > 0"
+                @click="ejecutarAccionTray('limpiar-recientes')"
+                class="text-[10px] font-bold text-amber-200 hover:text-white underline cursor-pointer"
+              >
+                Limpiar
+              </button>
+            </div>
+
+            <div
+              v-if="trayArchivosRecientes.length === 0"
+              class="py-2.5 px-3 rounded-xl bg-black/20 border border-white/15 text-center text-white/60 text-xs font-medium"
+            >
+              Aún no hay archivos recientes
+            </div>
+
+            <div v-else class="flex flex-col gap-1 max-h-[108px] overflow-y-auto pr-0.5">
+              <button
+                v-for="item in trayArchivosRecientes"
+                :key="item.ruta"
+                @click="ejecutarAccionTray('abrir-reciente', item.ruta)"
+                class="w-full py-1.5 px-3 rounded-xl bg-[#fde68a]/60 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white border border-white/45 flex items-center justify-between text-left transition-colors cursor-pointer group"
+                title="Mostrar archivo en su carpeta"
+              >
+                <span class="text-xs font-extrabold truncate max-w-[230px]">
+                  {{ item.nombre }}
+                </span>
+                <span class="text-[10px] font-extrabold opacity-70 group-hover:opacity-100">
+                  Abrir ↗
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Pie del Panel: Auto-inicio con Windows y Salir -->
+          <div class="flex items-center justify-between pt-2 border-t border-white/25">
+            <button
+              @click="ejecutarAccionTray('autostart', !trayIniciarConWindows)"
+              class="px-3 py-1.5 rounded-full text-[11px] font-extrabold border transition-all flex items-center gap-1.5 cursor-pointer"
+              :class="
+                trayIniciarConWindows
+                  ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                  : 'bg-[#fde68a]/60 text-[#1c1917] border-white/45'
+              "
+            >
+              <span>{{ trayIniciarConWindows ? '✓' : '○' }}</span>
+              <span>Iniciar con Windows</span>
+            </button>
+
+            <button
+              @click="ejecutarAccionTray('salir')"
+              class="px-4 py-1.5 rounded-full bg-red-600/85 hover:bg-red-600 text-white font-extrabold text-[11px] tracking-wider uppercase border border-white/65 shadow-md cursor-pointer"
+            >
+              Salir
+            </button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- =================================================================== -->
+    <!-- 3. VENTANA DE HERRAMIENTAS CON ZOOM DE PRECISIÓN Y RUTA DE ORIGEN   -->
     <!-- =================================================================== -->
     <Transition
       enter-active-class="transition duration-200 ease-out"
@@ -1884,7 +2130,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- Controles de Zoom de Precisión (En Dibujar, Firmar y Recortar) -->
+            <!-- Controles de Zoom de Precisión -->
             <div
               v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'"
               class="flex items-center gap-1.5 bg-[#fde68a]/60 border border-white/55 rounded-full px-3 py-1 shadow-inner"
@@ -1911,7 +2157,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 +
               </button>
 
-              <!-- Botón Modo Mano (Mover vista con zoom) -->
               <button
                 v-if="zoomNivel > 100"
                 @click="modoPan = !modoPan"
@@ -1921,13 +2166,12 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
                     : 'bg-white/50 text-[#1c1917] border-white/60'
                 "
-                title="También puedes mantener presionada la barra espaciadora o clic derecho para mover"
               >
                 ✋ {{ modoPan ? 'Moviendo' : 'Mover' }}
               </button>
             </div>
 
-            <!-- Selector de Páginas (Si es PDF de varias hojas) -->
+            <!-- Selector de Páginas -->
             <div
               v-if="paginasCanvases.length > 1 && herramientaActual !== 'dividir' && herramientaActual !== 'editar'"
               class="flex items-center gap-2 bg-[#fde68a]/55 border border-white/50 rounded-full px-3 py-1"
@@ -1949,7 +2193,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </button>
             </div>
 
-            <!-- Botón Cerrar -->
             <button
               @click="cerrarVentanaHerramienta"
               class="w-9 h-9 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-sm flex items-center justify-center transition-colors cursor-pointer"
@@ -1960,7 +2203,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
           <!-- CONTENIDO SEGÚN LA HERRAMIENTA SELECCIONADA -->
           <div class="flex-1 overflow-hidden flex flex-col items-center justify-center min-h-[400px]">
-            <!-- A. VISTA PARA RECORTAR / DIBUJAR / ROTAR / AJUSTAR -->
             <div
               v-if="
                 herramientaActual === 'dibujar' ||
@@ -1970,7 +2212,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               "
               class="w-full flex flex-col items-center gap-3"
             >
-              <!-- Controles Superiores de Dibujo -->
+              <!-- Controles de Dibujo -->
               <div
                 v-if="herramientaActual === 'dibujar'"
                 class="flex flex-wrap items-center justify-center gap-2.5 bg-black/20 border border-white/25 rounded-full px-5 py-1.5"
@@ -2027,7 +2269,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </button>
               </div>
 
-              <!-- Controles Superiores de Rotación -->
+              <!-- Controles de Rotación -->
               <div
                 v-if="herramientaActual === 'rotar'"
                 class="flex items-center gap-3 bg-black/20 border border-white/25 rounded-full px-5 py-2"
@@ -2068,7 +2310,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </button>
               </div>
 
-              <!-- Controles de Escala y Compresión (AJUSTAR) -->
+              <!-- Controles de Ajuste -->
               <div
                 v-if="herramientaActual === 'ajustar'"
                 class="flex flex-wrap items-center justify-center gap-4 bg-black/20 border border-white/25 rounded-full px-6 py-2"
@@ -2114,7 +2356,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </div>
               </div>
 
-              <!-- Contenedor con Scroll y Zoom para precisión al firmar o recortar -->
+              <!-- Contenedor con Scroll y Zoom -->
               <div
                 ref="contenedorScrollRef"
                 @wheel="onWheelCanvasZoom"
@@ -2145,7 +2387,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     @mouseleave="onCanvasMouseUp"
                   ></canvas>
 
-                  <!-- Cuadro Naranja de Recorte Interactivo -->
                   <div
                     v-if="herramientaActual === 'recortar' && cajaRecorte.activo"
                     :style="estiloOverlayRecorte"
@@ -2161,7 +2402,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- B. VISTA PARA DIVIDIR / EXTRAER PÁGINAS DE UN PDF -->
+            <!-- VISTA PARA DIVIDIR PDF -->
             <div
               v-else-if="herramientaActual === 'dividir'"
               class="w-full flex flex-col items-center gap-4"
@@ -2213,7 +2454,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- C. VISTA PARA EDITAR DOCUMENTO DE TEXTO (DOCX / TXT) -->
+            <!-- VISTA PARA EDITAR DOCUMENTO -->
             <div
               v-else-if="herramientaActual === 'editar'"
               class="w-full flex flex-col gap-3"
@@ -2231,7 +2472,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
-          <!-- Barra Inferior de Acciones (Guarda siempre en la carpeta de origen detectada) -->
+          <!-- Barra Inferior -->
           <div class="flex items-center justify-between mt-3 pt-3 border-t border-white/25">
             <span class="text-white/70 text-xs font-medium">
               <template v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">

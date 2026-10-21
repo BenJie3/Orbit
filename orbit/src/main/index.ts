@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, screen } from 'electron'
+import { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, shell } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
@@ -10,10 +10,181 @@ import path from 'path'
 import zlib from 'zlib'
 
 let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
 let shiftPresionado = false
 let modoVentanaActivo = false
+let menuTrayVisible = false
 let ultimoScrollMs = 0
 let shellNotifierProc: ChildProcessWithoutNullStreams | null = null
+
+type ModoTecla = 'shift' | 'doble-shift' | 'alt' | 'ctrl'
+let pausado = false
+let minutosTimerActivo = 0
+let timerReanudar: NodeJS.Timeout | null = null
+let modoTeclaActual: ModoTecla = 'shift'
+let ultimoToqueTeclaMs = 0
+let esperandoSegundoToque = false
+let archivosRecientes: string[] = []
+
+const rutaConfig = path.join(app.getPath('userData'), 'orbit-settings.json')
+
+function cargarConfiguracion() {
+  try {
+    if (fs.existsSync(rutaConfig)) {
+      const data = JSON.parse(fs.readFileSync(rutaConfig, 'utf8'))
+      if (data.modoTeclaActual) modoTeclaActual = data.modoTeclaActual
+      if (Array.isArray(data.archivosRecientes)) {
+        archivosRecientes = data.archivosRecientes.filter((r: string) => fs.existsSync(r)).slice(0, 5)
+      }
+    }
+  } catch {}
+}
+
+function guardarConfiguracion() {
+  try {
+    fs.writeFileSync(
+      rutaConfig,
+      JSON.stringify({ modoTeclaActual, archivosRecientes }, null, 2),
+      'utf8'
+    )
+  } catch {}
+}
+
+function registrarArchivoReciente(rutaArchivo: string) {
+  archivosRecientes = [rutaArchivo, ...archivosRecientes.filter((r) => r !== rutaArchivo)].slice(0, 5)
+  guardarConfiguracion()
+}
+
+async function generarIconoTray(activo: boolean): Promise<Electron.NativeImage> {
+  const colorPrimario = activo ? '#f97316' : '#78716c'
+  const colorSecundario = activo ? '#dc2626' : '#44403c'
+  const colorCentro = activo ? '#fde68a' : '#a8a29e'
+
+  const svg = `
+  <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="${colorPrimario}"/>
+        <stop offset="100%" stop-color="${colorSecundario}"/>
+      </linearGradient>
+    </defs>
+    <circle cx="32" cy="32" r="27" fill="none" stroke="url(#g)" stroke-width="11"/>
+    <line x1="32" y1="2" x2="32" y2="17" stroke="#1c1917" stroke-width="3.5"/>
+    <line x1="32" y1="47" x2="32" y2="62" stroke="#1c1917" stroke-width="3.5"/>
+    <line x1="2" y1="32" x2="17" y2="32" stroke="#1c1917" stroke-width="3.5"/>
+    <line x1="47" y1="32" x2="62" y2="32" stroke="#1c1917" stroke-width="3.5"/>
+    <circle cx="32" cy="32" r="8.5" fill="${colorCentro}"/>
+  </svg>`
+
+  const pngBuffer = await sharp(Buffer.from(svg)).resize(32, 32).png().toBuffer()
+  return nativeImage.createFromBuffer(pngBuffer)
+}
+
+function obtenerEstadoTray(mostrar: boolean, x = 0, y = 0) {
+  const loginSettings = app.getLoginItemSettings()
+  return {
+    mostrar,
+    x,
+    y,
+    pausadoGaming: pausado,
+    minutosTimer: minutosTimerActivo,
+    modoTeclaActual,
+    archivosRecientes: archivosRecientes
+      .filter((r) => fs.existsSync(r))
+      .map((r) => ({ nombre: path.basename(r), ruta: r })),
+    iniciarConWindows: loginSettings.openAtLogin
+  }
+}
+
+function ocultarLienzoCompletamente() {
+  shiftPresionado = false
+  modoVentanaActivo = false
+  menuTrayVisible = false
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setIgnoreMouseEvents(true)
+    mainWindow.setSkipTaskbar(true)
+    mainWindow.hide()
+  }
+}
+
+async function cambiarEstadoPausa(pausarEstado: boolean, minutosAutoReanudar = 0) {
+  pausado = pausarEstado
+  minutosTimerActivo = pausarEstado ? minutosAutoReanudar : 0
+
+  if (timerReanudar) {
+    clearTimeout(timerReanudar)
+    timerReanudar = null
+  }
+
+  if (pausado) {
+    shiftPresionado = false
+    if (minutosAutoReanudar > 0) {
+      timerReanudar = setTimeout(() => {
+        cambiarEstadoPausa(false)
+      }, minutosAutoReanudar * 60 * 1000)
+    }
+  }
+
+  if (tray) {
+    const icono = await generarIconoTray(!pausado)
+    tray.setImage(icono)
+    tray.setToolTip(pausado ? 'Orbit — En pausa' : 'Orbit — Activo en segundo plano')
+  }
+}
+
+function abrirPanelTrayPersonalizado() {
+  if (!mainWindow || mainWindow.isDestroyed() || !tray) return
+
+  if (menuTrayVisible) {
+    mainWindow.webContents.send('abrir-menu-tray', obtenerEstadoTray(false))
+    ocultarLienzoCompletamente()
+    return
+  }
+
+  const cursor = screen.getCursorScreenPoint()
+  const display = screen.getDisplayNearestPoint(cursor)
+  const workArea = display.workArea
+
+  const panelAncho = 340
+  const panelAlto = 460
+  const x = Math.max(
+    workArea.x + panelAncho / 2 + 12,
+    Math.min(workArea.x + workArea.width - panelAncho / 2 - 12, cursor.x)
+  )
+  const y = Math.max(
+    workArea.y + panelAlto / 2 + 12,
+    Math.min(workArea.y + workArea.height - panelAlto / 2 - 12, cursor.y - panelAlto / 2 - 15)
+  )
+
+  modoVentanaActivo = true
+  menuTrayVisible = true
+
+  // Mostramos sin activar el icono en la barra de tareas
+  mainWindow.setSkipTaskbar(true)
+  mainWindow.setIgnoreMouseEvents(false)
+  mainWindow.showInactive()
+  mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
+  mainWindow.webContents.send('abrir-menu-tray', obtenerEstadoTray(true, x, y))
+}
+
+async function inicializarTray() {
+  const iconoInicial = await generarIconoTray(!pausado)
+  tray = new Tray(iconoInicial)
+  tray.setToolTip('Orbit — Activo en segundo plano')
+
+  tray.on('right-click', () => {
+    abrirPanelTrayPersonalizado()
+  })
+
+  tray.on('click', () => {
+    abrirPanelTrayPersonalizado()
+  })
+
+  tray.on('double-click', () => {
+    cambiarEstadoPausa(!pausado)
+  })
+}
 
 interface SegmentoTexto {
   texto: string
@@ -37,7 +208,6 @@ interface BloqueDocumento {
   height?: number
 }
 
-// Notifica a Windows Explorer en cualquier carpeta del disco para que el archivo aparezca al instante
 function iniciarNotificadorSistemaArchivos() {
   if (process.platform !== 'win32') return
 
@@ -76,7 +246,6 @@ while ($true) {
   }
 }
 
-// Guardado asíncrono sin bloquear el hilo principal + notificación instantánea a la carpeta de origen
 async function guardarEnOrigenYRefrescar(rutaArchivo: string, datos: Buffer | string) {
   if (typeof datos === 'string') {
     await fs.promises.writeFile(rutaArchivo, datos, 'utf8')
@@ -87,9 +256,10 @@ async function guardarEnOrigenYRefrescar(rutaArchivo: string, datos: Buffer | st
   if (shellNotifierProc && shellNotifierProc.stdin.writable) {
     shellNotifierProc.stdin.write(`${rutaArchivo}\n`)
   }
+
+  registrarArchivoReciente(rutaArchivo)
 }
 
-// Detecta siempre el directorio de origen real del archivo y genera un nombre disponible
 function obtenerRutaSalida(rutaOriginal: string, extDestino: string, sufijo = ''): string {
   const parsed = path.parse(rutaOriginal)
   const base = `${parsed.name}${sufijo}`
@@ -614,16 +784,50 @@ function generarDocxEstructurado(bloques: BloqueDocumento[]): Buffer {
   return crearZipBuffer(archivosZip)
 }
 
+function coincideTeclaActivacion(keycode: number): boolean {
+  if (modoTeclaActual === 'shift' || modoTeclaActual === 'doble-shift') {
+    return keycode === UiohookKey.Shift || keycode === UiohookKey.ShiftRight
+  }
+  if (modoTeclaActual === 'alt') {
+    return keycode === UiohookKey.Alt || keycode === UiohookKey.AltRight
+  }
+  if (modoTeclaActual === 'ctrl') {
+    return keycode === UiohookKey.Ctrl || keycode === UiohookKey.CtrlRight
+  }
+  return false
+}
+
+function mostrarRuedaEnCursor() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  const cursor = screen.getCursorScreenPoint()
+  const display = screen.getPrimaryDisplay()
+  const { x: dispX, y: dispY, width, height } = display.bounds
+
+  const margen = 170
+  const posX = Math.max(margen, Math.min(width - margen, cursor.x - dispX))
+  const posY = Math.max(margen, Math.min(height - margen, cursor.y - dispY))
+
+  mainWindow.setSkipTaskbar(true)
+  mainWindow.setIgnoreMouseEvents(false)
+  mainWindow.showInactive()
+  mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
+  mainWindow.webContents.send('toggle-menu', {
+    mostrar: true,
+    x: posX,
+    y: posY
+  })
+}
+
 function createWindow(): BrowserWindow {
   const primaryDisplay = screen.getPrimaryDisplay()
   const { width, height } = primaryDisplay.bounds
 
   const win = new BrowserWindow({
-    width,
-    height,
-    x: 0,
-    y: 0,
-    show: false,
+    width: width - 2,
+    height: height - 4,
+    x: 1,
+    y: 1,
+    show: false, // Arranca 100% oculto para jamás bloquear la barra de tareas
     autoHideMenuBar: true,
     transparent: true,
     frame: false,
@@ -631,21 +835,26 @@ function createWindow(): BrowserWindow {
     movable: false,
     fullscreenable: false,
     alwaysOnTop: true,
-    skipTaskbar: true,
-    focusable: false,
+    skipTaskbar: true, // Nunca aparece en la barra de tareas
+    focusable: true, // Fijo desde el inicio para no llamar setFocusable() dinámico
     hasShadow: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
-      backgroundThrottling: false
+      backgroundThrottling: false,
+      paintWhenInitiallyHidden: true
     }
   })
 
-  win.setAlwaysOnTop(true, 'screen-saver')
-  win.setIgnoreMouseEvents(true, { forward: true })
+  win.setSkipTaskbar(true)
+  win.setIgnoreMouseEvents(true)
 
-  win.on('ready-to-show', () => {
-    win.showInactive()
+  // Si el panel de la bandeja está abierto y el usuario hace clic en otra app, se oculta solo
+  win.on('blur', () => {
+    if (menuTrayVisible && !win.isDestroyed()) {
+      win.webContents.send('abrir-menu-tray', obtenerEstadoTray(false))
+      ocultarLienzoCompletamente()
+    }
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
@@ -662,268 +871,308 @@ function createWindow(): BrowserWindow {
   return win
 }
 
-app.whenReady().then(() => {
-  electronApp.setAppUserModelId('com.orbit.converter')
-  iniciarNotificadorSistemaArchivos()
+const instanciaUnica = app.requestSingleInstanceLock()
+if (!instanciaUnica) {
+  app.quit()
+} else {
+  app.whenReady().then(async () => {
+    electronApp.setAppUserModelId('com.orbit.converter')
+    cargarConfiguracion()
+    iniciarNotificadorSistemaArchivos()
+    await inicializarTray()
 
-  app.on('browser-window-created', (_, window) => {
-    optimizer.watchWindowShortcuts(window)
-  })
+    app.on('browser-window-created', (_, window) => {
+      optimizer.watchWindowShortcuts(window)
+    })
 
-  mainWindow = createWindow()
+    mainWindow = createWindow()
 
-  uIOhook.on('keydown', (e) => {
-    if (
-      (e.keycode === UiohookKey.Shift || e.keycode === UiohookKey.ShiftRight) &&
-      !shiftPresionado &&
-      !modoVentanaActivo
-    ) {
-      shiftPresionado = true
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        const cursor = screen.getCursorScreenPoint()
-        const display = screen.getPrimaryDisplay()
-        const { x: dispX, y: dispY, width, height } = display.bounds
+    uIOhook.on('keydown', (e) => {
+      if (pausado || modoVentanaActivo) return
+      if (!coincideTeclaActivacion(e.keycode)) return
 
-        const margen = 170
-        const posX = Math.max(margen, Math.min(width - margen, cursor.x - dispX))
-        const posY = Math.max(margen, Math.min(height - margen, cursor.y - dispY))
-
-        mainWindow.setIgnoreMouseEvents(false)
-        mainWindow.webContents.send('toggle-menu', {
-          mostrar: true,
-          x: posX,
-          y: posY
-        })
-      }
-    }
-  })
-
-  uIOhook.on('keyup', (e) => {
-    if (e.keycode === UiohookKey.Shift || e.keycode === UiohookKey.ShiftRight) {
-      shiftPresionado = false
-      if (!modoVentanaActivo && mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setIgnoreMouseEvents(true, { forward: true })
-        mainWindow.webContents.send('toggle-menu', {
-          mostrar: false,
-          x: 0,
-          y: 0
-        })
-      }
-    }
-  })
-
-  // Detector nativo de Scroll con filtro de fluidez (evita saturar IPC)
-  uIOhook.on('wheel', (e) => {
-    if (shiftPresionado && !modoVentanaActivo && mainWindow && !mainWindow.isDestroyed()) {
-      const ahora = Date.now()
-      if (ahora - ultimoScrollMs < 60) return
-      ultimoScrollMs = ahora
-
-      const direccion = e.rotation > 0 ? 'down' : 'up'
-      mainWindow.webContents.send('scroll-menu', direccion)
-    }
-  })
-
-  uIOhook.start()
-
-  ipcMain.on('activar-modo-ventana', () => {
-    modoVentanaActivo = true
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setIgnoreMouseEvents(false)
-      mainWindow.setFocusable(true)
-      mainWindow.focus()
-    }
-  })
-
-  ipcMain.on('forzar-cierre-menu', () => {
-    shiftPresionado = false
-    modoVentanaActivo = false
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setFocusable(false)
-      mainWindow.setIgnoreMouseEvents(true, { forward: true })
-    }
-  })
-
-  // 1. GUARDAR PÁGINAS DE IMAGEN EN LA CARPETA DE ORIGEN DEL ARCHIVO
-  ipcMain.handle(
-    'guardar-paginas-imagen',
-    async (
-      _,
-      paginasBytes: Uint8Array[],
-      formatoDestino: string,
-      rutaOriginal: string,
-      sufijoPersonalizado?: string
-    ) => {
-      try {
-        if (paginasBytes.length === 1) {
-          const outPath = obtenerRutaSalida(
-            rutaOriginal,
-            formatoDestino,
-            sufijoPersonalizado || ''
-          )
-          await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[0]))
-        } else {
-          for (let i = 0; i < paginasBytes.length; i++) {
-            const sufijo = sufijoPersonalizado
-              ? `${sufijoPersonalizado}_pag${i + 1}`
-              : `_pag${i + 1}`
-            const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino, sufijo)
-            await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[i]))
+      if (!shiftPresionado) {
+        if (modoTeclaActual === 'doble-shift') {
+          const ahora = Date.now()
+          if (esperandoSegundoToque && ahora - ultimoToqueTeclaMs <= 360) {
+            shiftPresionado = true
+            esperandoSegundoToque = false
+            mostrarRuedaEnCursor()
+          } else {
+            esperandoSegundoToque = true
+            ultimoToqueTeclaMs = ahora
           }
+        } else {
+          shiftPresionado = true
+          mostrarRuedaEnCursor()
         }
-        return true
-      } catch (error) {
-        console.error('Error al guardar páginas de imagen:', error)
-        return false
       }
-    }
-  )
+    })
 
-  // 2. GUARDAR PÁGINAS RENDERIZADAS O EDITADAS COMO .PDF EN LA CARPETA DE ORIGEN
-  ipcMain.handle(
-    'guardar-paginas-como-pdf',
-    async (
-      _,
-      paginasPngBytes: Uint8Array[],
-      rutaOriginal: string,
-      dimensiones?: { width: number; height: number }[],
-      sufijoPersonalizado?: string
-    ) => {
-      try {
-        const pdfDoc = await PDFDocument.create()
-        for (let i = 0; i < paginasPngBytes.length; i++) {
-          const pngBytes = paginasPngBytes[i]
-          const img = await pdfDoc.embedPng(pngBytes)
-          const w = dimensiones?.[i]?.width || img.width || 612
-          const h = dimensiones?.[i]?.height || img.height || 792
-          const page = pdfDoc.addPage([w, h])
-          page.drawImage(img, { x: 0, y: 0, width: w, height: h })
+    uIOhook.on('keyup', (e) => {
+      if (!coincideTeclaActivacion(e.keycode)) return
+
+      if (shiftPresionado) {
+        shiftPresionado = false
+        if (!modoVentanaActivo && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('toggle-menu', {
+            mostrar: false,
+            x: 0,
+            y: 0
+          })
+          ocultarLienzoCompletamente()
         }
-        const pdfBytes = await pdfDoc.save()
-        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
-        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
-        return true
-      } catch (error) {
-        console.error('Error creando PDF:', error)
-        return false
       }
-    }
-  )
+    })
 
-  // 3. GUARDAR DOCUMENTO .DOCX O .TXT EN LA CARPETA DE ORIGEN
-  ipcMain.handle(
-    'guardar-texto-documento',
-    async (
-      _,
-      bloques: BloqueDocumento[],
-      formatoDestino: 'txt' | 'docx',
-      rutaOriginal: string
-    ) => {
-      try {
-        const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
+    uIOhook.on('wheel', (e) => {
+      if (
+        !pausado &&
+        shiftPresionado &&
+        !modoVentanaActivo &&
+        mainWindow &&
+        !mainWindow.isDestroyed()
+      ) {
+        const ahora = Date.now()
+        if (ahora - ultimoScrollMs < 60) return
+        ultimoScrollMs = ahora
 
-        if (formatoDestino === 'txt') {
-          const lineasTxt: string[] = []
-          for (const b of bloques) {
-            if (b.tipo === 'salto_pagina') {
-              lineasTxt.push('\r\n----------------------------------------\r\n')
-            } else if (b.tipo === 'texto' && b.texto !== undefined) {
-              if ((b.espacioAntes || 0) > 160) lineasTxt.push('')
-              lineasTxt.push(b.texto)
-            } else if (b.tipo === 'tabla' && b.filasTabla) {
-              lineasTxt.push('')
-              for (const fila of b.filasTabla) {
-                const textoFila = fila
-                  .map((celda) => celda.map((s) => s.texto).join(''))
-                  .join('   |   ')
-                lineasTxt.push(textoFila)
-              }
-              lineasTxt.push('')
+        const direccion = e.rotation > 0 ? 'down' : 'up'
+        mainWindow.webContents.send('scroll-menu', direccion)
+      }
+    })
+
+    uIOhook.start()
+
+    ipcMain.on('activar-modo-ventana', () => {
+      modoVentanaActivo = true
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setSkipTaskbar(true)
+        mainWindow.setIgnoreMouseEvents(false)
+        mainWindow.showInactive()
+      }
+    })
+
+    ipcMain.on('forzar-cierre-menu', () => {
+      ocultarLienzoCompletamente()
+    })
+
+    ipcMain.handle('actualizar-config-tray', async (_, accion) => {
+      if (accion.tipo === 'toggle-gaming') {
+        await cambiarEstadoPausa(!pausado, 0)
+      } else if (accion.tipo === 'timer') {
+        const mins = Number(accion.valor) || 0
+        if (pausado && minutosTimerActivo === mins) {
+          await cambiarEstadoPausa(false, 0)
+        } else {
+          await cambiarEstadoPausa(true, mins)
+        }
+      } else if (accion.tipo === 'tecla') {
+        modoTeclaActual = accion.valor
+        guardarConfiguracion()
+      } else if (accion.tipo === 'autostart') {
+        const nuevoValor = Boolean(accion.valor)
+        app.setLoginItemSettings({
+          openAtLogin: nuevoValor,
+          path: app.getPath('exe')
+        })
+      } else if (accion.tipo === 'abrir-reciente') {
+        if (accion.valor && fs.existsSync(accion.valor)) {
+          shell.showItemInFolder(accion.valor)
+        }
+      } else if (accion.tipo === 'limpiar-recientes') {
+        archivosRecientes = []
+        guardarConfiguracion()
+      } else if (accion.tipo === 'salir') {
+        uIOhook.stop()
+        if (shellNotifierProc) shellNotifierProc.kill()
+        app.quit()
+      }
+
+      return obtenerEstadoTray(true)
+    })
+
+    // 1. GUARDAR PÁGINAS DE IMAGEN
+    ipcMain.handle(
+      'guardar-paginas-imagen',
+      async (
+        _,
+        paginasBytes: Uint8Array[],
+        formatoDestino: string,
+        rutaOriginal: string,
+        sufijoPersonalizado?: string
+      ) => {
+        try {
+          if (paginasBytes.length === 1) {
+            const outPath = obtenerRutaSalida(
+              rutaOriginal,
+              formatoDestino,
+              sufijoPersonalizado || ''
+            )
+            await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[0]))
+          } else {
+            for (let i = 0; i < paginasBytes.length; i++) {
+              const sufijo = sufijoPersonalizado
+                ? `${sufijoPersonalizado}_pag${i + 1}`
+                : `_pag${i + 1}`
+              const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino, sufijo)
+              await guardarEnOrigenYRefrescar(outPath, Buffer.from(paginasBytes[i]))
             }
           }
-          const contenidoFinal =
-            lineasTxt.length > 0
-              ? lineasTxt.join('\r\n')
-              : '[Este documento contiene únicamente imágenes sin texto seleccionable]'
-          await guardarEnOrigenYRefrescar(outPath, contenidoFinal)
-        } else {
-          const docxBuffer = generarDocxEstructurado(bloques)
-          await guardarEnOrigenYRefrescar(outPath, docxBuffer)
+          return true
+        } catch (error) {
+          console.error('Error al guardar páginas de imagen:', error)
+          return false
         }
-        return true
-      } catch (error) {
-        console.error('Error al guardar documento:', error)
-        return false
       }
-    }
-  )
+    )
 
-  // 4. LEER ARCHIVOS .DOCX O .TXT
-  ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
-    try {
-      const ext = path.extname(rutaOriginal).toLowerCase()
-      if (ext === '.docx') {
-        return await parsearDocxABloques(rutaOriginal)
-      } else {
-        const contenido = await fs.promises.readFile(rutaOriginal, 'utf8')
-        const lineas = contenido.split(/\r?\n/)
-        const bloques: BloqueDocumento[] = lineas.map((linea) => ({
-          tipo: 'texto',
-          texto: linea,
-          segmentos: [{ texto: linea, fontSize: 11, bold: false }],
-          fontSize: 11,
-          bold: false,
-          align: 'left',
-          espacioDespues: 60
-        }))
-        return bloques
-      }
-    } catch (error) {
-      console.error('Error leyendo documento:', error)
-      return []
-    }
-  })
-
-  // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES EN LA CARPETA DE ORIGEN
-  ipcMain.handle(
-    'convertir-imagen-backend',
-    async (_, rutaOriginal: string, formatoDestino: string) => {
-      try {
-        const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
-
-        if (formatoDestino === 'pdf') {
-          const pngBuffer = await sharp(rutaOriginal).rotate().png().toBuffer()
+    // 2. GUARDAR PÁGINAS RENDERIZADAS O EDITADAS COMO .PDF
+    ipcMain.handle(
+      'guardar-paginas-como-pdf',
+      async (
+        _,
+        paginasPngBytes: Uint8Array[],
+        rutaOriginal: string,
+        dimensiones?: { width: number; height: number }[],
+        sufijoPersonalizado?: string
+      ) => {
+        try {
           const pdfDoc = await PDFDocument.create()
-          const img = await pdfDoc.embedPng(pngBuffer)
-
-          const page = pdfDoc.addPage([img.width, img.height])
-          page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
-
+          for (let i = 0; i < paginasPngBytes.length; i++) {
+            const pngBytes = paginasPngBytes[i]
+            const img = await pdfDoc.embedPng(pngBytes)
+            const w = dimensiones?.[i]?.width || img.width || 612
+            const h = dimensiones?.[i]?.height || img.height || 792
+            const page = pdfDoc.addPage([w, h])
+            page.drawImage(img, { x: 0, y: 0, width: w, height: h })
+          }
           const pdfBytes = await pdfDoc.save()
+          const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
           await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
-        } else if (formatoDestino === 'jpg') {
-          const outBuf = await sharp(rutaOriginal)
-            .rotate()
-            .flatten({ background: '#ffffff' })
-            .jpeg({ quality: 92 })
-            .toBuffer()
-          await guardarEnOrigenYRefrescar(outPath, outBuf)
-        } else if (formatoDestino === 'png') {
-          const outBuf = await sharp(rutaOriginal).rotate().png().toBuffer()
-          await guardarEnOrigenYRefrescar(outPath, outBuf)
-        } else if (formatoDestino === 'webp') {
-          const outBuf = await sharp(rutaOriginal).rotate().webp({ quality: 92 }).toBuffer()
-          await guardarEnOrigenYRefrescar(outPath, outBuf)
+          return true
+        } catch (error) {
+          console.error('Error creando PDF:', error)
+          return false
         }
-
-        return true
-      } catch (error) {
-        console.error('Error convirtiendo imagen:', error)
-        return false
       }
-    }
-  )
-})
+    )
+
+    // 3. GUARDAR DOCUMENTO .DOCX O .TXT
+    ipcMain.handle(
+      'guardar-texto-documento',
+      async (
+        _,
+        bloques: BloqueDocumento[],
+        formatoDestino: 'txt' | 'docx',
+        rutaOriginal: string
+      ) => {
+        try {
+          const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
+
+          if (formatoDestino === 'txt') {
+            const lineasTxt: string[] = []
+            for (const b of bloques) {
+              if (b.tipo === 'salto_pagina') {
+                lineasTxt.push('\r\n----------------------------------------\r\n')
+              } else if (b.tipo === 'texto' && b.texto !== undefined) {
+                if ((b.espacioAntes || 0) > 160) lineasTxt.push('')
+                lineasTxt.push(b.texto)
+              } else if (b.tipo === 'tabla' && b.filasTabla) {
+                lineasTxt.push('')
+                for (const fila of b.filasTabla) {
+                  const textoFila = fila
+                    .map((celda) => celda.map((s) => s.texto).join(''))
+                    .join('   |   ')
+                  lineasTxt.push(textoFila)
+                }
+                lineasTxt.push('')
+              }
+            }
+            const contenidoFinal =
+              lineasTxt.length > 0
+                ? lineasTxt.join('\r\n')
+                : '[Este documento contiene únicamente imágenes sin texto seleccionable]'
+            await guardarEnOrigenYRefrescar(outPath, contenidoFinal)
+          } else {
+            const docxBuffer = generarDocxEstructurado(bloques)
+            await guardarEnOrigenYRefrescar(outPath, docxBuffer)
+          }
+          return true
+        } catch (error) {
+          console.error('Error al guardar documento:', error)
+          return false
+        }
+      }
+    )
+
+    // 4. LEER ARCHIVOS .DOCX O .TXT
+    ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
+      try {
+        const ext = path.extname(rutaOriginal).toLowerCase()
+        if (ext === '.docx') {
+          return await parsearDocxABloques(rutaOriginal)
+        } else {
+          const contenido = await fs.promises.readFile(rutaOriginal, 'utf8')
+          const lineas = contenido.split(/\r?\n/)
+          const bloques: BloqueDocumento[] = lineas.map((linea) => ({
+            tipo: 'texto',
+            texto: linea,
+            segmentos: [{ texto: linea, fontSize: 11, bold: false }],
+            fontSize: 11,
+            bold: false,
+            align: 'left',
+            espacioDespues: 60
+          }))
+          return bloques
+        }
+      } catch (error) {
+        console.error('Error leyendo documento:', error)
+        return []
+      }
+    })
+
+    // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES
+    ipcMain.handle(
+      'convertir-imagen-backend',
+      async (_, rutaOriginal: string, formatoDestino: string) => {
+        try {
+          const outPath = obtenerRutaSalida(rutaOriginal, formatoDestino)
+
+          if (formatoDestino === 'pdf') {
+            const pngBuffer = await sharp(rutaOriginal).rotate().png().toBuffer()
+            const pdfDoc = await PDFDocument.create()
+            const img = await pdfDoc.embedPng(pngBuffer)
+
+            const page = pdfDoc.addPage([img.width, img.height])
+            page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
+
+            const pdfBytes = await pdfDoc.save()
+            await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+          } else if (formatoDestino === 'jpg') {
+            const outBuf = await sharp(rutaOriginal)
+              .rotate()
+              .flatten({ background: '#ffffff' })
+              .jpeg({ quality: 92 })
+              .toBuffer()
+            await guardarEnOrigenYRefrescar(outPath, outBuf)
+          } else if (formatoDestino === 'png') {
+            const outBuf = await sharp(rutaOriginal).rotate().png().toBuffer()
+            await guardarEnOrigenYRefrescar(outPath, outBuf)
+          } else if (formatoDestino === 'webp') {
+            const outBuf = await sharp(rutaOriginal).rotate().webp({ quality: 92 }).toBuffer()
+            await guardarEnOrigenYRefrescar(outPath, outBuf)
+          }
+
+          return true
+        } catch (error) {
+          console.error('Error convirtiendo imagen:', error)
+          return false
+        }
+      }
+    )
+  })
+}
 
 app.on('window-all-closed', () => {
   uIOhook.stop()

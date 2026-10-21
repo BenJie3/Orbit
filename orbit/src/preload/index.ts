@@ -26,10 +26,15 @@ export interface BloqueDocumento {
   height?: number
 }
 
-export interface PaginaPdfRender {
-  pngBytes: Uint8Array
-  width: number
-  height: number
+export interface EstadoTrayOrbit {
+  mostrar: boolean
+  x: number
+  y: number
+  pausadoGaming: boolean
+  minutosTimer: number
+  modoTeclaActual: 'shift' | 'doble-shift' | 'alt' | 'ctrl'
+  archivosRecientes: { nombre: string; ruta: string }[]
+  iniciarConWindows: boolean
 }
 
 contextBridge.exposeInMainWorld('api', {
@@ -38,11 +43,21 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('toggle-menu', (_, data) => callback(data))
   },
 
-  // Escucha el scroll del ratón hacia abajo ('down') o hacia arriba ('up')
   onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => {
     ipcRenderer.removeAllListeners('scroll-menu')
     ipcRenderer.on('scroll-menu', (_, direccion: 'up' | 'down') => callback(direccion))
   },
+
+  // Abre y sincroniza el nuevo menú personalizado de la bandeja del sistema
+  onTrayMenu: (callback: (estado: EstadoTrayOrbit) => void) => {
+    ipcRenderer.removeAllListeners('abrir-menu-tray')
+    ipcRenderer.on('abrir-menu-tray', (_, estado: EstadoTrayOrbit) => callback(estado))
+  },
+
+  actualizarConfigTray: (accion: {
+    tipo: 'toggle-gaming' | 'timer' | 'tecla' | 'autostart' | 'abrir-reciente' | 'limpiar-recientes' | 'salir'
+    valor?: any
+  }) => ipcRenderer.invoke('actualizar-config-tray', accion),
 
   obtenerRuta: (file: File) => {
     try {
@@ -92,7 +107,6 @@ contextBridge.exposeInMainWorld('api', {
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
 
-  // Mantiene la ventana interactiva abierta cuando se abre una herramienta (Recortar, Dibujar, etc.)
   activarModoVentana: () => ipcRenderer.send('activar-modo-ventana'),
 
   cerrarMenu: () => ipcRenderer.send('forzar-cierre-menu')
