@@ -1924,44 +1924,73 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
           class="fixed -translate-x-1/2 -translate-y-1/2 w-[335px] rounded-[30px] bg-orange-950/45 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_22px_60px_rgba(0,0,0,0.7)] p-4 flex flex-col gap-3"
         >
           <!-- Encabezado con Estado de Orbit -->
-          <div class="flex items-center justify-between pb-2.5 border-b border-white/25">
-            <div class="flex items-center gap-2.5">
-              <div
-                class="w-9 h-9 rounded-full flex items-center justify-center border border-white/70 shadow-md"
-                :class="
-                  trayPausado
-                    ? 'bg-stone-700/80'
-                    : 'bg-gradient-to-br from-[#f97316] to-[#dc2626] shadow-[0_0_14px_rgba(234,88,12,0.6)]'
-                "
-              >
-                <div class="w-3.5 h-3.5 rounded-full bg-[#fde68a] border border-white/60"></div>
-              </div>
-              <div class="flex flex-col">
-                <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
-                  ORBIT
-                </span>
-                <span
-                  class="text-[11px] font-bold mt-0.5"
-                  :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
-                >
-                  {{
-                    trayPausado
-                      ? trayMinutosTimer > 0
-                        ? `En pausa (${trayMinutosTimer}m)`
-                        : 'En pausa'
-                      : 'Activo en segundo plano'
-                  }}
-                </span>
-              </div>
-            </div>
+<div class="flex items-center justify-between pb-2.5 border-b border-white/25">
+  <div class="flex items-center gap-2.5">
+    <div class="w-10 h-10 flex items-center justify-center">
+      <svg viewBox="0 0 64 64" class="w-full h-full drop-shadow-md">
+        <defs>
+          <linearGradient id="trayHeaderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" :stop-color="trayPausado ? '#78716c' : '#f97316'" />
+            <stop offset="100%" :stop-color="trayPausado ? '#44403c' : '#dc2626'" />
+          </linearGradient>
+        </defs>
+        <ellipse
+          cx="32"
+          cy="32"
+          rx="27"
+          ry="11"
+          transform="rotate(-30 32 32)"
+          fill="none"
+          stroke="url(#trayHeaderGrad)"
+          stroke-width="5.5"
+          stroke-linecap="round"
+        />
+        <circle
+          cx="32"
+          cy="32"
+          r="11"
+          fill="url(#trayHeaderGrad)"
+          stroke="#1c1917"
+          stroke-width="2.5"
+        />
+        <circle cx="32" cy="32" r="5" :fill="trayPausado ? '#a8a29e' : '#fde68a'" />
+        <circle
+          cx="50"
+          cy="14"
+          r="5.5"
+          :fill="trayPausado ? '#a8a29e' : '#fde68a'"
+          :stroke="trayPausado ? '#44403c' : '#dc2626'"
+          stroke-width="2"
+        />
+      </svg>
+    </div>
 
-            <button
-              @click="cerrarMenuTray"
-              class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
-            >
-              ✕
-            </button>
-          </div>
+    <div class="flex flex-col">
+      <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
+        ORBIT
+      </span>
+      <span
+        class="text-[11px] font-bold mt-0.5"
+        :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
+      >
+        {{
+          trayPausado
+            ? trayMinutosTimer > 0
+              ? `En pausa (${trayMinutosTimer}m)`
+              : 'En pausa'
+            : 'Activo en segundo plano'
+        }}
+      </span>
+    </div>
+  </div>
+
+  <button
+    @click="cerrarMenuTray"
+    class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
+  >
+    ✕
+  </button>
+</div>
 
           <!-- Botón Principal Pausar + Temporizadores -->
           <div class="flex flex-col gap-2 bg-black/20 rounded-2xl p-2.5 border border-white/20">

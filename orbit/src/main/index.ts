@@ -68,12 +68,10 @@ async function generarIconoTray(activo: boolean): Promise<Electron.NativeImage> 
         <stop offset="100%" stop-color="${colorSecundario}"/>
       </linearGradient>
     </defs>
-    <circle cx="32" cy="32" r="27" fill="none" stroke="url(#g)" stroke-width="11"/>
-    <line x1="32" y1="2" x2="32" y2="17" stroke="#1c1917" stroke-width="3.5"/>
-    <line x1="32" y1="47" x2="32" y2="62" stroke="#1c1917" stroke-width="3.5"/>
-    <line x1="2" y1="32" x2="17" y2="32" stroke="#1c1917" stroke-width="3.5"/>
-    <line x1="47" y1="32" x2="62" y2="32" stroke="#1c1917" stroke-width="3.5"/>
-    <circle cx="32" cy="32" r="8.5" fill="${colorCentro}"/>
+    <ellipse cx="32" cy="32" rx="27" ry="11" transform="rotate(-30 32 32)" fill="none" stroke="url(#g)" stroke-width="5.5" stroke-linecap="round"/>
+    <circle cx="32" cy="32" r="11" fill="url(#g)" stroke="#1c1917" stroke-width="2.5"/>
+    <circle cx="32" cy="32" r="5" fill="${colorCentro}"/>
+    <circle cx="50" cy="14" r="5.5" fill="${colorCentro}" stroke="${colorSecundario}" stroke-width="2"/>
   </svg>`
 
   const pngBuffer = await sharp(Buffer.from(svg)).resize(32, 32).png().toBuffer()
