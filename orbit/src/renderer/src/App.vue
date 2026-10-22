@@ -103,6 +103,14 @@ interface EstadoTrayOrbit {
   modoTeclaActual: 'shift' | 'doble-shift' | 'alt' | 'ctrl'
   archivosRecientes: { nombre: string; ruta: string }[]
   iniciarConWindows: boolean
+  versionApp: string
+}
+
+interface ResultadoActualizacion {
+  estado: 'actualizado' | 'disponible' | 'descargando' | 'error'
+  versionNueva?: string
+  mensaje: string
+  urlDescarga?: string
 }
 
 declare global {
@@ -111,6 +119,9 @@ declare global {
       onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => void
       onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => void
       onTrayMenu: (callback: (estado: EstadoTrayOrbit) => void) => void
+      onArchivoGuardadoToast: (
+        callback: (data: { nombre: string; ruta: string; carpeta: string }) => void
+      ) => void
       actualizarConfigTray: (accion: {
         tipo:
           | 'toggle-gaming'
@@ -122,6 +133,7 @@ declare global {
           | 'salir'
         valor?: any
       }) => Promise<EstadoTrayOrbit>
+      buscarActualizaciones: () => Promise<ResultadoActualizacion>
       obtenerRuta: (file: File) => string
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
@@ -142,6 +154,22 @@ declare global {
       ) => Promise<boolean>
       leerDocumentoTexto: (rutaOriginal: string) => Promise<BloqueDocumento[]>
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
+      unirPdfsBackend: (rutasPdfs: string[]) => Promise<boolean>
+      convertirImagenesAPdfUnico: (rutasImagenes: string[]) => Promise<boolean>
+      leerImagenPortapapeles: () => Promise<{
+        pngBytes: Uint8Array
+        rutaSugerida: string
+        nombre: string
+      } | null>
+      leerArchivoBinario: (rutaOriginal: string) => Promise<Uint8Array>
+      guardarMultimediaBytes: (
+        bytes: Uint8Array,
+        extDestino: string,
+        rutaOriginal: string,
+        sufijoPersonalizado?: string
+      ) => Promise<boolean>
+      mostrarArchivoEnCarpeta: (rutaArchivo: string) => Promise<boolean>
+      setMouseIgnore: (ignorar: boolean) => void
       activarModoVentana: () => void
       cerrarMenu: () => void
     }
@@ -154,10 +182,16 @@ const procesando = ref(false)
 const posX = ref(500)
 const posY = ref(400)
 const opcionActiva = ref<string | null>(null)
-const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen'>('pdf')
+const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen' | 'video' | 'audio'>('pdf')
 const modoRueda = ref<'conversion' | 'herramientas'>('conversion')
+const cantidadArchivosEnVuelo = ref(1)
 
-// --- ESTADOS DEL PANEL DE BANDEJA ORBIT (TRAY MENU) ---
+// --- ESTADO DE LA NOTIFICACIÓN TOAST FLOTANTE (OPCIÓN 2) ---
+const toastVisible = ref(false)
+const toastData = ref({ nombre: '', ruta: '', carpeta: '' })
+let timerToastUI: number | null = null
+
+// --- ESTADOS DEL PANEL DE BANDEJA ORBIT Y ACTUALIZADOR (OPCIÓN 5) ---
 const trayMenuAbierto = ref(false)
 const trayPosX = ref(0)
 const trayPosY = ref(0)
@@ -166,9 +200,22 @@ const trayMinutosTimer = ref(0)
 const trayModoTecla = ref<'shift' | 'doble-shift' | 'alt' | 'ctrl'>('shift')
 const trayArchivosRecientes = ref<{ nombre: string; ruta: string }[]>([])
 const trayIniciarConWindows = ref(false)
+const trayVersionApp = ref('0.1.0')
+const buscandoUpdate = ref(false)
+const infoUpdate = ref<ResultadoActualizacion | null>(null)
 
 // --- ESTADOS DE LA VENTANA DE HERRAMIENTAS ORBIT ---
-type TipoHerramienta = 'recortar' | 'dibujar' | 'dividir' | 'rotar' | 'ajustar' | 'editar'
+type TipoHerramienta =
+  | 'recortar'
+  | 'dibujar'
+  | 'dividir'
+  | 'rotar'
+  | 'ajustar'
+  | 'editar'
+  | 'multimedia'
+  | 'capturar'
+  | 'gif'
+
 const ventanaAbierta = ref(false)
 const herramientaActual = ref<TipoHerramienta | null>(null)
 const rutaArchivoActivo = ref('')
@@ -207,9 +254,22 @@ const voltearH = ref(false)
 const voltearV = ref(false)
 
 const escalaPorcentaje = ref(75)
-const calidadPorcentaje = ref(85)
-
+const calidadPorcentaje = ref(80)
 const textoEditable = ref('')
+
+// --- ESTADOS PARA HERRAMIENTAS MULTIMEDIA (VIDEO Y AUDIO) ---
+const mediaUrlActiva = ref('')
+const esVideoActivo = ref(false)
+const videoPlayerRef = ref<HTMLVideoElement | null>(null)
+const audioPlayerRef = ref<HTMLAudioElement | null>(null)
+const duracionMedia = ref(0)
+const inicioCorteSeg = ref(0)
+const finCorteSeg = ref(10)
+const volumenMediaPct = ref(100)
+const velocidadMedia = ref(1)
+const fpsGif = ref(10)
+const anchoGif = ref(360)
+const bytesMultimediaOriginal = shallowRef<Uint8Array | null>(null)
 
 const nombreCarpetaOrigen = computed(() => {
   if (!rutaArchivoActivo.value) return 'carpeta de origen'
@@ -223,6 +283,58 @@ const nombreCarpetaOrigen = computed(() => {
   if (carpeta.toLowerCase() === 'documents') return 'Documentos'
   return carpeta
 })
+
+const herramientasDisponiblesArchivo = computed<{ id: TipoHerramienta; label: string }[]>(() => {
+  const ext = extArchivoActivo.value
+  if (['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext)) {
+    return [
+      { id: 'multimedia', label: 'Recortar / Audio' },
+      { id: 'capturar', label: 'Capturar Frame' },
+      { id: 'gif', label: 'Crear GIF' }
+    ]
+  }
+  if (['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext)) {
+    return [{ id: 'multimedia', label: 'Recortar / Ajustar Audio' }]
+  }
+  if (ext === 'pdf') {
+    return [
+      { id: 'recortar', label: 'Recortar' },
+      { id: 'dibujar', label: 'Dibujar / Firmar' },
+      { id: 'dividir', label: 'Dividir' },
+      { id: 'rotar', label: 'Rotar' },
+      { id: 'ajustar', label: 'Comprimir' }
+    ]
+  }
+  if (ext === 'docx' || ext === 'txt') {
+    return [
+      { id: 'editar', label: 'Editar Texto' },
+      { id: 'dibujar', label: 'Firmar' },
+      { id: 'recortar', label: 'Recortar' },
+      { id: 'rotar', label: 'Rotar' }
+    ]
+  }
+  return [
+    { id: 'recortar', label: 'Recortar' },
+    { id: 'dibujar', label: 'Dibujar' },
+    { id: 'ajustar', label: 'Ajustar' },
+    { id: 'rotar', label: 'Rotar' }
+  ]
+})
+
+const cambiarHerramientaEnVentana = async (nuevaTool: TipoHerramienta) => {
+  herramientaActual.value = nuevaTool
+  zoomNivel.value = 100
+  modoPan.value = false
+  if (
+    nuevaTool !== 'editar' &&
+    nuevaTool !== 'dividir' &&
+    nuevaTool !== 'multimedia' &&
+    nuevaTool !== 'capturar' &&
+    nuevaTool !== 'gif'
+  ) {
+    await sincronizarCanvasVistaPrevia()
+  }
+}
 
 const estiloCanvasZoom = computed(() => {
   const factor = zoomNivel.value / 100
@@ -243,7 +355,6 @@ function crearPathSegmento(anguloCentralGrados: number): string {
   const halfAngle = Math.PI / 4
 
   const aRad = (anguloCentralGrados * Math.PI) / 180
-
   const dOut = Math.asin((gap + rOut) / (R2 - rOut))
   const dIn = Math.asin((gap + rIn) / (R1 + rIn))
 
@@ -286,6 +397,7 @@ function crearPathSegmento(anguloCentralGrados: number): string {
   ].join(' ')
 }
 
+// 1. Catálogo de CONVERSIÓN (Incluye Video y Audio)
 const catalogoConversion = {
   pdf: [
     { id: 'docx', label: 'DOCX', angulo: -90, tx: 160, ty: 55 },
@@ -310,9 +422,22 @@ const catalogoConversion = {
     { id: 'jpg', label: 'JPG', angulo: 0, tx: 265, ty: 160 },
     { id: 'png', label: 'PNG', angulo: 90, tx: 160, ty: 265 },
     { id: 'webp', label: 'WEBP', angulo: 180, tx: 55, ty: 160 }
+  ],
+  video: [
+    { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
+    { id: 'gif', label: 'GIF', angulo: 0, tx: 265, ty: 160 },
+    { id: 'mp3', label: 'MP3', angulo: 90, tx: 160, ty: 265 },
+    { id: 'jpg', label: 'FRAME', angulo: 180, tx: 55, ty: 160 }
+  ],
+  audio: [
+    { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
+    { id: 'mp3', label: 'MP3', angulo: 0, tx: 265, ty: 160 },
+    { id: 'webm', label: 'WEBM', angulo: 90, tx: 160, ty: 265 },
+    { id: 'txt', label: 'INFO', angulo: 180, tx: 55, ty: 160 }
   ]
 }
 
+// 2. Catálogo de HERRAMIENTAS (Scroll Abajo - Incluye herramientas de Video y Audio)
 const catalogoHerramientas = {
   pdf: [
     { id: 'tool:recortar', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
@@ -337,14 +462,31 @@ const catalogoHerramientas = {
     { id: 'tool:dibujar', label: 'FIRMAR', angulo: 0, tx: 265, ty: 160 },
     { id: 'tool:recortar', label: 'RECORTAR', angulo: 90, tx: 160, ty: 265 },
     { id: 'tool:rotar', label: 'ROTAR', angulo: 180, tx: 55, ty: 160 }
+  ],
+  video: [
+    { id: 'tool:multimedia', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:capturar', label: 'CAPTURAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:gif', label: 'CREAR GIF', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:multimedia', label: 'VOLUMEN', angulo: 180, tx: 55, ty: 160 }
+  ],
+  audio: [
+    { id: 'tool:multimedia', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
+    { id: 'tool:multimedia', label: 'VOLUMEN', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:multimedia', label: 'VELOCIDAD', angulo: 90, tx: 160, ty: 265 },
+    { id: 'wav', label: 'A WAV', angulo: 180, tx: 55, ty: 160 }
   ]
 }
 
 const etiquetaCentro = computed(() => {
   if (opcionActiva.value) {
-    return opcionActiva.value.replace('tool:', '').toUpperCase()
+    return opcionActiva.value.replace('tool:', '').replace('unir-pdf', 'UNIR').toUpperCase()
   }
   if (modoRueda.value === 'herramientas') return 'TOOLS'
+  if (cantidadArchivosEnVuelo.value > 1) {
+    const sufijo =
+      tipoDetectado.value === 'imagen' ? 'IMGS' : `${tipoDetectado.value.toUpperCase()}S`
+    return `${cantidadArchivosEnVuelo.value} ${sufijo}`
+  }
   if (tipoDetectado.value === 'imagen') return 'IMG'
   return tipoDetectado.value.toUpperCase()
 })
@@ -352,8 +494,25 @@ const etiquetaCentro = computed(() => {
 const segmentos = computed(() => {
   const fuente =
     modoRueda.value === 'herramientas' ? catalogoHerramientas : catalogoConversion
-  const opciones = fuente[tipoDetectado.value] || fuente.pdf
-  return opciones.map((op) => ({
+  const opcionesBase = [...(fuente[tipoDetectado.value] || fuente.pdf)]
+
+  if (
+    modoRueda.value === 'conversion' &&
+    tipoDetectado.value === 'pdf' &&
+    cantidadArchivosEnVuelo.value > 1
+  ) {
+    opcionesBase[0] = { id: 'unir-pdf', label: 'UNIR PDF', angulo: -90, tx: 160, ty: 55 }
+  }
+
+  if (
+    modoRueda.value === 'conversion' &&
+    tipoDetectado.value === 'imagen' &&
+    cantidadArchivosEnVuelo.value > 1
+  ) {
+    opcionesBase[0] = { id: 'pdf', label: 'UNIR PDF', angulo: -90, tx: 160, ty: 55 }
+  }
+
+  return opcionesBase.map((op) => ({
     ...op,
     path: crearPathSegmento(op.angulo)
   }))
@@ -375,7 +534,7 @@ const onWheelLocal = (e: WheelEvent) => {
   else if (e.deltaY < 0) cambiarModoPorScroll('up')
 }
 
-// --- FUNCIONES DEL PANEL DE BANDEJA ORBIT ---
+// --- FUNCIONES DEL PANEL DE BANDEJA Y BUSCADOR DE ACTUALIZACIONES ---
 const aplicarEstadoTray = (estado: EstadoTrayOrbit) => {
   if (estado.x) trayPosX.value = estado.x
   if (estado.y) trayPosY.value = estado.y
@@ -384,6 +543,7 @@ const aplicarEstadoTray = (estado: EstadoTrayOrbit) => {
   trayModoTecla.value = estado.modoTeclaActual
   trayArchivosRecientes.value = estado.archivosRecientes
   trayIniciarConWindows.value = estado.iniciarConWindows
+  if (estado.versionApp) trayVersionApp.value = estado.versionApp
 }
 
 const ejecutarAccionTray = async (
@@ -404,9 +564,243 @@ const ejecutarAccionTray = async (
   }
 }
 
+const verificarActualizacionesApp = async () => {
+  buscandoUpdate.value = true
+  infoUpdate.value = null
+  try {
+    infoUpdate.value = await window.api.buscarActualizaciones()
+  } catch {
+    infoUpdate.value = {
+      estado: 'error',
+      mensaje: 'No se pudo conectar con el servidor de versiones'
+    }
+  } finally {
+    buscandoUpdate.value = false
+  }
+}
+
 const cerrarMenuTray = () => {
   trayMenuAbierto.value = false
+  infoUpdate.value = null
   window.api.cerrarMenu()
+}
+
+// --- FUNCIONES DE LA NOTIFICACIÓN TOAST FLOTANTE ---
+const configurarMouseToast = (ignorar: boolean) => {
+  window.api.setMouseIgnore(ignorar)
+}
+
+const abrirArchivoDesdeToast = async () => {
+  if (toastData.value.ruta) {
+    await window.api.mostrarArchivoEnCarpeta(toastData.value.ruta)
+  }
+  cerrarToast()
+}
+
+const cerrarToast = () => {
+  toastVisible.value = false
+  window.api.setMouseIgnore(true)
+}
+
+// --- CODIFICADOR NATIVO WAV (PCM 16-BIT) Y GIF89A ANIMADO ---
+function codificarAudioBufferAWav(
+  audioBuffer: AudioBuffer,
+  inicioSeg = 0,
+  finSeg?: number,
+  gananciaVolumen = 1.0
+): Uint8Array {
+  const sampleRate = audioBuffer.sampleRate
+  const numChannels = Math.min(2, audioBuffer.numberOfChannels)
+  const startSample = Math.max(0, Math.floor(inicioSeg * sampleRate))
+  const endSample = Math.min(
+    audioBuffer.length,
+    finSeg ? Math.floor(finSeg * sampleRate) : audioBuffer.length
+  )
+  const frameCount = Math.max(1, endSample - startSample)
+
+  const bytesPerSample = 2
+  const blockAlign = numChannels * bytesPerSample
+  const dataSize = frameCount * blockAlign
+  const buffer = new ArrayBuffer(44 + dataSize)
+  const view = new DataView(buffer)
+
+  const writeStr = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
+  }
+
+  writeStr(0, 'RIFF')
+  view.setUint32(4, 36 + dataSize, true)
+  writeStr(8, 'WAVE')
+  writeStr(12, 'fmt ')
+  view.setUint32(16, 16, true)
+  view.setUint16(20, 1, true)
+  view.setUint16(22, numChannels, true)
+  view.setUint32(24, sampleRate, true)
+  view.setUint32(28, sampleRate * blockAlign, true)
+  view.setUint16(32, blockAlign, true)
+  view.setUint16(34, 16, true)
+  writeStr(36, 'data')
+  view.setUint32(40, dataSize, true)
+
+  const channels: Float32Array[] = []
+  for (let c = 0; c < numChannels; c++) {
+    channels.push(audioBuffer.getChannelData(c))
+  }
+
+  let offset = 44
+  for (let i = 0; i < frameCount; i++) {
+    const idx = startSample + i
+    for (let c = 0; c < numChannels; c++) {
+      const sample = Math.max(-1, Math.min(1, channels[c][idx] * gananciaVolumen))
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
+      offset += 2
+    }
+  }
+
+  return new Uint8Array(buffer)
+}
+
+// Codificador GIF89a nativo con paleta cuantizada 3-3-2 (256 colores)
+function codificarFramesAGif(
+  frames: ImageData[],
+  width: number,
+  height: number,
+  delayMs: number
+): Uint8Array {
+  const bytes: number[] = []
+  const writeStr = (s: string) => {
+    for (let i = 0; i < s.length; i++) bytes.push(s.charCodeAt(i))
+  }
+  const writeU16 = (v: number) => {
+    bytes.push(v & 0xff, (v >> 8) & 0xff)
+  }
+
+  writeStr('GIF89a')
+  writeU16(width)
+  writeU16(height)
+  bytes.push(0xf7, 0, 0)
+
+  // Paleta global 3-3-2 (256 colores exactos)
+  for (let i = 0; i < 256; i++) {
+    const r = Math.round(((i >> 5) & 0x07) * (255 / 7))
+    const g = Math.round(((i >> 2) & 0x07) * (255 / 7))
+    const b = Math.round((i & 0x03) * (255 / 3))
+    bytes.push(r, g, b)
+  }
+
+  // Extensión Netscape para bucle infinito
+  bytes.push(0x21, 0xff, 0x0b)
+  writeStr('NETSCAPE2.0')
+  bytes.push(0x03, 0x01, 0x00, 0x00, 0x00)
+
+  const delayCs = Math.max(2, Math.round(delayMs / 10))
+
+  for (const frame of frames) {
+    bytes.push(0x21, 0xf9, 0x04, 0x00)
+    writeU16(delayCs)
+    bytes.push(0x00, 0x00)
+
+    bytes.push(0x2c)
+    writeU16(0)
+    writeU16(0)
+    writeU16(width)
+    writeU16(height)
+    bytes.push(0x00)
+
+    // LZW con código mínimo de 8 bits y reinicio de diccionario cada 250 píxeles
+    bytes.push(8)
+    const data = frame.data
+    const totalPixels = width * height
+
+    let bitBuffer = 0
+    let bitCount = 0
+    let subBlock: number[] = []
+
+    const emitCode = (code: number) => {
+      bitBuffer |= code << bitCount
+      bitCount += 9
+      while (bitCount >= 8) {
+        subBlock.push(bitBuffer & 0xff)
+        bitBuffer >>= 8
+        bitCount -= 8
+        if (subBlock.length === 255) {
+          bytes.push(255, ...subBlock)
+          subBlock = []
+        }
+      }
+    }
+
+    emitCode(256) // Clear code inicial
+    let countInTable = 0
+    for (let p = 0; p < totalPixels; p++) {
+      const idx = p * 4
+      const r = data[idx] >> 5
+      const g = data[idx + 1] >> 5
+      const b = data[idx + 2] >> 6
+      const colorIdx = (r << 5) | (g << 2) | b
+      emitCode(colorIdx)
+      countInTable++
+      if (countInTable === 250) {
+        emitCode(256)
+        countInTable = 0
+      }
+    }
+    emitCode(257) // End of Information code
+
+    if (bitCount > 0) {
+      subBlock.push(bitBuffer & 0xff)
+    }
+    if (subBlock.length > 0) {
+      bytes.push(subBlock.length, ...subBlock)
+    }
+    bytes.push(0x00)
+  }
+
+  bytes.push(0x3b)
+  return new Uint8Array(bytes)
+}
+
+// --- PEGAR IMAGEN DESDE PORTAPAPELES (CTRL + V) ---
+const abrirImagenDesdePortapapeles = async (toolInicial: TipoHerramienta = 'recortar') => {
+  const clip = await window.api.leerImagenPortapapeles()
+  if (!clip) return
+
+  trayMenuAbierto.value = false
+  showMenu.value = false
+  procesando.value = true
+  window.api.activarModoVentana()
+
+  try {
+    rutaArchivoActivo.value = clip.rutaSugerida
+    nombreArchivoActivo.value = clip.nombre
+    extArchivoActivo.value = 'png'
+    herramientaActual.value = toolInicial
+    paginaIndice.value = 0
+    rotacionGrados.value = 0
+    voltearH.value = false
+    voltearV.value = false
+    zoomNivel.value = 100
+    modoPan.value = false
+
+    const img = await cargarImagenDesdeBytes(clip.pngBytes, 'image/png')
+    const c = document.createElement('canvas')
+    c.width = img.naturalWidth || 800
+    c.height = img.naturalHeight || 600
+    const ctx = c.getContext('2d', { alpha: false })!
+    ctx.fillStyle = '#FFFFFF'
+    ctx.fillRect(0, 0, c.width, c.height)
+    ctx.drawImage(img, 0, 0)
+
+    paginasCanvases.value = [c]
+    paginasMiniaturas.value = [c.toDataURL('image/jpeg', 0.8)]
+    ventanaAbierta.value = true
+    await sincronizarCanvasVistaPrevia()
+  } catch (error) {
+    console.error('Error abriendo captura del portapapeles:', error)
+    cerrarVentanaHerramienta()
+  } finally {
+    procesando.value = false
+  }
 }
 
 onMounted(() => {
@@ -416,11 +810,13 @@ onMounted(() => {
       posX.value = data.x
       posY.value = data.y
       modoRueda.value = 'conversion'
+      cantidadArchivosEnVuelo.value = 1
       showMenu.value = true
     } else if (!procesando.value) {
       showMenu.value = false
       opcionActiva.value = null
       modoRueda.value = 'conversion'
+      cantidadArchivosEnVuelo.value = 1
     }
   })
 
@@ -436,10 +832,27 @@ onMounted(() => {
     trayMenuAbierto.value = estado.mostrar
   })
 
+  window.api.onArchivoGuardadoToast((data) => {
+    toastData.value = data
+    toastVisible.value = true
+    if (timerToastUI) window.clearTimeout(timerToastUI)
+    timerToastUI = window.setTimeout(() => {
+      toastVisible.value = false
+    }, 4000)
+  })
+
   window.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       if (trayMenuAbierto.value) cerrarMenuTray()
       else if (ventanaAbierta.value) cerrarVentanaHerramienta()
+    } else if (
+      (e.ctrlKey || e.metaKey) &&
+      e.key.toLowerCase() === 'v' &&
+      (showMenu.value || trayMenuAbierto.value) &&
+      !ventanaAbierta.value
+    ) {
+      e.preventDefault()
+      abrirImagenDesdePortapapeles('recortar')
     } else if (ventanaAbierta.value && e.code === 'Space' && herramientaActual.value !== 'editar') {
       espacioPresionado.value = true
     } else if (
@@ -467,8 +880,14 @@ const detectarTipoEnVuelo = (event: DragEvent) => {
   const items = event.dataTransfer?.items
   if (!items || items.length === 0) return
 
+  cantidadArchivosEnVuelo.value = items.length
+
   const mime = (items[0].type || '').toLowerCase()
-  if (mime.startsWith('image/')) {
+  if (mime.startsWith('video/')) {
+    tipoDetectado.value = 'video'
+  } else if (mime.startsWith('audio/')) {
+    tipoDetectado.value = 'audio'
+  } else if (mime.startsWith('image/')) {
     tipoDetectado.value = 'imagen'
   } else if (mime.includes('word') || mime.includes('officedocument')) {
     tipoDetectado.value = 'docx'
@@ -1125,6 +1544,127 @@ const analizarPaginaCompleta = async (
   return bloquesPosicion.map((item) => item.bloque)
 }
 
+// --- MOTOR DE CONVERSIÓN DIRECTA DE VIDEO Y AUDIO ---
+const extraerAudioAWavDirecto = async (
+  bytesOrigen: Uint8Array,
+  inicioSeg = 0,
+  finSeg?: number,
+  ganancia = 1.0,
+  velocidad = 1.0
+): Promise<Uint8Array> => {
+  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+  try {
+    const copiaBuffer = bytesOrigen.buffer.slice(
+      bytesOrigen.byteOffset,
+      bytesOrigen.byteOffset + bytesOrigen.byteLength
+    ) as ArrayBuffer
+    const decoded = await audioCtx.decodeAudioData(copiaBuffer)
+
+    if (velocidad !== 1.0) {
+      const duracionTramo = (finSeg || decoded.duration) - inicioSeg
+      const nuevaLongitud = Math.max(
+        1,
+        Math.floor((duracionTramo / velocidad) * decoded.sampleRate)
+      )
+      const offlineCtx = new OfflineAudioContext(
+        Math.min(2, decoded.numberOfChannels),
+        nuevaLongitud,
+        decoded.sampleRate
+      )
+      const source = offlineCtx.createBufferSource()
+      source.buffer = decoded
+      source.playbackRate.value = velocidad
+      const gainNode = offlineCtx.createGain()
+      gainNode.gain.value = ganancia
+      source.connect(gainNode)
+      gainNode.connect(offlineCtx.destination)
+      source.start(0, inicioSeg, duracionTramo)
+      const rendered = await offlineCtx.startRendering()
+      return codificarAudioBufferAWav(rendered, 0, rendered.duration, 1.0)
+    }
+
+    return codificarAudioBufferAWav(decoded, inicioSeg, finSeg, ganancia)
+  } finally {
+    await audioCtx.close().catch(() => {})
+  }
+}
+
+const convertirVideoAGif = async (
+  videoUrl: string,
+  inicioSeg: number,
+  finSeg: number,
+  fps = 10,
+  anchoMax = 360
+): Promise<Uint8Array> => {
+  const video = document.createElement('video')
+  video.src = videoUrl
+  video.muted = true
+  video.playsInline = true
+
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve()
+    video.onerror = () => reject(new Error('No se pudo cargar el video'))
+  })
+
+  const duracionTotal = video.duration || 5
+  const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.2))
+  const tEnd = Math.min(duracionTotal, Math.max(tStart + 0.5, finSeg))
+  const pasoSeg = 1 / fps
+
+  const ratio = (video.videoHeight || 360) / (video.videoWidth || 640)
+  const w = anchoMax
+  const h = Math.max(60, Math.round(w * ratio))
+
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+
+  const frames: ImageData[] = []
+  const maxFrames = 65
+
+  for (let t = tStart; t <= tEnd && frames.length < maxFrames; t += pasoSeg) {
+    video.currentTime = t
+    await new Promise<void>((res) => {
+      const onSeek = () => {
+        video.removeEventListener('seeked', onSeek)
+        res()
+      }
+      video.addEventListener('seeked', onSeek)
+    })
+    ctx.drawImage(video, 0, 0, w, h)
+    frames.push(ctx.getImageData(0, 0, w, h))
+  }
+
+  return codificarFramesAGif(frames, w, h, Math.round(1000 / fps))
+}
+
+const capturarFrameDeVideo = async (
+  videoUrl: string,
+  segundo = 0.5,
+  formato: 'jpg' | 'png' = 'jpg'
+): Promise<Uint8Array> => {
+  const video = document.createElement('video')
+  video.src = videoUrl
+  video.muted = true
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve()
+    video.onerror = () => reject(new Error('No se pudo abrir el video'))
+  })
+
+  video.currentTime = Math.min(video.duration || 0, Math.max(0, segundo))
+  await new Promise<void>((res) => {
+    video.onseeked = () => res()
+  })
+
+  const canvas = document.createElement('canvas')
+  canvas.width = video.videoWidth || 1280
+  canvas.height = video.videoHeight || 720
+  const ctx = canvas.getContext('2d', { alpha: false })!
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+  return await canvasToUint8ArrayDirecto(canvas, formato, 0.94)
+}
+
 const cambiarZoom = (delta: number) => {
   zoomNivel.value = Math.max(100, Math.min(400, zoomNivel.value + delta))
 }
@@ -1180,6 +1720,21 @@ watch(paginaIndice, () => {
   }
 })
 
+const onMediaMetadataLoaded = (e: Event) => {
+  const el = e.target as HTMLMediaElement
+  const d = el.duration && isFinite(el.duration) ? Math.round(el.duration * 10) / 10 : 10
+  duracionMedia.value = d
+  inicioCorteSeg.value = 0
+  finCorteSeg.value = d
+}
+
+const aplicarVelocidadYVolumen = () => {
+  const el = esVideoActivo.value ? videoPlayerRef.value : audioPlayerRef.value
+  if (!el) return
+  el.playbackRate = velocidadMedia.value
+  el.volume = Math.min(1, volumenMediaPct.value / 100)
+}
+
 const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: TipoHerramienta) => {
   procesando.value = true
   window.api.activarModoVentana()
@@ -1198,10 +1753,32 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
   voltearV.value = false
   zoomNivel.value = 100
   modoPan.value = false
+  volumenMediaPct.value = 100
+  velocidadMedia.value = 1
+
+  if (mediaUrlActiva.value) {
+    URL.revokeObjectURL(mediaUrlActiva.value)
+    mediaUrlActiva.value = ''
+  }
 
   try {
+    const esVideo = ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext) || file.type.startsWith('video/')
+    const esAudio = ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext) || file.type.startsWith('audio/')
     const esPdf = ext === 'pdf' || file.type === 'application/pdf'
     const esDocTexto = ext === 'docx' || ext === 'txt'
+
+    if (esVideo || esAudio) {
+      esVideoActivo.value = esVideo
+      const bytes = await window.api.leerArchivoBinario(rutaReal)
+      bytesMultimediaOriginal.value = bytes
+      const blob = new Blob([bytes], {
+        type: file.type || (esVideo ? 'video/mp4' : 'audio/mpeg')
+      })
+      mediaUrlActiva.value = URL.createObjectURL(blob)
+      showMenu.value = false
+      ventanaAbierta.value = true
+      return
+    }
 
     if (esPdf) {
       const arrayBuffer = await file.arrayBuffer()
@@ -1238,11 +1815,9 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
         .map((b) => b.texto)
         .join('\n\n')
 
-      if (tool !== 'editar') {
-        const canvases = await renderizarBloquesACanvases(bloques)
-        paginasCanvases.value = canvases
-        paginasMiniaturas.value = canvases.map((c) => c.toDataURL('image/jpeg', 0.75))
-      }
+      const canvases = await renderizarBloquesACanvases(bloques)
+      paginasCanvases.value = canvases
+      paginasMiniaturas.value = canvases.map((c) => c.toDataURL('image/jpeg', 0.75))
     } else {
       const ab = await file.arrayBuffer()
       const mime = file.type || 'image/png'
@@ -1270,6 +1845,11 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
 }
 
 const cerrarVentanaHerramienta = () => {
+  if (mediaUrlActiva.value) {
+    URL.revokeObjectURL(mediaUrlActiva.value)
+    mediaUrlActiva.value = ''
+  }
+  bytesMultimediaOriginal.value = null
   ventanaAbierta.value = false
   herramientaActual.value = null
   showMenu.value = false
@@ -1296,12 +1876,7 @@ const obtenerCoordenadasCanvas = (e: MouseEvent) => {
 
 const onCanvasMouseDown = (e: MouseEvent) => {
   const scrollBox = contenedorScrollRef.value
-  if (
-    modoPan.value ||
-    espacioPresionado.value ||
-    e.button === 1 ||
-    e.button === 2
-  ) {
+  if (modoPan.value || espacioPresionado.value || e.button === 1 || e.button === 2) {
     if (scrollBox) {
       arrastrandoPan.value = true
       panInicio.value = {
@@ -1460,7 +2035,52 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       ? extArchivoActivo.value
       : 'png'
 
-    if (herramientaActual.value === 'dibujar') {
+    // 1. HERRAMIENTAS MULTIMEDIA (VIDEO / AUDIO / CAPTURA / GIF)
+    if (herramientaActual.value === 'capturar' && videoPlayerRef.value) {
+      const v = videoPlayerRef.value
+      const canvas = document.createElement('canvas')
+      canvas.width = v.videoWidth || 1280
+      canvas.height = v.videoHeight || 720
+      const ctx = canvas.getContext('2d', { alpha: false })!
+      ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
+      const fmt = (formatoSalidaOpcional || 'jpg') as 'jpg' | 'png'
+      const bytes = await canvasToUint8ArrayDirecto(canvas, fmt, 0.95)
+      await window.api.guardarPaginasImagen(
+        [bytes],
+        fmt,
+        rutaArchivoActivo.value,
+        `_frame_${Math.round(v.currentTime)}s`
+      )
+    } else if (herramientaActual.value === 'gif' && mediaUrlActiva.value) {
+      const gifBytes = await convertirVideoAGif(
+        mediaUrlActiva.value,
+        inicioCorteSeg.value,
+        finCorteSeg.value,
+        fpsGif.value,
+        anchoGif.value
+      )
+      await window.api.guardarMultimediaBytes(
+        gifBytes,
+        'gif',
+        rutaArchivoActivo.value,
+        '_clip'
+      )
+    } else if (herramientaActual.value === 'multimedia' && bytesMultimediaOriginal.value) {
+      const destino = formatoSalidaOpcional || 'wav'
+      const wavBytes = await extraerAudioAWavDirecto(
+        bytesMultimediaOriginal.value,
+        inicioCorteSeg.value,
+        finCorteSeg.value,
+        volumenMediaPct.value / 100,
+        velocidadMedia.value
+      )
+      await window.api.guardarMultimediaBytes(
+        wavBytes,
+        destino,
+        rutaArchivoActivo.value,
+        '_recorte'
+      )
+    } else if (herramientaActual.value === 'dibujar') {
       if (esPdfOrigen || extArchivoActivo.value === 'docx' || extArchivoActivo.value === 'txt') {
         const bytesList: Uint8Array[] = []
         const dims: { width: number; height: number }[] = []
@@ -1598,28 +2218,51 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         }
       }
     } else if (herramientaActual.value === 'ajustar') {
-      const src = paginasCanvases.value[0]
       const factor = escalaPorcentaje.value / 100
-      const outCanvas = document.createElement('canvas')
-      outCanvas.width = Math.max(16, Math.round(src.width * factor))
-      outCanvas.height = Math.max(16, Math.round(src.height * factor))
-      const ctx = outCanvas.getContext('2d', { alpha: false })!
-      ctx.fillStyle = '#FFFFFF'
-      ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
-      ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
+      const calidad = calidadPorcentaje.value / 100
 
-      const fmt = formatoSalidaOpcional || formatoImgDestino
-      const bytes = await canvasToUint8ArrayDirecto(
-        outCanvas,
-        fmt,
-        calidadPorcentaje.value / 100
-      )
-      await window.api.guardarPaginasImagen(
-        [bytes],
-        fmt,
-        rutaArchivoActivo.value,
-        `_${escalaPorcentaje.value}pct`
-      )
+      if (esPdfOrigen) {
+        const bytesList: Uint8Array[] = []
+        const dims: { width: number; height: number }[] = []
+
+        for (const src of paginasCanvases.value) {
+          const outCanvas = document.createElement('canvas')
+          outCanvas.width = Math.max(16, Math.round(src.width * factor))
+          outCanvas.height = Math.max(16, Math.round(src.height * factor))
+          const ctx = outCanvas.getContext('2d', { alpha: false })!
+          ctx.fillStyle = '#FFFFFF'
+          ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+          ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
+
+          bytesList.push(await canvasToUint8ArrayDirecto(outCanvas, 'jpg', calidad))
+          dims.push({ width: Math.round(src.width * 0.5), height: Math.round(src.height * 0.5) })
+        }
+
+        await window.api.guardarPaginasComoPdf(
+          bytesList,
+          rutaArchivoActivo.value,
+          dims,
+          '_comprimido'
+        )
+      } else {
+        const src = paginasCanvases.value[0]
+        const outCanvas = document.createElement('canvas')
+        outCanvas.width = Math.max(16, Math.round(src.width * factor))
+        outCanvas.height = Math.max(16, Math.round(src.height * factor))
+        const ctx = outCanvas.getContext('2d', { alpha: false })!
+        ctx.fillStyle = '#FFFFFF'
+        ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+        ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
+
+        const fmt = formatoSalidaOpcional || formatoImgDestino
+        const bytes = await canvasToUint8ArrayDirecto(outCanvas, fmt, calidad)
+        await window.api.guardarPaginasImagen(
+          [bytes],
+          fmt,
+          rutaArchivoActivo.value,
+          `_${escalaPorcentaje.value}pct`
+        )
+      }
     } else if (herramientaActual.value === 'editar') {
       const lineas = textoEditable.value.split(/\r?\n/)
       const bloques: BloqueDocumento[] = lineas.map((l) => ({
@@ -1656,107 +2299,160 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
   }
 }
 
+const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoDestino: string) => {
+  const ext = rutaReal.split('.').pop()?.toLowerCase() || ''
+  if (ext === formatoDestino || (ext === 'jpeg' && formatoDestino === 'jpg')) return
+
+  const esVideo = ['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext) || file.type.startsWith('video/')
+  const esAudio = ['mp3', 'wav', 'ogg', 'm4a', 'flac', 'aac'].includes(ext) || file.type.startsWith('audio/')
+  const esPdf = ext === 'pdf' || file.type === 'application/pdf'
+  const esDocTexto = ext === 'docx' || ext === 'txt'
+
+  // CONVERSIÓN DE VIDEO / AUDIO DESDE LA RUEDA
+  if (esVideo || esAudio) {
+    const bytes = await window.api.leerArchivoBinario(rutaReal)
+    if (formatoDestino === 'wav' || formatoDestino === 'mp3' || formatoDestino === 'webm') {
+      const wavBytes = await extraerAudioAWavDirecto(bytes, 0, undefined, 1.0, 1.0)
+      await window.api.guardarMultimediaBytes(wavBytes, formatoDestino, rutaReal)
+    } else if (formatoDestino === 'gif' && esVideo) {
+      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const url = URL.createObjectURL(blob)
+      try {
+        const gifBytes = await convertirVideoAGif(url, 0, 5, 10, 360)
+        await window.api.guardarMultimediaBytes(gifBytes, 'gif', rutaReal)
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+    } else if ((formatoDestino === 'jpg' || formatoDestino === 'png') && esVideo) {
+      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const url = URL.createObjectURL(blob)
+      try {
+        const imgBytes = await capturarFrameDeVideo(url, 0.5, formatoDestino)
+        await window.api.guardarPaginasImagen([imgBytes], formatoDestino, rutaReal, '_frame')
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+    } else if (formatoDestino === 'txt') {
+      const infoBloques: BloqueDocumento[] = [
+        { tipo: 'texto', texto: `Archivo Multimedia: ${file.name}`, bold: true, fontSize: 14 },
+        { tipo: 'texto', texto: `Tamaño: ${(file.size / 1024 / 1024).toFixed(2)} MB`, fontSize: 11 },
+        { tipo: 'texto', texto: `Formato original: ${ext.toUpperCase()}`, fontSize: 11 }
+      ]
+      await window.api.guardarTextoDocumento(infoBloques, 'txt', rutaReal)
+    }
+    return
+  }
+
+  if (esPdf && ['jpg', 'png', 'webp'].includes(formatoDestino)) {
+    const arrayBuffer = await file.arrayBuffer()
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(arrayBuffer),
+      isEvalSupported: false,
+      useSystemFonts: true,
+      disableFontFace: true,
+      isOffscreenCanvasSupported: false
+    } as any)
+
+    const pdf = await loadingTask.promise
+    const paginasBytes: Uint8Array[] = []
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i)
+      const { canvas } = await renderizarPaginaACanvas(page, 1600)
+      const bytes = await canvasToUint8ArrayDirecto(canvas, formatoDestino)
+      paginasBytes.push(bytes)
+    }
+
+    await window.api.guardarPaginasImagen(paginasBytes, formatoDestino, rutaReal)
+  } else if (esPdf && (formatoDestino === 'txt' || formatoDestino === 'docx')) {
+    const arrayBuffer = await file.arrayBuffer()
+    const loadingTask = pdfjsLib.getDocument({
+      data: new Uint8Array(arrayBuffer),
+      isEvalSupported: false,
+      useSystemFonts: true,
+      disableFontFace: true,
+      isOffscreenCanvasSupported: false
+    } as any)
+
+    const pdf = await loadingTask.promise
+    const bloquesTotales: BloqueDocumento[] = []
+
+    for (let i = 1; i <= pdf.numPages; i++) {
+      if (i > 1) {
+        bloquesTotales.push({ tipo: 'salto_pagina' })
+      }
+
+      const page = await pdf.getPage(i)
+      const textContent = await page.getTextContent()
+      const bloquesPagina = await analizarPaginaCompleta(
+        page,
+        textContent,
+        formatoDestino as 'txt' | 'docx'
+      )
+      bloquesTotales.push(...bloquesPagina)
+    }
+
+    await window.api.guardarTextoDocumento(
+      bloquesTotales,
+      formatoDestino as 'txt' | 'docx',
+      rutaReal
+    )
+  } else if (esDocTexto) {
+    const bloques = await window.api.leerDocumentoTexto(rutaReal)
+
+    if (formatoDestino === 'txt' || formatoDestino === 'docx') {
+      await window.api.guardarTextoDocumento(bloques, formatoDestino, rutaReal)
+    } else if (formatoDestino === 'pdf') {
+      const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
+      await window.api.guardarPaginasComoPdf(paginasPng, rutaReal)
+    } else if (formatoDestino === 'jpg' || formatoDestino === 'png') {
+      const paginasImg = await renderizarBloquesAPaginas(
+        bloques,
+        formatoDestino as 'jpg' | 'png'
+      )
+      await window.api.guardarPaginasImagen(paginasImg, formatoDestino, rutaReal)
+    }
+  } else {
+    await window.api.convertirImagenBackend(rutaReal, formatoDestino)
+  }
+}
+
 const procesarArchivo = async (event: DragEvent, opcionId: string) => {
   event.preventDefault()
   const files = event.dataTransfer?.files
   if (!files || files.length === 0) return
 
-  const file = files[0]
-  const rutaReal = window.api.obtenerRuta(file)
-  if (!rutaReal) return
+  const listaArchivos = Array.from(files)
+  const primerArchivo = listaArchivos[0]
+  const primeraRuta = window.api.obtenerRuta(primerArchivo)
+  if (!primeraRuta) return
 
   if (opcionId.startsWith('tool:')) {
     const toolName = opcionId.replace('tool:', '') as TipoHerramienta
-    await abrirHerramientaConArchivo(file, rutaReal, toolName)
-    return
-  }
-
-  const formatoDestino = opcionId
-  const ext = rutaReal.split('.').pop()?.toLowerCase() || ''
-  if (ext === formatoDestino || (ext === 'jpeg' && formatoDestino === 'jpg')) {
-    showMenu.value = false
-    opcionActiva.value = null
-    window.api.cerrarMenu?.()
+    await abrirHerramientaConArchivo(primerArchivo, primeraRuta, toolName)
     return
   }
 
   procesando.value = true
 
   try {
-    const esPdf = ext === 'pdf' || file.type === 'application/pdf'
-    const esDocTexto = ext === 'docx' || ext === 'txt'
+    const rutasTodas = listaArchivos.map((f) => window.api.obtenerRuta(f)).filter(Boolean)
 
-    if (esPdf && ['jpg', 'png', 'webp'].includes(formatoDestino)) {
-      const arrayBuffer = await file.arrayBuffer()
-      const loadingTask = pdfjsLib.getDocument({
-        data: new Uint8Array(arrayBuffer),
-        isEvalSupported: false,
-        useSystemFonts: true,
-        disableFontFace: true,
-        isOffscreenCanvasSupported: false
-      } as any)
-
-      const pdf = await loadingTask.promise
-      const paginasBytes: Uint8Array[] = []
-
-      for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i)
-        const { canvas } = await renderizarPaginaACanvas(page, 1600)
-        const bytes = await canvasToUint8ArrayDirecto(canvas, formatoDestino)
-        paginasBytes.push(bytes)
-      }
-
-      await window.api.guardarPaginasImagen(paginasBytes, formatoDestino, rutaReal)
-    } else if (esPdf && (formatoDestino === 'txt' || formatoDestino === 'docx')) {
-      const arrayBuffer = await file.arrayBuffer()
-      const loadingTask = pdfjsLib.getDocument({
-        data: new Uint8Array(arrayBuffer),
-        isEvalSupported: false,
-        useSystemFonts: true,
-        disableFontFace: true,
-        isOffscreenCanvasSupported: false
-      } as any)
-
-      const pdf = await loadingTask.promise
-      const bloquesTotales: BloqueDocumento[] = []
-
-      for (let i = 1; i <= pdf.numPages; i++) {
-        if (i > 1) {
-          bloquesTotales.push({ tipo: 'salto_pagina' })
-        }
-
-        const page = await pdf.getPage(i)
-        const textContent = await page.getTextContent()
-        const bloquesPagina = await analizarPaginaCompleta(
-          page,
-          textContent,
-          formatoDestino as 'txt' | 'docx'
-        )
-        bloquesTotales.push(...bloquesPagina)
-      }
-
-      await window.api.guardarTextoDocumento(
-        bloquesTotales,
-        formatoDestino as 'txt' | 'docx',
-        rutaReal
-      )
-    } else if (esDocTexto) {
-      const bloques = await window.api.leerDocumentoTexto(rutaReal)
-
-      if (formatoDestino === 'txt' || formatoDestino === 'docx') {
-        await window.api.guardarTextoDocumento(bloques, formatoDestino, rutaReal)
-      } else if (formatoDestino === 'pdf') {
-        const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
-        await window.api.guardarPaginasComoPdf(paginasPng, rutaReal)
-      } else if (formatoDestino === 'jpg' || formatoDestino === 'png') {
-        const paginasImg = await renderizarBloquesAPaginas(
-          bloques,
-          formatoDestino as 'jpg' | 'png'
-        )
-        await window.api.guardarPaginasImagen(paginasImg, formatoDestino, rutaReal)
-      }
+    if (opcionId === 'unir-pdf' && rutasTodas.length > 1) {
+      await window.api.unirPdfsBackend(rutasTodas)
+    } else if (
+      opcionId === 'pdf' &&
+      tipoDetectado.value === 'imagen' &&
+      rutasTodas.length > 1
+    ) {
+      await window.api.convertirImagenesAPdfUnico(rutasTodas)
     } else {
-      await window.api.convertirImagenBackend(rutaReal, formatoDestino)
+      for (const f of listaArchivos) {
+        const ruta = window.api.obtenerRuta(f)
+        if (ruta) {
+          await convertirArchivoIndividual(f, ruta, opcionId)
+        }
+      }
     }
   } catch (error: any) {
     const detalle =
@@ -1766,6 +2462,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     procesando.value = false
     showMenu.value = false
     opcionActiva.value = null
+    cantidadArchivosEnVuelo.value = 1
     window.api.cerrarMenu?.()
   }
 }
@@ -1823,7 +2520,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             class="pointer-events-none"
           />
 
-          <g v-for="seg in segmentos" :key="seg.id">
+          <g v-for="seg in segmentos" :key="seg.id + seg.angulo">
             <path
               :d="seg.path"
               :fill="opcionActiva === seg.id ? 'url(#activeGrad)' : 'url(#inactiveGrad)'"
@@ -1854,7 +2551,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               text-anchor="middle"
               dominant-baseline="central"
               class="pointer-events-none font-extrabold tracking-wider transition-colors duration-150"
-              :class="seg.label.length > 5 ? 'text-[12px]' : 'text-[15px]'"
+              :class="seg.label.length > 5 ? 'text-[11px]' : 'text-[15px]'"
               :fill="opcionActiva === seg.id ? '#FFFFFF' : '#1c1917'"
             >
               {{ seg.label }}
@@ -1903,7 +2600,57 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     </Transition>
 
     <!-- =================================================================== -->
-    <!-- 2. PANEL DE BANDEJA DEL SISTEMA CON DISEÑO ORBIT                    -->
+    <!-- 2. NOTIFICACIÓN TOAST FLOTANTE DE ARCHIVO GUARDADO (OPCIÓN 2)       -->
+    <!-- =================================================================== -->
+    <Transition
+      enter-active-class="transition duration-200 ease-out"
+      enter-from-class="opacity-0 translate-y-6 scale-90"
+      enter-to-class="opacity-100 translate-y-0 scale-100"
+      leave-active-class="transition duration-150 ease-in"
+      leave-from-class="opacity-100 translate-y-0 scale-100"
+      leave-to-class="opacity-0 translate-y-4 scale-90"
+    >
+      <div
+        v-if="toastVisible && !ventanaAbierta"
+        @mouseenter="configurarMouseToast(false)"
+        @mouseleave="configurarMouseToast(true)"
+        class="fixed bottom-6 right-6 z-50 w-[330px] rounded-2xl bg-orange-950/55 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_18px_45px_rgba(0,0,0,0.65)] p-3.5 flex items-center justify-between gap-3 pointer-events-auto"
+      >
+        <div class="flex items-center gap-2.5 min-w-0">
+          <div
+            class="w-8 h-8 rounded-full bg-gradient-to-br from-[#f97316] to-[#dc2626] border border-white/75 flex items-center justify-center text-white font-extrabold text-xs shrink-0 shadow-md"
+          >
+            ✓
+          </div>
+          <div class="flex flex-col min-w-0">
+            <span class="text-amber-200 text-[10px] font-extrabold uppercase tracking-wider">
+              Guardado en {{ toastData.carpeta }}
+            </span>
+            <span class="text-white text-xs font-bold truncate">
+              {{ toastData.nombre }}
+            </span>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-1.5 shrink-0">
+          <button
+            @click="abrirArchivoDesdeToast"
+            class="px-3 py-1.5 rounded-full bg-[#fde68a]/80 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white font-extrabold text-[11px] border border-white/60 transition-all cursor-pointer"
+          >
+            Abrir ↗
+          </button>
+          <button
+            @click="cerrarToast"
+            class="w-6 h-6 rounded-full bg-black/25 hover:bg-red-600 text-white/80 hover:text-white text-[10px] font-extrabold flex items-center justify-center cursor-pointer"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+    </Transition>
+
+    <!-- =================================================================== -->
+    <!-- 3. PANEL DE BANDEJA DEL SISTEMA CON AUTO-UPDATER (OPCIÓN 5)         -->
     <!-- =================================================================== -->
     <Transition
       enter-active-class="transition duration-150 ease-out"
@@ -1921,76 +2668,81 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
       >
         <div
           :style="{ left: `${trayPosX}px`, top: `${trayPosY}px` }"
-          class="fixed -translate-x-1/2 -translate-y-1/2 w-[335px] rounded-[30px] bg-orange-950/45 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_22px_60px_rgba(0,0,0,0.7)] p-4 flex flex-col gap-3"
+          class="fixed -translate-x-1/2 -translate-y-1/2 w-[340px] rounded-[30px] bg-orange-950/45 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_22px_60px_rgba(0,0,0,0.7)] p-4 flex flex-col gap-2.5"
         >
-          <!-- Encabezado con Estado de Orbit -->
-<div class="flex items-center justify-between pb-2.5 border-b border-white/25">
-  <div class="flex items-center gap-2.5">
-    <div class="w-10 h-10 flex items-center justify-center">
-      <svg viewBox="0 0 64 64" class="w-full h-full drop-shadow-md">
-        <defs>
-          <linearGradient id="trayHeaderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-            <stop offset="0%" :stop-color="trayPausado ? '#78716c' : '#f97316'" />
-            <stop offset="100%" :stop-color="trayPausado ? '#44403c' : '#dc2626'" />
-          </linearGradient>
-        </defs>
-        <ellipse
-          cx="32"
-          cy="32"
-          rx="27"
-          ry="11"
-          transform="rotate(-30 32 32)"
-          fill="none"
-          stroke="url(#trayHeaderGrad)"
-          stroke-width="5.5"
-          stroke-linecap="round"
-        />
-        <circle
-          cx="32"
-          cy="32"
-          r="11"
-          fill="url(#trayHeaderGrad)"
-          stroke="#1c1917"
-          stroke-width="2.5"
-        />
-        <circle cx="32" cy="32" r="5" :fill="trayPausado ? '#a8a29e' : '#fde68a'" />
-        <circle
-          cx="50"
-          cy="14"
-          r="5.5"
-          :fill="trayPausado ? '#a8a29e' : '#fde68a'"
-          :stroke="trayPausado ? '#44403c' : '#dc2626'"
-          stroke-width="2"
-        />
-      </svg>
-    </div>
+          <!-- Encabezado con Estado y Versión de Orbit -->
+          <div class="flex items-center justify-between pb-2 border-b border-white/25">
+            <div class="flex items-center gap-2.5">
+              <div class="w-10 h-10 flex items-center justify-center">
+                <svg viewBox="0 0 64 64" class="w-full h-full drop-shadow-md">
+                  <defs>
+                    <linearGradient id="trayHeaderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+                      <stop offset="0%" :stop-color="trayPausado ? '#78716c' : '#f97316'" />
+                      <stop offset="100%" :stop-color="trayPausado ? '#44403c' : '#dc2626'" />
+                    </linearGradient>
+                  </defs>
+                  <ellipse
+                    cx="32"
+                    cy="32"
+                    rx="27"
+                    ry="11"
+                    transform="rotate(-30 32 32)"
+                    fill="none"
+                    stroke="url(#trayHeaderGrad)"
+                    stroke-width="5.5"
+                    stroke-linecap="round"
+                  />
+                  <circle
+                    cx="32"
+                    cy="32"
+                    r="11"
+                    fill="url(#trayHeaderGrad)"
+                    stroke="#1c1917"
+                    stroke-width="2.5"
+                  />
+                  <circle cx="32" cy="32" r="5" :fill="trayPausado ? '#a8a29e' : '#fde68a'" />
+                  <circle
+                    cx="50"
+                    cy="14"
+                    r="5.5"
+                    :fill="trayPausado ? '#a8a29e' : '#fde68a'"
+                    :stroke="trayPausado ? '#44403c' : '#dc2626'"
+                    stroke-width="2"
+                  />
+                </svg>
+              </div>
 
-    <div class="flex flex-col">
-      <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
-        ORBIT
-      </span>
-      <span
-        class="text-[11px] font-bold mt-0.5"
-        :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
-      >
-        {{
-          trayPausado
-            ? trayMinutosTimer > 0
-              ? `En pausa (${trayMinutosTimer}m)`
-              : 'En pausa'
-            : 'Activo en segundo plano'
-        }}
-      </span>
-    </div>
-  </div>
+              <div class="flex flex-col">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
+                    ORBIT
+                  </span>
+                  <span class="px-1.5 py-0.5 rounded-full bg-white/15 text-amber-200 font-extrabold text-[9px]">
+                    v{{ trayVersionApp }}
+                  </span>
+                </div>
+                <span
+                  class="text-[11px] font-bold mt-0.5"
+                  :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
+                >
+                  {{
+                    trayPausado
+                      ? trayMinutosTimer > 0
+                        ? `En pausa (${trayMinutosTimer}m)`
+                        : 'En pausa'
+                      : 'Activo en segundo plano'
+                  }}
+                </span>
+              </div>
+            </div>
 
-  <button
-    @click="cerrarMenuTray"
-    class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
-  >
-    ✕
-  </button>
-</div>
+            <button
+              @click="cerrarMenuTray"
+              class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
 
           <!-- Botón Principal Pausar + Temporizadores -->
           <div class="flex flex-col gap-2 bg-black/20 rounded-2xl p-2.5 border border-white/20">
@@ -2030,8 +2782,17 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
+          <!-- Acción Rápida: Pegar Captura del Portapapeles -->
+          <button
+            @click="abrirImagenDesdePortapapeles('recortar')"
+            class="w-full py-1.5 px-3.5 rounded-xl bg-[#fde68a]/70 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white font-extrabold text-xs border border-white/55 flex items-center justify-between transition-all cursor-pointer"
+          >
+            <span>📋 Editar captura del portapapeles</span>
+            <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/15">Ctrl+V</span>
+          </button>
+
           <!-- Selector de Tecla de Activación -->
-          <div class="flex flex-col gap-1.5">
+          <div class="flex flex-col gap-1">
             <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider px-1">
               Tecla para abrir la rueda
             </span>
@@ -2058,7 +2819,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
           </div>
 
           <!-- Historial de Archivos Recientes -->
-          <div class="flex flex-col gap-1.5">
+          <div class="flex flex-col gap-1">
             <div class="flex items-center justify-between px-1">
               <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider">
                 Conversiones recientes
@@ -2074,18 +2835,17 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
             <div
               v-if="trayArchivosRecientes.length === 0"
-              class="py-2.5 px-3 rounded-xl bg-black/20 border border-white/15 text-center text-white/60 text-xs font-medium"
+              class="py-2 px-3 rounded-xl bg-black/20 border border-white/15 text-center text-white/60 text-xs font-medium"
             >
               Aún no hay archivos recientes
             </div>
 
-            <div v-else class="flex flex-col gap-1 max-h-[108px] overflow-y-auto pr-0.5">
+            <div v-else class="flex flex-col gap-1 max-h-[85px] overflow-y-auto pr-0.5">
               <button
                 v-for="item in trayArchivosRecientes"
                 :key="item.ruta"
                 @click="ejecutarAccionTray('abrir-reciente', item.ruta)"
                 class="w-full py-1.5 px-3 rounded-xl bg-[#fde68a]/60 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white border border-white/45 flex items-center justify-between text-left transition-colors cursor-pointer group"
-                title="Mostrar archivo en su carpeta"
               >
                 <span class="text-xs font-extrabold truncate max-w-[230px]">
                   {{ item.nombre }}
@@ -2097,8 +2857,24 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
+          <!-- Buscador de Actualizaciones (Opción 5) -->
+          <div class="flex flex-col gap-1 bg-black/20 rounded-xl p-2 border border-white/15">
+            <div class="flex items-center justify-between">
+              <span class="text-white/85 text-[11px] font-bold">
+                {{ infoUpdate ? infoUpdate.mensaje : 'Actualizaciones de Orbit' }}
+              </span>
+              <button
+                @click="verificarActualizacionesApp"
+                :disabled="buscandoUpdate"
+                class="px-2.5 py-1 rounded-full bg-[#fde68a]/70 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-[10px] border border-white/50 cursor-pointer shrink-0"
+              >
+                {{ buscandoUpdate ? 'Buscando...' : '🔄 Buscar' }}
+              </button>
+            </div>
+          </div>
+
           <!-- Pie del Panel: Auto-inicio con Windows y Salir -->
-          <div class="flex items-center justify-between pt-2 border-t border-white/25">
+          <div class="flex items-center justify-between pt-1.5 border-t border-white/25">
             <button
               @click="ejecutarAccionTray('autostart', !trayIniciarConWindows)"
               class="px-3 py-1.5 rounded-full text-[11px] font-extrabold border transition-all flex items-center gap-1.5 cursor-pointer"
@@ -2124,7 +2900,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     </Transition>
 
     <!-- =================================================================== -->
-    <!-- 3. VENTANA DE HERRAMIENTAS CON ZOOM DE PRECISIÓN Y RUTA DE ORIGEN   -->
+    <!-- 4. VENTANA DE HERRAMIENTAS (DOCUMENTOS, IMÁGENES, VIDEO Y AUDIO)    -->
     <!-- =================================================================== -->
     <Transition
       enter-active-class="transition duration-200 ease-out"
@@ -2139,23 +2915,25 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm pointer-events-auto"
       >
         <div
-          class="relative w-[820px] max-h-[90vh] rounded-[34px] bg-orange-950/35 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_25px_70px_rgba(0,0,0,0.65)] flex flex-col overflow-hidden p-5"
+          class="relative w-[850px] max-h-[90vh] rounded-[34px] bg-orange-950/35 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_25px_70px_rgba(0,0,0,0.65)] flex flex-col overflow-hidden p-5"
         >
-          <!-- Barra Superior -->
-          <div class="flex items-center justify-between mb-3 pb-3 border-b border-white/25">
-            <div class="flex items-center gap-3">
-              <div
-                class="px-4 py-1.5 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] border border-white/75 text-white font-extrabold text-xs tracking-wider uppercase shadow-[0_0_15px_rgba(234,88,12,0.5)]"
-              >
-                {{ herramientaActual }}
-              </div>
-              <div class="flex flex-col">
-                <span class="text-white/95 font-bold text-sm truncate max-w-[300px]">
-                  {{ nombreArchivoActivo }}
-                </span>
-                <span class="text-amber-200/80 text-[11px] font-medium truncate max-w-[300px]">
-                  Origen: {{ nombreCarpetaOrigen }}
-                </span>
+          <!-- Barra Superior con Selector Rápido de Herramientas -->
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-3 pb-3 border-b border-white/25">
+            <div class="flex items-center gap-2.5">
+              <div class="flex items-center gap-1 bg-black/25 p-1 rounded-full border border-white/25">
+                <button
+                  v-for="tab in herramientasDisponiblesArchivo"
+                  :key="tab.id"
+                  @click="cambiarHerramientaEnVentana(tab.id)"
+                  class="px-3 py-1 rounded-full font-extrabold text-[11px] tracking-wider uppercase transition-all cursor-pointer"
+                  :class="
+                    herramientaActual === tab.id
+                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border border-white/80 shadow-[0_0_12px_rgba(234,88,12,0.5)]'
+                      : 'text-amber-100/85 hover:text-white hover:bg-white/10'
+                  "
+                >
+                  {{ tab.label }}
+                </button>
               </div>
             </div>
 
@@ -2167,21 +2945,18 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               <button
                 @click="cambiarZoom(-25)"
                 class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
-                title="Alejar"
               >
                 −
               </button>
               <button
                 @click="restablecerZoom"
                 class="px-2 text-[#1c1917] font-extrabold text-xs min-w-[48px] text-center cursor-pointer hover:underline"
-                title="Restablecer a 100%"
               >
                 {{ zoomNivel }}%
               </button>
               <button
                 @click="cambiarZoom(25)"
                 class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
-                title="Acercar para mayor precisión"
               >
                 +
               </button>
@@ -2232,8 +3007,155 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
           <!-- CONTENIDO SEGÚN LA HERRAMIENTA SELECCIONADA -->
           <div class="flex-1 overflow-hidden flex flex-col items-center justify-center min-h-[400px]">
+            <!-- A. ESTUDIO MULTIMEDIA (VIDEO / AUDIO / CAPTURA / GIF) -->
             <div
               v-if="
+                herramientaActual === 'multimedia' ||
+                herramientaActual === 'capturar' ||
+                herramientaActual === 'gif'
+              "
+              class="w-full flex flex-col items-center gap-4"
+            >
+              <!-- Reproductor de Video o Audio -->
+              <div
+                class="w-full flex flex-col items-center justify-center bg-black/30 rounded-2xl p-4 border border-white/25"
+              >
+                <video
+                  v-if="esVideoActivo"
+                  ref="videoPlayerRef"
+                  :src="mediaUrlActiva"
+                  controls
+                  @loadedmetadata="onMediaMetadataLoaded"
+                  class="max-h-[250px] rounded-xl shadow-lg bg-black"
+                ></video>
+
+                <div v-else class="w-full flex flex-col items-center gap-3 py-6">
+                  <div
+                    class="w-16 h-16 rounded-full bg-gradient-to-br from-[#f97316] to-[#dc2626] border-2 border-white/80 flex items-center justify-center text-2xl shadow-lg"
+                  >
+                    🎵
+                  </div>
+                  <audio
+                    ref="audioPlayerRef"
+                    :src="mediaUrlActiva"
+                    controls
+                    @loadedmetadata="onMediaMetadataLoaded"
+                    class="w-[80%]"
+                  ></audio>
+                </div>
+              </div>
+
+              <!-- Controles de Recorte de Tiempo, Volumen, Velocidad o GIF -->
+              <div
+                class="w-full grid grid-cols-2 gap-3 bg-black/20 rounded-2xl p-3.5 border border-white/20"
+              >
+                <div class="flex flex-col gap-1.5">
+                  <label class="text-amber-100 text-xs font-extrabold">
+                    ⏱ Inicio del recorte: {{ inicioCorteSeg }}s
+                  </label>
+                  <input
+                    type="range"
+                    v-model.number="inicioCorteSeg"
+                    :min="0"
+                    :max="Math.max(0.5, finCorteSeg - 0.5)"
+                    step="0.5"
+                    class="accent-orange-500 cursor-pointer"
+                  />
+                </div>
+
+                <div class="flex flex-col gap-1.5">
+                  <label class="text-amber-100 text-xs font-extrabold">
+                    🏁 Fin del recorte: {{ finCorteSeg }}s (Total: {{ duracionMedia }}s)
+                  </label>
+                  <input
+                    type="range"
+                    v-model.number="finCorteSeg"
+                    :min="inicioCorteSeg + 0.5"
+                    :max="Math.max(1, duracionMedia)"
+                    step="0.5"
+                    class="accent-orange-500 cursor-pointer"
+                  />
+                </div>
+
+                <!-- Controles extra para Audio/Video -->
+                <template v-if="herramientaActual === 'multimedia'">
+                  <div class="flex items-center gap-2">
+                    <span class="text-white text-xs font-extrabold">🔊 Volumen:</span>
+                    <button
+                      v-for="vol in [50, 100, 150, 200]"
+                      :key="vol"
+                      @click="volumenMediaPct = vol; aplicarVelocidadYVolumen()"
+                      class="px-2.5 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
+                      :class="
+                        volumenMediaPct === vol
+                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      "
+                    >
+                      {{ vol }}%
+                    </button>
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <span class="text-white text-xs font-extrabold">⚡ Velocidad:</span>
+                    <button
+                      v-for="vel in [0.5, 1, 1.5, 2]"
+                      :key="vel"
+                      @click="velocidadMedia = vel; aplicarVelocidadYVolumen()"
+                      class="px-2.5 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
+                      :class="
+                        velocidadMedia === vel
+                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      "
+                    >
+                      {{ vel }}x
+                    </button>
+                  </div>
+                </template>
+
+                <!-- Controles extra para Creador de GIF -->
+                <template v-if="herramientaActual === 'gif'">
+                  <div class="flex items-center gap-2">
+                    <span class="text-white text-xs font-extrabold">🎞️ Fluidez GIF:</span>
+                    <button
+                      v-for="f in [8, 12, 15]"
+                      :key="f"
+                      @click="fpsGif = f"
+                      class="px-3 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
+                      :class="
+                        fpsGif === f
+                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      "
+                    >
+                      {{ f }} FPS
+                    </button>
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <span class="text-white text-xs font-extrabold">📐 Tamaño:</span>
+                    <button
+                      v-for="w in [280, 360, 480]"
+                      :key="w"
+                      @click="anchoGif = w"
+                      class="px-3 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
+                      :class="
+                        anchoGif === w
+                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
+                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      "
+                    >
+                      {{ w }}px
+                    </button>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- B. VISTA PARA RECORTAR / DIBUJAR / ROTAR / AJUSTAR -->
+            <div
+              v-else-if="
                 herramientaActual === 'dibujar' ||
                 herramientaActual === 'recortar' ||
                 herramientaActual === 'rotar' ||
@@ -2339,15 +3261,15 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </button>
               </div>
 
-              <!-- Controles de Ajuste -->
+              <!-- Controles de Ajuste / Compresión -->
               <div
                 v-if="herramientaActual === 'ajustar'"
                 class="flex flex-wrap items-center justify-center gap-4 bg-black/20 border border-white/25 rounded-full px-6 py-2"
               >
                 <div class="flex items-center gap-2">
-                  <span class="text-white text-xs font-extrabold uppercase">Tamaño:</span>
+                  <span class="text-white text-xs font-extrabold uppercase">Resolución:</span>
                   <button
-                    v-for="pct in [25, 50, 75, 100]"
+                    v-for="pct in [50, 75, 100]"
                     :key="pct"
                     @click="escalaPorcentaje = pct"
                     class="px-3 py-1 rounded-full text-xs font-extrabold border cursor-pointer"
@@ -2364,12 +3286,12 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 <div class="h-4 w-[1px] bg-white/30"></div>
 
                 <div class="flex items-center gap-2">
-                  <span class="text-white text-xs font-extrabold uppercase">Calidad:</span>
+                  <span class="text-white text-xs font-extrabold uppercase">Compresión:</span>
                   <button
                     v-for="cal in [
-                      { v: 60, l: 'Ligera' },
-                      { v: 85, l: 'Óptima' },
-                      { v: 98, l: 'Máxima' }
+                      { v: 55, l: 'Máxima reducción' },
+                      { v: 78, l: 'Equilibrada' },
+                      { v: 92, l: 'Alta calidad' }
                     ]"
                     :key="cal.v"
                     @click="calidadPorcentaje = cal.v"
@@ -2431,7 +3353,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- VISTA PARA DIVIDIR PDF -->
+            <!-- C. VISTA PARA DIVIDIR PDF -->
             <div
               v-else-if="herramientaActual === 'dividir'"
               class="w-full flex flex-col items-center gap-4"
@@ -2483,7 +3405,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- VISTA PARA EDITAR DOCUMENTO -->
+            <!-- D. VISTA PARA EDITAR DOCUMENTO -->
             <div
               v-else-if="herramientaActual === 'editar'"
               class="w-full flex flex-col gap-3"
@@ -2503,13 +3425,21 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
           <!-- Barra Inferior -->
           <div class="flex items-center justify-between mt-3 pt-3 border-t border-white/25">
-            <span class="text-white/70 text-xs font-medium">
-              <template v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">
-                Tip: Usa <b>Ctrl + Rueda</b> para hacer zoom y <b>Espacio + Arrastrar</b> para mover
-              </template>
-            </span>
+            <div class="flex flex-col">
+              <span class="text-white/90 text-xs font-bold truncate max-w-[320px]">
+                📄 {{ nombreArchivoActivo }}
+              </span>
+              <span class="text-amber-200/80 text-[11px] font-medium">
+                <template v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">
+                  Tip: Usa <b>Ctrl + Rueda</b> para zoom y <b>Espacio + Arrastrar</b> para mover
+                </template>
+                <template v-else>
+                  Carpeta destino: <b>{{ nombreCarpetaOrigen }}</b>
+                </template>
+              </span>
+            </div>
 
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-2.5">
               <button
                 @click="cerrarVentanaHerramienta"
                 class="px-5 py-2 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/55 transition-transform hover:scale-105 cursor-pointer"
@@ -2520,13 +3450,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               <template v-if="herramientaActual === 'editar'">
                 <button
                   @click="guardarResultadoHerramienta('txt')"
-                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                  class="px-4 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
                   Guardar TXT
                 </button>
                 <button
                   @click="guardarResultadoHerramienta('pdf')"
-                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                  class="px-4 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
                   Guardar PDF
                 </button>
@@ -2535,6 +3465,21 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-6 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/80 shadow-[0_0_16px_rgba(234,88,12,0.65)] hover:scale-105 transition-transform cursor-pointer"
                 >
                   Guardar DOCX en {{ nombreCarpetaOrigen }}
+                </button>
+              </template>
+
+              <template v-else-if="herramientaActual === 'multimedia'">
+                <button
+                  @click="guardarResultadoHerramienta('mp3')"
+                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                >
+                  Exportar MP3
+                </button>
+                <button
+                  @click="guardarResultadoHerramienta('wav')"
+                  class="px-6 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 shadow-[0_0_18px_rgba(234,88,12,0.7)] hover:scale-105 transition-transform cursor-pointer"
+                >
+                  Guardar WAV en {{ nombreCarpetaOrigen }}
                 </button>
               </template>
 

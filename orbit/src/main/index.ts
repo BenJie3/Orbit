@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, shell, clipboard } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
@@ -14,6 +14,8 @@ let tray: Tray | null = null
 let shiftPresionado = false
 let modoVentanaActivo = false
 let menuTrayVisible = false
+let toastActivo = false
+let timerOcultarToast: NodeJS.Timeout | null = null
 let ultimoScrollMs = 0
 let shellNotifierProc: ChildProcessWithoutNullStreams | null = null
 
@@ -25,6 +27,7 @@ let modoTeclaActual: ModoTecla = 'shift'
 let ultimoToqueTeclaMs = 0
 let esperandoSegundoToque = false
 let archivosRecientes: string[] = []
+let repoGitHubConfig = ''
 
 const rutaConfig = path.join(app.getPath('userData'), 'orbit-settings.json')
 
@@ -36,6 +39,7 @@ function cargarConfiguracion() {
       if (Array.isArray(data.archivosRecientes)) {
         archivosRecientes = data.archivosRecientes.filter((r: string) => fs.existsSync(r)).slice(0, 5)
       }
+      if (data.repoGitHub) repoGitHubConfig = data.repoGitHub
     }
   } catch {}
 }
@@ -44,7 +48,7 @@ function guardarConfiguracion() {
   try {
     fs.writeFileSync(
       rutaConfig,
-      JSON.stringify({ modoTeclaActual, archivosRecientes }, null, 2),
+      JSON.stringify({ modoTeclaActual, archivosRecientes, repoGitHub: repoGitHubConfig }, null, 2),
       'utf8'
     )
   } catch {}
@@ -90,7 +94,8 @@ function obtenerEstadoTray(mostrar: boolean, x = 0, y = 0) {
     archivosRecientes: archivosRecientes
       .filter((r) => fs.existsSync(r))
       .map((r) => ({ nombre: path.basename(r), ruta: r })),
-    iniciarConWindows: loginSettings.openAtLogin
+    iniciarConWindows: loginSettings.openAtLogin,
+    versionApp: app.getVersion() || '0.1.0'
   }
 }
 
@@ -99,11 +104,44 @@ function ocultarLienzoCompletamente() {
   modoVentanaActivo = false
   menuTrayVisible = false
 
+  if (toastActivo) return
+
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.setIgnoreMouseEvents(true)
     mainWindow.setSkipTaskbar(true)
     mainWindow.hide()
   }
+}
+
+// Dispara la notificación Toast flotante de éxito sin bloquear el escritorio
+function notificarToastArchivoGuardado(rutaArchivo: string) {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+
+  if (timerOcultarToast) {
+    clearTimeout(timerOcultarToast)
+    timerOcultarToast = null
+  }
+
+  toastActivo = true
+  const nombre = path.basename(rutaArchivo)
+  const carpeta = path.basename(path.dirname(rutaArchivo)) || 'Origen'
+
+  mainWindow.setSkipTaskbar(true)
+  mainWindow.setIgnoreMouseEvents(true, { forward: true })
+  mainWindow.showInactive()
+  mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
+  mainWindow.webContents.send('archivo-guardado-toast', {
+    nombre,
+    ruta: rutaArchivo,
+    carpeta
+  })
+
+  timerOcultarToast = setTimeout(() => {
+    toastActivo = false
+    if (!shiftPresionado && !modoVentanaActivo && !menuTrayVisible) {
+      ocultarLienzoCompletamente()
+    }
+  }, 4200)
 }
 
 async function cambiarEstadoPausa(pausarEstado: boolean, minutosAutoReanudar = 0) {
@@ -145,7 +183,7 @@ function abrirPanelTrayPersonalizado() {
   const workArea = display.workArea
 
   const panelAncho = 340
-  const panelAlto = 460
+  const panelAlto = 520
   const x = Math.max(
     workArea.x + panelAncho / 2 + 12,
     Math.min(workArea.x + workArea.width - panelAncho / 2 - 12, cursor.x)
@@ -158,7 +196,6 @@ function abrirPanelTrayPersonalizado() {
   modoVentanaActivo = true
   menuTrayVisible = true
 
-  // Mostramos sin activar el icono en la barra de tareas
   mainWindow.setSkipTaskbar(true)
   mainWindow.setIgnoreMouseEvents(false)
   mainWindow.showInactive()
@@ -256,6 +293,7 @@ async function guardarEnOrigenYRefrescar(rutaArchivo: string, datos: Buffer | st
   }
 
   registrarArchivoReciente(rutaArchivo)
+  notificarToastArchivoGuardado(rutaArchivo)
 }
 
 function obtenerRutaSalida(rutaOriginal: string, extDestino: string, sufijo = ''): string {
@@ -825,7 +863,7 @@ function createWindow(): BrowserWindow {
     height: height - 4,
     x: 1,
     y: 1,
-    show: false, // Arranca 100% oculto para jamás bloquear la barra de tareas
+    show: false,
     autoHideMenuBar: true,
     transparent: true,
     frame: false,
@@ -833,8 +871,8 @@ function createWindow(): BrowserWindow {
     movable: false,
     fullscreenable: false,
     alwaysOnTop: true,
-    skipTaskbar: true, // Nunca aparece en la barra de tareas
-    focusable: true, // Fijo desde el inicio para no llamar setFocusable() dinámico
+    skipTaskbar: true,
+    focusable: true,
     hasShadow: false,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -847,7 +885,6 @@ function createWindow(): BrowserWindow {
   win.setSkipTaskbar(true)
   win.setIgnoreMouseEvents(true)
 
-  // Si el panel de la bandeja está abierto y el usuario hace clic en otra app, se oculta solo
   win.on('blur', () => {
     if (menuTrayVisible && !win.isDestroyed()) {
       win.webContents.send('abrir-menu-tray', obtenerEstadoTray(false))
@@ -944,15 +981,97 @@ if (!instanciaUnica) {
 
     ipcMain.on('activar-modo-ventana', () => {
       modoVentanaActivo = true
+      menuTrayVisible = false
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.setSkipTaskbar(true)
         mainWindow.setIgnoreMouseEvents(false)
         mainWindow.showInactive()
+        mainWindow.focus()
+      }
+    })
+
+    // Permite que el Toast flotante reciba clics solo cuando el mouse pasa sobre él
+    ipcMain.on('set-mouse-ignore', (_, ignorar: boolean) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return
+      if (modoVentanaActivo || menuTrayVisible || shiftPresionado) return
+      if (ignorar) {
+        mainWindow.setIgnoreMouseEvents(true, { forward: true })
+      } else {
+        mainWindow.setIgnoreMouseEvents(false)
       }
     })
 
     ipcMain.on('forzar-cierre-menu', () => {
       ocultarLienzoCompletamente()
+    })
+
+    ipcMain.handle('mostrar-archivo-en-carpeta', async (_, rutaArchivo: string) => {
+      if (rutaArchivo && fs.existsSync(rutaArchivo)) {
+        shell.showItemInFolder(rutaArchivo)
+        return true
+      }
+      return false
+    })
+
+    // BUSCADOR AUTOMÁTICO DE ACTUALIZACIONES (Soporta electron-updater y GitHub Releases)
+    ipcMain.handle('buscar-actualizaciones', async () => {
+      const versionActual = app.getVersion() || '0.1.0'
+      try {
+        // 1. Intentar con electron-updater si está instalado y la app está empaquetada
+        if (app.isPackaged) {
+          try {
+            // @ts-ignore
+            const { autoUpdater } = eval('require')('electron-updater')
+            autoUpdater.autoDownload = true
+            const res = await autoUpdater.checkForUpdates()
+            if (res && res.updateInfo && res.updateInfo.version !== versionActual) {
+              return {
+                estado: 'descargando',
+                versionNueva: res.updateInfo.version,
+                mensaje: `Descargando Orbit v${res.updateInfo.version} en segundo plano...`
+              }
+            }
+          } catch {}
+        }
+
+        // 2. Verificación directa contra GitHub Releases si existe repositorio configurado en package.json
+        const pkgPath = path.join(app.getAppPath(), 'package.json')
+        let repoUrl = repoGitHubConfig
+        if (!repoUrl && fs.existsSync(pkgPath)) {
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
+          const rawRepo = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url || ''
+          const match = rawRepo.match(/github\.com[/:]([^/]+\/[^/.]+)/i)
+          if (match) repoUrl = match[1]
+        }
+
+        if (repoUrl) {
+          const resp = await fetch(`https://api.github.com/repos/${repoUrl}/releases/latest`, {
+            headers: { 'User-Agent': 'Orbit-App' }
+          })
+          if (resp.ok) {
+            const release: any = await resp.json()
+            const tagLimpio = String(release.tag_name || '').replace(/^v/i, '')
+            if (tagLimpio && tagLimpio !== versionActual) {
+              return {
+                estado: 'disponible',
+                versionNueva: tagLimpio,
+                mensaje: `¡Nueva versión v${tagLimpio} disponible!`,
+                urlDescarga: release.html_url
+              }
+            }
+          }
+        }
+
+        return {
+          estado: 'actualizado',
+          mensaje: `Estás en la versión más reciente (v${versionActual})`
+        }
+      } catch {
+        return {
+          estado: 'actualizado',
+          mensaje: `Orbit v${versionActual} está actualizado`
+        }
+      }
     })
 
     ipcMain.handle('actualizar-config-tray', async (_, accion) => {
@@ -1025,21 +1144,22 @@ if (!instanciaUnica) {
       }
     )
 
-    // 2. GUARDAR PÁGINAS RENDERIZADAS O EDITADAS COMO .PDF
+    // 2. GUARDAR PÁGINAS RENDERIZADAS, EDITADAS O COMPRIMIDAS COMO .PDF
     ipcMain.handle(
       'guardar-paginas-como-pdf',
       async (
         _,
-        paginasPngBytes: Uint8Array[],
+        paginasBytes: Uint8Array[],
         rutaOriginal: string,
         dimensiones?: { width: number; height: number }[],
         sufijoPersonalizado?: string
       ) => {
         try {
           const pdfDoc = await PDFDocument.create()
-          for (let i = 0; i < paginasPngBytes.length; i++) {
-            const pngBytes = paginasPngBytes[i]
-            const img = await pdfDoc.embedPng(pngBytes)
+          for (let i = 0; i < paginasBytes.length; i++) {
+            const bytes = paginasBytes[i]
+            const esJpeg = bytes.length > 2 && bytes[0] === 0xff && bytes[1] === 0xd8
+            const img = esJpeg ? await pdfDoc.embedJpg(bytes) : await pdfDoc.embedPng(bytes)
             const w = dimensiones?.[i]?.width || img.width || 612
             const h = dimensiones?.[i]?.height || img.height || 792
             const page = pdfDoc.addPage([w, h])
@@ -1165,6 +1285,112 @@ if (!instanciaUnica) {
           return true
         } catch (error) {
           console.error('Error convirtiendo imagen:', error)
+          return false
+        }
+      }
+    )
+
+    // 6. UNIR MÚLTIPLES ARCHIVOS PDF EN UNO SOLO
+    ipcMain.handle('unir-pdfs-backend', async (_, rutasPdfs: string[]) => {
+      try {
+        if (!rutasPdfs || rutasPdfs.length === 0) return false
+        const pdfFinal = await PDFDocument.create()
+
+        for (const ruta of rutasPdfs) {
+          if (!fs.existsSync(ruta)) continue
+          const bytes = await fs.promises.readFile(ruta)
+          const pdfOrigen = await PDFDocument.load(bytes)
+          const paginasCopiadas = await pdfFinal.copyPages(pdfOrigen, pdfOrigen.getPageIndices())
+          for (const pag of paginasCopiadas) {
+            pdfFinal.addPage(pag)
+          }
+        }
+
+        const pdfBytes = await pdfFinal.save()
+        const outPath = obtenerRutaSalida(rutasPdfs[0], 'pdf', '_unido')
+        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+        return true
+      } catch (error) {
+        console.error('Error uniendo PDFs:', error)
+        return false
+      }
+    })
+
+    // 7. UNIR MÚLTIPLES IMÁGENES EN UN SOLO DOCUMENTO PDF
+    ipcMain.handle('convertir-imagenes-a-pdf-unico', async (_, rutasImagenes: string[]) => {
+      try {
+        if (!rutasImagenes || rutasImagenes.length === 0) return false
+        const pdfDoc = await PDFDocument.create()
+
+        for (const ruta of rutasImagenes) {
+          if (!fs.existsSync(ruta)) continue
+          const pngBuffer = await sharp(ruta).rotate().png().toBuffer()
+          const img = await pdfDoc.embedPng(pngBuffer)
+          const page = pdfDoc.addPage([img.width, img.height])
+          page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height })
+        }
+
+        const pdfBytes = await pdfDoc.save()
+        const outPath = obtenerRutaSalida(rutasImagenes[0], 'pdf', '_album')
+        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+        return true
+      } catch (error) {
+        console.error('Error uniendo imágenes en PDF:', error)
+        return false
+      }
+    })
+
+    // 8. LEER IMAGEN DEL PORTAPAPELES DE WINDOWS (CTRL + V)
+    ipcMain.handle('leer-imagen-portapapeles', async () => {
+      try {
+        const img = clipboard.readImage()
+        if (img.isEmpty()) return null
+        const pngBuf = img.toPNG()
+        const escritorio = app.getPath('desktop')
+        const fecha = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+        const rutaSugerida = path.join(escritorio, `Captura_${fecha}.png`)
+        return {
+          pngBytes: new Uint8Array(pngBuf),
+          rutaSugerida,
+          nombre: `Captura_${fecha}.png`
+        }
+      } catch (error) {
+        console.error('Error leyendo portapapeles:', error)
+        return null
+      }
+    })
+
+    // 9. MULTIMEDIA: LEER ARCHIVO BINARIO DE AUDIO / VIDEO DESDE DISCO
+    ipcMain.handle('leer-archivo-binario', async (_, rutaOriginal: string) => {
+      try {
+        const buf = await fs.promises.readFile(rutaOriginal)
+        return new Uint8Array(buf)
+      } catch (error) {
+        console.error('Error leyendo binario multimedia:', error)
+        return new Uint8Array(0)
+      }
+    })
+
+    // 10. MULTIMEDIA: GUARDAR AUDIO / VIDEO / GIF PROCESADO EN CARPETA DE ORIGEN
+    ipcMain.handle(
+      'guardar-multimedia-bytes',
+      async (
+        _,
+        bytes: Uint8Array,
+        extDestino: string,
+        rutaOriginal: string,
+        sufijoPersonalizado?: string
+      ) => {
+        try {
+          const outPath = obtenerRutaSalida(
+            rutaOriginal,
+            extDestino,
+            sufijoPersonalizado || ''
+          )
+          await guardarEnOrigenYRefrescar(outPath, Buffer.from(bytes))
+          return true
+        } catch (error) {
+          console.error('Error guardando archivo multimedia:', error)
           return false
         }
       }
