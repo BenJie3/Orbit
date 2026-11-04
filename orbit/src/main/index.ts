@@ -407,70 +407,78 @@ async function extraerHslDominanteDeImagen(rutaImagen: string): Promise<[number,
   return null
 }
 
+function informarOrigenTema(origen: string, detalle = '') {
+  const firma = `${origen}|${temaActual.primario}|${detalle}`
+  if (firma !== ultimoOrigenTema) {
+    ultimoOrigenTema = firma
+    console.info(`[Orbit Wallpaper] Fuente: ${origen}. Color: ${temaActual.primario}.${detalle ? ` ${detalle}` : ''}`)
+  }
+}
+
 async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
   if (!adaptarFondoActivo) {
+    const anterior = temaActual.primario
     temaActual = { ...TEMA_ZAFIRO_DEFAULT }
     ultimaFirmaWallpaper = 'DEFAULT'
-    return true
+    informarOrigenTema('Zafiro (adaptación desactivada)')
+    return forzar || anterior !== temaActual.primario
   }
 
   const infoWE = obtenerWallpaperActivoWallpaperEngine()
   const infoWin = obtenerRutasWallpaperWindows()
-  const accentWin = systemPreferences.getAccentColor?.() || ''
+  // El acento de Windows NO es el fondo. Usarlo como fuente final causaba
+  // que Orbit se quedara rosa incluso si el wallpaper había cambiado.
+  const previewFirma = infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)
+    ? fs.statSync(infoWE.rutaPreview).mtimeMs
+    : ''
+  const firmaActual = `${infoWE?.firma || ''}|${previewFirma}|${infoWin?.firma || ''}`
+  if (!forzar && firmaActual === ultimaFirmaWallpaper) return false
 
-  const firmaActual = `${infoWE?.firma || ''}|${infoWin?.firma || ''}|${accentWin}`
-  if (!forzar && firmaActual === ultimaFirmaWallpaper) {
-    return false
-  }
-  ultimaFirmaWallpaper = firmaActual
-
-  // 1. Intentar extraer de la imagen activa de Wallpaper Engine
+  // 1. El wallpaper realmente seleccionado en Wallpaper Engine.
   if (infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)) {
     const hsl = await extraerHslDominanteDeImagen(infoWE.rutaPreview)
     if (hsl) {
       temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
+      ultimaFirmaWallpaper = firmaActual
+      informarOrigenTema('Wallpaper Engine (preview)', `Monitor: ${infoWE.monitor}; archivo: ${path.basename(infoWE.rutaPreview)}`)
       return true
     }
   }
 
-  // 2. Si Wallpaper Engine no tiene imagen pero tiene schemecolor en project.json
+  // 2. Algunos proyectos solo proporcionan un schemecolor.
   if (infoWE?.schemeColor) {
-    const partes = infoWE.schemeColor
-      .trim()
-      .split(/\s+/)
-      .map((n) => parseFloat(n))
-    if (partes.length >= 3 && partes.every((n) => !isNaN(n))) {
-      const r = partes[0] <= 1 ? Math.round(partes[0] * 255) : Math.round(partes[0])
-      const g = partes[1] <= 1 ? Math.round(partes[1] * 255) : Math.round(partes[1])
-      const b = partes[2] <= 1 ? Math.round(partes[2] * 255) : Math.round(partes[2])
-      const [h, s] = rgbToHsl(r, g, b)
-      if (s > 10) {
-        temaActual = construirTemaDesdeHsl(h, s)
+    const partes = infoWE.schemeColor.trim().split(/\\s+/).map(Number)
+    if (partes.length >= 3 && partes.slice(0, 3).every((n) => Number.isFinite(n))) {
+      const [r, g, b] = partes.slice(0, 3).map((n) =>
+        Math.max(0, Math.min(255, Math.round(n <= 1 ? n * 255 : n)))
+      )
+      const [h, saturacion] = rgbToHsl(r, g, b)
+      if (saturacion > 10) {
+        temaActual = construirTemaDesdeHsl(h, saturacion)
+        ultimaFirmaWallpaper = firmaActual
+        informarOrigenTema('Wallpaper Engine (schemecolor)', `Monitor: ${infoWE.monitor}`)
         return true
       }
     }
   }
 
-  // 3. Intentar extraer del Wallpaper de Windows (TranscodedWallpaper / CachedFiles)
+  // 3. Fondo estático de Windows (no confundir con su color de acento).
   if (infoWin?.ruta && fs.existsSync(infoWin.ruta)) {
     const hsl = await extraerHslDominanteDeImagen(infoWin.ruta)
     if (hsl) {
       temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
+      ultimaFirmaWallpaper = firmaActual
+      informarOrigenTema('Imagen de fondo de Windows', path.basename(infoWin.ruta))
       return true
     }
   }
 
-  // 4. Respaldo final: Color de acento DWM de Windows
-  if (accentWin && accentWin.length >= 6) {
-    const r = parseInt(accentWin.slice(0, 2), 16)
-    const g = parseInt(accentWin.slice(2, 4), 16)
-    const b = parseInt(accentWin.slice(4, 6), 16)
-    const [h, s] = rgbToHsl(r, g, b)
-    temaActual = construirTemaDesdeHsl(h, Math.max(65, s))
-    return true
-  }
-
-  return false
+  // Si no hay imagen identificable, no inventar una paleta a partir del acento
+  // de Windows. Conservar el tema Zafiro permite diagnosticar el origen.
+  temaActual = { ...TEMA_ZAFIRO_DEFAULT }
+  ultimaFirmaWallpaper = firmaActual
+  informarOrigenTema('Zafiro (ninguna imagen de fondo identificada)')
+  return true
 }
 
 // Dispara la actualización visual en el Icono del Tray y en la Ventana Vue en tiempo real
