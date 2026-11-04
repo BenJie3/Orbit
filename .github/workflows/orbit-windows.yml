@@ -1,0 +1,43 @@
+name: Orbit Windows verification
+
+on:
+  push:
+    branches:
+      - fix/v1.0.0-stability-update-wallpaper
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'orbit/**'
+      - '.github/workflows/orbit-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: orbit
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: orbit/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --legacy-peer-deps
+      - name: Type-check main, preload and renderer
+        run: npm run typecheck
+      - name: Build Electron application (no installer and no release)
+        run: npx electron-vite build
+      - name: Generate Sapphire icon
+        run: node scripts/generate-icon.cjs
+      - name: Verify icon output
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'build/icon.png')) { throw 'Missing build/icon.png' }
