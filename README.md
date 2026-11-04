@@ -31,6 +31,8 @@ Orbit utiliza por defecto una paleta Azul Zafiro / Cian Fluent. Desde el panel d
 
 El motor lee el proyecto seleccionado de Wallpaper Engine cuando existe una vista previa accesible y utiliza un histograma HSL para identificar el tono dominante; también dispone de un respaldo para fondos de Windows. Emplea vigilancia de archivos y comprobaciones periódicas ligeras. La respuesta depende de cómo Wallpaper Engine guarde cada fondo: los cambios de escena dentro de un wallpaper animado pueden no generar un nuevo archivo de configuración.
 
+**Diagnóstico:** al iniciar con `npm run dev`, la terminal muestra `[Orbit Wallpaper] Fuente:` y el color detectado. Si aparece `Wallpaper Engine (preview)`, el tono procede de la miniatura del proyecto activo; si aparece `Imagen de fondo de Windows`, no se encontró un recurso usable de Wallpaper Engine. Cuando no se puede identificar ninguna imagen, Orbit mantiene el azul zafiro en lugar de usar por error el color de acento de Windows. La detección de escenas animadas dentro de un mismo wallpaper y algunos estados de playlist puede requerir un método adicional de captura del frame activo.
+
 ## 🔄 Actualizaciones
 
 En la versión instalada para Windows, el panel permite comprobar, descargar y aplicar nuevas versiones desde GitHub Releases, sin abrir el navegador. El instalador se valida con los metadatos de publicación de `electron-updater` y se instala mediante NSIS. Para que funcione, el Release debe contener el instalador compatible y el archivo `latest.yml`. Las actualizaciones no se ejecutan desde `npm run dev`.
