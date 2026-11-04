@@ -35,8 +35,10 @@ jobs:
         shell: pwsh
         run: |
           $env:ELECTRON_RUN_AS_NODE = "1"
-          & "./node_modules/electron/dist/electron.exe" -e "require('uiohook-napi'); require('sharp'); console.log('Native addons load under Electron')"
+          & "./node_modules/electron/dist/electron.exe" -e "require('uiohook-napi'); require('sharp'); console.log('Native addons load under Electron'); process.exit(0)"
           if ($LASTEXITCODE -ne 0) { throw "Native N-API prebuilds failed in Electron" }
+      - name: Test Wallpaper Engine config selection
+        run: npm run test:wallpaper
       - name: Type-check main, preload and renderer
         run: npm run typecheck
       - name: Build Electron application (no installer and no release)
