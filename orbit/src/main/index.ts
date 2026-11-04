@@ -1549,6 +1549,31 @@ if (!instanciaUnica) {
 
       try {
         emitirProgreso({ estado: 'buscando', porcentaje: 0, mensaje: 'Buscando nueva versión...' })
+        // Preflight: los releases beta antiguos pueden no tener latest.yml.
+        // Evitar falsos errores y sobre todo cualquier intento de downgrade.
+        const respRelease = await fetch('https://api.github.com/repos/BenJie3/Orbit/releases/latest', {
+          headers: { 'User-Agent': 'Orbit-Updater', Accept: 'application/vnd.github+json' }
+        })
+        if (!respRelease.ok) throw new Error(`GitHub Releases respondió ${respRelease.status}`)
+        const release = (await respRelease.json()) as { tag_name?: string }
+        const numeros = (v: string): number[] | null => {
+          const match = v.replace(/^v/i, '').match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:$|[-+])/)
+          return match ? match.slice(1, 4).map(Number) : null
+        }
+        const remoto = numeros(String(release.tag_name || ''))
+        const local = numeros(versionActual)
+        if (remoto && local) {
+          const comparacion = remoto.findIndex((n, i) => n !== local[i])
+          if (comparacion === -1 || remoto[comparacion] < local[comparacion]) {
+            const info = {
+              estado: 'actualizado' as const,
+              porcentaje: 100,
+              mensaje: `Estás en la última versión (v${versionActual})`
+            }
+            emitirProgreso(info)
+            return info
+          }
+        }
         autoUpdater.once('update-available', marcarDisponible)
         const comprobacion = await autoUpdater.checkForUpdates()
         autoUpdater.removeListener('update-available', marcarDisponible)
