@@ -73,7 +73,7 @@ Haz clic en el icono orbital de la bandeja del sistema para abrir el centro de c
 ## 💻 Instalación y Desarrollo Local
 
 ### Prerrequisitos
-* **Node.js** `v20.x` (recomendado)
+* **Node.js** `v20.18.0` (versión de desarrollo fijada para preservar la compatibilidad de módulos nativos de Electron 31)
 * **Windows 10 / 11 (x64)**
 
 ### Pasos para ejecutar en desarrollo
@@ -82,8 +82,9 @@ Haz clic en el icono orbital de la bandeja del sistema para abrir el centro de c
 git clone https://github.com/BenJie3/Orbit.git
 cd Orbit/orbit
 
-# 2. Instalar dependencias
-npm install --legacy-peer-deps
+# 2. Instalar exactamente las dependencias declaradas en el lockfile
+npm ci --legacy-peer-deps
 
-# 3. Iniciar en modo desarrollo
+# 3. Verificar TypeScript e iniciar en modo desarrollo
+npm run typecheck
 npm run dev
