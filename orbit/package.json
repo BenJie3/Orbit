@@ -38,7 +38,7 @@
 
     "build": "npm run typecheck && electron-vite build",
 
-    "postinstall": "node --experimental-require-module ./node_modules/electron-builder/cli.js install-app-deps",
+    "postinstall": "node scripts/check-native.cjs",
 
     "build:unpack": "npm run build && electron-builder --dir",
 
