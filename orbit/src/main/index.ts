@@ -447,7 +447,7 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
 
   // 2. Algunos proyectos solo proporcionan un schemecolor.
   if (infoWE?.schemeColor) {
-    const partes = infoWE.schemeColor.trim().split(/\\s+/).map(Number)
+    const partes = infoWE.schemeColor.trim().split(/\s+/).map(Number)
     if (partes.length >= 3 && partes.slice(0, 3).every((n) => Number.isFinite(n))) {
       const [r, g, b] = partes.slice(0, 3).map((n) =>
         Math.max(0, Math.min(255, Math.round(n <= 1 ? n * 255 : n)))
