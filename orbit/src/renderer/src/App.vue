@@ -94,31 +94,34 @@ interface BloqueConPosicion {
   bloque: BloqueDocumento
 }
 
-interface EstadoTrayOrbit {
-  mostrar: boolean
-  x: number
-  y: number
-  pausadoGaming: boolean
-  minutosTimer: number
-  modoTeclaActual: 'shift' | 'doble-shift' | 'alt' | 'ctrl'
-  archivosRecientes: { nombre: string; ruta: string }[]
-  iniciarConWindows: boolean
-  versionApp: string
+interface PaletaUnificadaOrbit {
+  primario: string
+  secundario: string
+  claro: string
+  inactivoTop: string
+  inactivoBottom: string
+  cristal: string
+  cristalRueda: string
+  borde: string
+  sombra: string
+  textoOscuro: string
 }
 
 interface ResultadoActualizacion {
-  estado: 'actualizado' | 'disponible' | 'descargando' | 'error'
+  estado: 'buscando' | 'disponible' | 'actualizado' | 'descargando' | 'instalando' | 'error'
   versionNueva?: string
+  porcentaje?: number
   mensaje: string
-  urlDescarga?: string
 }
 
 declare global {
   interface Window {
     api: {
-      onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => void
+      onToggleMenu: (callback: (data: any) => void) => void
       onScrollMenu: (callback: (direccion: 'up' | 'down') => void) => void
-      onTrayMenu: (callback: (estado: EstadoTrayOrbit) => void) => void
+      onTrayMenu: (callback: (estado: any) => void) => void
+      onTemaActualizado: (callback: (tema: any) => void) => void
+      onProgresoActualizacion: (callback: (info: ResultadoActualizacion) => void) => void
       onArchivoGuardadoToast: (
         callback: (data: { nombre: string; ruta: string; carpeta: string }) => void
       ) => void
@@ -128,12 +131,15 @@ declare global {
           | 'timer'
           | 'tecla'
           | 'autostart'
+          | 'adaptar-fondo'
           | 'abrir-reciente'
           | 'limpiar-recientes'
           | 'salir'
         valor?: any
-      }) => Promise<EstadoTrayOrbit>
-      buscarActualizaciones: () => Promise<ResultadoActualizacion>
+      }) => Promise<any>
+      obtenerTemaInicial?: () => Promise<any>
+      buscarYActualizarDirecto?: () => Promise<ResultadoActualizacion>
+      buscarActualizaciones?: () => Promise<ResultadoActualizacion>
       obtenerRuta: (file: File) => string
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
@@ -156,6 +162,7 @@ declare global {
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
       unirPdfsBackend: (rutasPdfs: string[]) => Promise<boolean>
       convertirImagenesAPdfUnico: (rutasImagenes: string[]) => Promise<boolean>
+      verificarImagenPortapapeles?: () => Promise<boolean>
       leerImagenPortapapeles: () => Promise<{
         pngBytes: Uint8Array
         rutaSugerida: string
@@ -176,7 +183,48 @@ declare global {
   }
 }
 
-// --- ESTADOS DEL MENÚ RADIAL Y SCROLL ---
+// --- PALETA REACTIVA EN TIEMPO REAL (Zafiro Fluent + Camaleón Wallpaper Engine / Windows) ---
+const paletaTema = ref<PaletaUnificadaOrbit>({
+  primario: '#2563eb',
+  secundario: '#06b6d4',
+  claro: '#e0f2fe',
+  inactivoTop: '#e0f2fe',
+  inactivoBottom: '#bae6fd',
+  cristal: 'rgba(15, 23, 42, 0.64)',
+  cristalRueda: 'rgba(15, 23, 42, 0.38)',
+  borde: 'rgba(186, 230, 253, 0.44)',
+  sombra: 'rgba(37, 99, 235, 0.65)',
+  textoOscuro: '#0f172a'
+})
+
+function normalizarTemaRecibido(raw: any): PaletaUnificadaOrbit {
+  if (!raw || typeof raw !== 'object') return paletaTema.value
+  return {
+    primario: raw.primario || '#2563eb',
+    secundario: raw.secundario || '#06b6d4',
+    claro: raw.centro || raw.claro || '#e0f2fe',
+    inactivoTop: raw.inactivoInicio || raw.inactivoTop || '#e0f2fe',
+    inactivoBottom: raw.inactivoFin || raw.inactivoBottom || '#bae6fd',
+    cristal: raw.cristal || 'rgba(15, 23, 42, 0.64)',
+    cristalRueda: raw.cristalRueda || raw.cristal || 'rgba(15, 23, 42, 0.38)',
+    borde: raw.borde || 'rgba(186, 230, 253, 0.44)',
+    sombra: raw.sombra || 'rgba(37, 99, 235, 0.65)',
+    textoOscuro: raw.textoInactivo || raw.textoOscuro || '#0f172a'
+  }
+}
+
+const estiloVariablesTema = computed(() => ({
+  '--o-pri': paletaTema.value.primario,
+  '--o-sec': paletaTema.value.secundario,
+  '--o-light': paletaTema.value.claro,
+  '--o-glass': paletaTema.value.cristal,
+  '--o-wheel': paletaTema.value.cristalRueda,
+  '--o-border': paletaTema.value.borde,
+  '--o-shadow': paletaTema.value.sombra,
+  '--o-dark': paletaTema.value.textoOscuro
+}))
+
+// --- ESTADOS DEL MENÚ RADIAL, PORTAPAPELES Y SCROLL ---
 const showMenu = ref(false)
 const procesando = ref(false)
 const posX = ref(500)
@@ -185,13 +233,14 @@ const opcionActiva = ref<string | null>(null)
 const tipoDetectado = ref<'pdf' | 'docx' | 'txt' | 'imagen' | 'video' | 'audio'>('pdf')
 const modoRueda = ref<'conversion' | 'herramientas'>('conversion')
 const cantidadArchivosEnVuelo = ref(1)
+const hayCapturaEnPortapapeles = ref(false)
 
-// --- ESTADO DE LA NOTIFICACIÓN TOAST FLOTANTE (OPCIÓN 2) ---
+// --- ESTADO DE LA NOTIFICACIÓN TOAST FLOTANTE ---
 const toastVisible = ref(false)
 const toastData = ref({ nombre: '', ruta: '', carpeta: '' })
 let timerToastUI: number | null = null
 
-// --- ESTADOS DEL PANEL DE BANDEJA ORBIT Y ACTUALIZADOR (OPCIÓN 5) ---
+// --- ESTADOS DEL PANEL DE BANDEJA Y AUTO-UPDATER ---
 const trayMenuAbierto = ref(false)
 const trayPosX = ref(0)
 const trayPosY = ref(0)
@@ -200,11 +249,12 @@ const trayMinutosTimer = ref(0)
 const trayModoTecla = ref<'shift' | 'doble-shift' | 'alt' | 'ctrl'>('shift')
 const trayArchivosRecientes = ref<{ nombre: string; ruta: string }[]>([])
 const trayIniciarConWindows = ref(false)
-const trayVersionApp = ref('0.1.0')
+const trayAdaptarColorFondo = ref(false)
+const trayVersionApp = ref('1.0.0')
 const buscandoUpdate = ref(false)
 const infoUpdate = ref<ResultadoActualizacion | null>(null)
 
-// --- ESTADOS DE LA VENTANA DE HERRAMIENTAS ORBIT ---
+// --- ESTADOS DE LA VENTANA DE HERRAMIENTAS ---
 type TipoHerramienta =
   | 'recortar'
   | 'dibujar'
@@ -232,10 +282,11 @@ const modoDivisionPdf = ref<'unico' | 'separados'>('unico')
 
 const contenedorScrollRef = ref<HTMLDivElement | null>(null)
 const canvasInteractivoRef = ref<HTMLCanvasElement | null>(null)
-const colorPincel = ref('#111827')
+const colorPincel = ref('#0f172a')
 const grosorPincel = ref(3)
 const dibujando = ref(false)
 const ultimoPuntoTrazo = ref<{ x: number; y: number } | null>(null)
+const fondoTransparenteActivo = ref(false)
 
 const zoomNivel = ref(100)
 const modoPan = ref(false)
@@ -257,7 +308,7 @@ const escalaPorcentaje = ref(75)
 const calidadPorcentaje = ref(80)
 const textoEditable = ref('')
 
-// --- ESTADOS PARA HERRAMIENTAS MULTIMEDIA (VIDEO Y AUDIO) ---
+// --- ESTADOS MULTIMEDIA (VIDEO Y AUDIO) ---
 const mediaUrlActiva = ref('')
 const esVideoActivo = ref(false)
 const videoPlayerRef = ref<HTMLVideoElement | null>(null)
@@ -288,7 +339,7 @@ const herramientasDisponiblesArchivo = computed<{ id: TipoHerramienta; label: st
   const ext = extArchivoActivo.value
   if (['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext)) {
     return [
-      { id: 'multimedia', label: 'Recortar / Audio' },
+      { id: 'multimedia', label: 'Recortar Video / Audio' },
       { id: 'capturar', label: 'Capturar Frame' },
       { id: 'gif', label: 'Crear GIF' }
     ]
@@ -397,7 +448,6 @@ function crearPathSegmento(anguloCentralGrados: number): string {
   ].join(' ')
 }
 
-// 1. Catálogo de CONVERSIÓN (Incluye Video y Audio)
 const catalogoConversion = {
   pdf: [
     { id: 'docx', label: 'DOCX', angulo: -90, tx: 160, ty: 55 },
@@ -437,7 +487,6 @@ const catalogoConversion = {
   ]
 }
 
-// 2. Catálogo de HERRAMIENTAS (Scroll Abajo - Incluye herramientas de Video y Audio)
 const catalogoHerramientas = {
   pdf: [
     { id: 'tool:recortar', label: 'RECORTAR', angulo: -90, tx: 160, ty: 55 },
@@ -534,16 +583,26 @@ const onWheelLocal = (e: WheelEvent) => {
   else if (e.deltaY < 0) cambiarModoPorScroll('up')
 }
 
-// --- FUNCIONES DEL PANEL DE BANDEJA Y BUSCADOR DE ACTUALIZACIONES ---
-const aplicarEstadoTray = (estado: EstadoTrayOrbit) => {
+const aplicarEstadoTray = (estado: any) => {
+  if (!estado) return
   if (estado.x) trayPosX.value = estado.x
   if (estado.y) trayPosY.value = estado.y
-  trayPausado.value = estado.pausadoGaming
-  trayMinutosTimer.value = estado.minutosTimer
-  trayModoTecla.value = estado.modoTeclaActual
-  trayArchivosRecientes.value = estado.archivosRecientes
-  trayIniciarConWindows.value = estado.iniciarConWindows
+  trayPausado.value = Boolean(estado.pausadoGaming)
+  trayMinutosTimer.value = Number(estado.minutosTimer || 0)
+  if (estado.modoTeclaActual) trayModoTecla.value = estado.modoTeclaActual
+  if (Array.isArray(estado.archivosRecientes)) {
+    trayArchivosRecientes.value = estado.archivosRecientes
+  }
+  trayIniciarConWindows.value = Boolean(estado.iniciarConWindows)
+  trayAdaptarColorFondo.value = Boolean(estado.adaptarFondo ?? estado.adaptarColorFondo)
+  const temaEntrante = estado.temaActual || estado.paletaTema
+  if (temaEntrante) {
+    paletaTema.value = normalizarTemaRecibido(temaEntrante)
+  }
   if (estado.versionApp) trayVersionApp.value = estado.versionApp
+  if (estado.tieneImagenPortapapeles !== undefined) {
+    hayCapturaEnPortapapeles.value = Boolean(estado.tieneImagenPortapapeles)
+  }
 }
 
 const ejecutarAccionTray = async (
@@ -552,6 +611,7 @@ const ejecutarAccionTray = async (
     | 'timer'
     | 'tecla'
     | 'autostart'
+    | 'adaptar-fondo'
     | 'abrir-reciente'
     | 'limpiar-recientes'
     | 'salir',
@@ -565,27 +625,42 @@ const ejecutarAccionTray = async (
 }
 
 const verificarActualizacionesApp = async () => {
+  if (buscandoUpdate.value) return
   buscandoUpdate.value = true
-  infoUpdate.value = null
+  infoUpdate.value = {
+    estado: 'descargando',
+    porcentaje: 5,
+    mensaje: 'Buscando nueva versión...'
+  }
   try {
-    infoUpdate.value = await window.api.buscarActualizaciones()
+    const res = window.api.buscarYActualizarDirecto
+      ? await window.api.buscarYActualizarDirecto()
+      : await window.api.buscarActualizaciones!()
+    infoUpdate.value = res
   } catch {
     infoUpdate.value = {
       estado: 'error',
-      mensaje: 'No se pudo conectar con el servidor de versiones'
+      porcentaje: 0,
+      mensaje: 'No se pudo conectar con el servidor de actualizaciones'
     }
   } finally {
-    buscandoUpdate.value = false
+    if (
+      infoUpdate.value?.estado !== 'descargando' &&
+      infoUpdate.value?.estado !== 'instalando'
+    ) {
+      buscandoUpdate.value = false
+    }
   }
 }
 
 const cerrarMenuTray = () => {
   trayMenuAbierto.value = false
-  infoUpdate.value = null
+  if (!buscandoUpdate.value) {
+    infoUpdate.value = null
+  }
   window.api.cerrarMenu()
 }
 
-// --- FUNCIONES DE LA NOTIFICACIÓN TOAST FLOTANTE ---
 const configurarMouseToast = (ignorar: boolean) => {
   window.api.setMouseIgnore(ignorar)
 }
@@ -602,7 +677,6 @@ const cerrarToast = () => {
   window.api.setMouseIgnore(true)
 }
 
-// --- CODIFICADOR NATIVO WAV (PCM 16-BIT) Y GIF89A ANIMADO ---
 function codificarAudioBufferAWav(
   audioBuffer: AudioBuffer,
   inicioSeg = 0,
@@ -660,7 +734,6 @@ function codificarAudioBufferAWav(
   return new Uint8Array(buffer)
 }
 
-// Codificador GIF89a nativo con paleta cuantizada 3-3-2 (256 colores)
 function codificarFramesAGif(
   frames: ImageData[],
   width: number,
@@ -680,7 +753,6 @@ function codificarFramesAGif(
   writeU16(height)
   bytes.push(0xf7, 0, 0)
 
-  // Paleta global 3-3-2 (256 colores exactos)
   for (let i = 0; i < 256; i++) {
     const r = Math.round(((i >> 5) & 0x07) * (255 / 7))
     const g = Math.round(((i >> 2) & 0x07) * (255 / 7))
@@ -688,7 +760,6 @@ function codificarFramesAGif(
     bytes.push(r, g, b)
   }
 
-  // Extensión Netscape para bucle infinito
   bytes.push(0x21, 0xff, 0x0b)
   writeStr('NETSCAPE2.0')
   bytes.push(0x03, 0x01, 0x00, 0x00, 0x00)
@@ -707,7 +778,6 @@ function codificarFramesAGif(
     writeU16(height)
     bytes.push(0x00)
 
-    // LZW con código mínimo de 8 bits y reinicio de diccionario cada 250 píxeles
     bytes.push(8)
     const data = frame.data
     const totalPixels = width * height
@@ -730,7 +800,7 @@ function codificarFramesAGif(
       }
     }
 
-    emitCode(256) // Clear code inicial
+    emitCode(256)
     let countInTable = 0
     for (let p = 0; p < totalPixels; p++) {
       const idx = p * 4
@@ -745,7 +815,7 @@ function codificarFramesAGif(
         countInTable = 0
       }
     }
-    emitCode(257) // End of Information code
+    emitCode(257)
 
     if (bitCount > 0) {
       subBlock.push(bitBuffer & 0xff)
@@ -760,7 +830,56 @@ function codificarFramesAGif(
   return new Uint8Array(bytes)
 }
 
-// --- PEGAR IMAGEN DESDE PORTAPAPELES (CTRL + V) ---
+// --- FUNCIÓN PRO C: QUITAR FONDO BLANCO (EXPORTACIÓN A PNG TRANSPARENTE) ---
+const quitarFondoBlanco = () => {
+  const c = canvasInteractivoRef.value
+  if (!c) return
+  const ctx = c.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return
+
+  const imgData = ctx.getImageData(0, 0, c.width, c.height)
+  const d = imgData.data
+
+  for (let i = 0; i < d.length; i += 4) {
+    const r = d[i]
+    const g = d[i + 1]
+    const b = d[i + 2]
+
+    const maxC = Math.max(r, g, b)
+    const minC = Math.min(r, g, b)
+    const sat = maxC - minC
+    const lum = (r * 299 + g * 587 + b * 114) / 1000
+
+    if (lum > 240 && sat < 30) {
+      d[i + 3] = 0
+    } else if (lum > 188 && sat < 42) {
+      const factorAlpha = (240 - lum) / (240 - 188)
+      d[i + 3] = Math.round(Math.max(0, Math.min(1, factorAlpha)) * d[i + 3])
+      d[i] = Math.max(0, Math.round(r * 0.88))
+      d[i + 1] = Math.max(0, Math.round(g * 0.88))
+      d[i + 2] = Math.max(0, Math.round(b * 0.88))
+    }
+  }
+
+  ctx.putImageData(imgData, 0, 0)
+  historialTrazos.value = [...historialTrazos.value, imgData]
+  fondoTransparenteActivo.value = true
+
+  const pageCanvas = paginasCanvases.value[paginaIndice.value]
+  if (pageCanvas) {
+    const nuevoCanvas = document.createElement('canvas')
+    nuevoCanvas.width = c.width
+    nuevoCanvas.height = c.height
+    const nCtx = nuevoCanvas.getContext('2d')
+    if (nCtx) {
+      nCtx.putImageData(imgData, 0, 0)
+      const copia = [...paginasCanvases.value]
+      copia[paginaIndice.value] = nuevoCanvas
+      paginasCanvases.value = copia
+    }
+  }
+}
+
 const abrirImagenDesdePortapapeles = async (toolInicial: TipoHerramienta = 'recortar') => {
   const clip = await window.api.leerImagenPortapapeles()
   if (!clip) return
@@ -781,18 +900,17 @@ const abrirImagenDesdePortapapeles = async (toolInicial: TipoHerramienta = 'reco
     voltearV.value = false
     zoomNivel.value = 100
     modoPan.value = false
+    fondoTransparenteActivo.value = false
 
     const img = await cargarImagenDesdeBytes(clip.pngBytes, 'image/png')
     const c = document.createElement('canvas')
     c.width = img.naturalWidth || 800
     c.height = img.naturalHeight || 600
-    const ctx = c.getContext('2d', { alpha: false })!
-    ctx.fillStyle = '#FFFFFF'
-    ctx.fillRect(0, 0, c.width, c.height)
+    const ctx = c.getContext('2d')!
     ctx.drawImage(img, 0, 0)
 
     paginasCanvases.value = [c]
-    paginasMiniaturas.value = [c.toDataURL('image/jpeg', 0.8)]
+    paginasMiniaturas.value = [c.toDataURL('image/png')]
     ventanaAbierta.value = true
     await sincronizarCanvasVistaPrevia()
   } catch (error) {
@@ -803,14 +921,26 @@ const abrirImagenDesdePortapapeles = async (toolInicial: TipoHerramienta = 'reco
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  if (window.api.obtenerTemaInicial) {
+    try {
+      const tInicial = await window.api.obtenerTemaInicial()
+      if (tInicial) paletaTema.value = normalizarTemaRecibido(tInicial)
+    } catch {}
+  }
+
   window.api.onToggleMenu((data) => {
     if (ventanaAbierta.value || trayMenuAbierto.value) return
+    const temaEntrante = data.temaActual || data.paletaTema
+    if (temaEntrante) {
+      paletaTema.value = normalizarTemaRecibido(temaEntrante)
+    }
     if (data.mostrar) {
       posX.value = data.x
       posY.value = data.y
       modoRueda.value = 'conversion'
       cantidadArchivosEnVuelo.value = 1
+      hayCapturaEnPortapapeles.value = Boolean(data.tieneImagenPortapapeles)
       showMenu.value = true
     } else if (!procesando.value) {
       showMenu.value = false
@@ -829,7 +959,22 @@ onMounted(() => {
   window.api.onTrayMenu((estado) => {
     showMenu.value = false
     aplicarEstadoTray(estado)
-    trayMenuAbierto.value = estado.mostrar
+    trayMenuAbierto.value = Boolean(estado.mostrar)
+  })
+
+  window.api.onTemaActualizado((nuevoTema) => {
+    if (nuevoTema) {
+      paletaTema.value = normalizarTemaRecibido(nuevoTema)
+    }
+  })
+
+  window.api.onProgresoActualizacion((info) => {
+    infoUpdate.value = info
+    if (info.estado === 'actualizado' || info.estado === 'error') {
+      buscandoUpdate.value = false
+    } else {
+      buscandoUpdate.value = true
+    }
   })
 
   window.api.onArchivoGuardadoToast((data) => {
@@ -860,7 +1005,11 @@ onMounted(() => {
       (e.ctrlKey || e.metaKey) &&
       e.key.toLowerCase() === 'z'
     ) {
-      if (herramientaActual.value === 'dibujar') {
+      if (
+        herramientaActual.value === 'dibujar' ||
+        herramientaActual.value === 'recortar' ||
+        herramientaActual.value === 'ajustar'
+      ) {
         e.preventDefault()
         deshacerTrazo()
       }
@@ -948,7 +1097,7 @@ const renderizarPaginaACanvas = async (
   const viewport = page.getViewport({ scale })
 
   const canvas = document.createElement('canvas')
-  const context = canvas.getContext('2d', { alpha: false })
+  const context = canvas.getContext('2d')
   if (!context) throw new Error('Error en canvas 2D')
 
   canvas.width = Math.floor(viewport.width)
@@ -975,7 +1124,7 @@ const renderizarBloquesACanvases = async (
   let currentCanvas = document.createElement('canvas')
   currentCanvas.width = W
   currentCanvas.height = H
-  let ctx = currentCanvas.getContext('2d', { alpha: false })!
+  let ctx = currentCanvas.getContext('2d')!
   ctx.fillStyle = '#FFFFFF'
   ctx.fillRect(0, 0, W, H)
   canvases.push(currentCanvas)
@@ -986,7 +1135,7 @@ const renderizarBloquesACanvases = async (
     currentCanvas = document.createElement('canvas')
     currentCanvas.width = W
     currentCanvas.height = H
-    ctx = currentCanvas.getContext('2d', { alpha: false })!
+    ctx = currentCanvas.getContext('2d')!
     ctx.fillStyle = '#FFFFFF'
     ctx.fillRect(0, 0, W, H)
     canvases.push(currentCanvas)
@@ -1027,9 +1176,7 @@ const renderizarBloquesACanvases = async (
 
         ctx.drawImage(img, drawX, cursorY, drawW, drawH)
         cursorY += drawH + 18
-      } catch (e) {
-        console.error('Error dibujando imagen de DOCX en canvas:', e)
-      }
+      } catch {}
       continue
     }
 
@@ -1515,7 +1662,7 @@ const analizarPaginaCompleta = async (
         const subCanvas = document.createElement('canvas')
         subCanvas.width = cropWidth
         subCanvas.height = sh
-        const subCtx = subCanvas.getContext('2d', { alpha: false })
+        const subCtx = subCanvas.getContext('2d')
         if (!subCtx) continue
 
         subCtx.fillStyle = '#FFFFFF'
@@ -1544,7 +1691,6 @@ const analizarPaginaCompleta = async (
   return bloquesPosicion.map((item) => item.bloque)
 }
 
-// --- MOTOR DE CONVERSIÓN DIRECTA DE VIDEO Y AUDIO ---
 const extraerAudioAWavDirecto = async (
   bytesOrigen: Uint8Array,
   inicioSeg = 0,
@@ -1587,6 +1733,128 @@ const extraerAudioAWavDirecto = async (
   } finally {
     await audioCtx.close().catch(() => {})
   }
+}
+
+// --- FUNCIÓN PRO A: RECORTAR CLIP DE VIDEO CON IMAGEN Y SONIDO ---
+const recortarClipDeVideo = async (
+  videoUrl: string,
+  inicioSeg: number,
+  finSeg: number,
+  gananciaVolumen = 1.0,
+  velocidad = 1.0
+): Promise<{ bytes: Uint8Array; ext: string }> => {
+  const video = document.createElement('video')
+  video.src = videoUrl
+  video.playsInline = true
+  video.crossOrigin = 'anonymous'
+
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve()
+    video.onerror = () => reject(new Error('No se pudo cargar el video para recortar'))
+  })
+
+  const duracionTotal = video.duration || 10
+  const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.3))
+  const tEnd = Math.min(duracionTotal, Math.max(tStart + 0.5, finSeg))
+
+  video.currentTime = tStart
+  video.playbackRate = velocidad
+
+  await new Promise<void>((res) => {
+    const onSeek = () => {
+      video.removeEventListener('seeked', onSeek)
+      res()
+    }
+    video.addEventListener('seeked', onSeek)
+  })
+
+  const w = video.videoWidth || 1280
+  const h = video.videoHeight || 720
+  const canvas = document.createElement('canvas')
+  canvas.width = w
+  canvas.height = h
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(video, 0, 0, w, h)
+
+  const canvasStream = canvas.captureStream(30)
+  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+  const sourceNode = audioCtx.createMediaElementSource(video)
+  const gainNode = audioCtx.createGain()
+  gainNode.gain.value = gananciaVolumen
+  const destAudio = audioCtx.createMediaStreamDestination()
+
+  sourceNode.connect(gainNode)
+  gainNode.connect(destAudio)
+
+  const combinedStream = new MediaStream([
+    ...canvasStream.getVideoTracks(),
+    ...destAudio.stream.getAudioTracks()
+  ])
+
+  let mimeElegido = 'video/webm;codecs=vp8,opus'
+  let extSalida = 'webm'
+  const candidatos = [
+    { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
+    { mime: 'video/mp4', ext: 'mp4' },
+    { mime: 'video/webm;codecs=vp9,opus', ext: 'webm' },
+    { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
+    { mime: 'video/webm', ext: 'webm' }
+  ]
+
+  for (const c of candidatos) {
+    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c.mime)) {
+      mimeElegido = c.mime
+      extSalida = c.ext
+      break
+    }
+  }
+
+  const chunks: BlobPart[] = []
+  const recorder = new MediaRecorder(combinedStream, {
+    mimeType: mimeElegido,
+    videoBitsPerSecond: 4500000
+  })
+
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) chunks.push(e.data)
+  }
+
+  const promesaGrabacion = new Promise<Uint8Array>((resolve, reject) => {
+    recorder.onstop = async () => {
+      try {
+        const blobFinal = new Blob(chunks, { type: mimeElegido })
+        const ab = await blobFinal.arrayBuffer()
+        resolve(new Uint8Array(ab))
+      } catch (err) {
+        reject(err)
+      }
+    }
+    recorder.onerror = (err) => reject(err)
+  })
+
+  let activo = true
+  const pintarFrame = () => {
+    if (!activo) return
+    if (video.currentTime >= tEnd || video.ended) {
+      activo = false
+      video.pause()
+      if (recorder.state === 'recording') recorder.stop()
+      return
+    }
+    ctx.drawImage(video, 0, 0, w, h)
+    window.requestAnimationFrame(pintarFrame)
+  }
+
+  recorder.start(100)
+  await video.play()
+  pintarFrame()
+
+  const bytes = await promesaGrabacion
+  activo = false
+  combinedStream.getTracks().forEach((t) => t.stop())
+  await audioCtx.close().catch(() => {})
+
+  return { bytes, ext: extSalida }
 }
 
 const convertirVideoAGif = async (
@@ -1660,7 +1928,7 @@ const capturarFrameDeVideo = async (
   const canvas = document.createElement('canvas')
   canvas.width = video.videoWidth || 1280
   canvas.height = video.videoHeight || 720
-  const ctx = canvas.getContext('2d', { alpha: false })!
+  const ctx = canvas.getContext('2d')!
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
   return await canvasToUint8ArrayDirecto(canvas, formato, 0.94)
 }
@@ -1753,6 +2021,7 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
   voltearV.value = false
   zoomNivel.value = 100
   modoPan.value = false
+  fondoTransparenteActivo.value = false
   volumenMediaPct.value = 100
   velocidadMedia.value = 1
 
@@ -1825,12 +2094,10 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
       const c = document.createElement('canvas')
       c.width = img.naturalWidth || 800
       c.height = img.naturalHeight || 600
-      const ctx = c.getContext('2d', { alpha: false })!
-      ctx.fillStyle = '#FFFFFF'
-      ctx.fillRect(0, 0, c.width, c.height)
+      const ctx = c.getContext('2d')!
       ctx.drawImage(img, 0, 0)
       paginasCanvases.value = [c]
-      paginasMiniaturas.value = [c.toDataURL('image/jpeg', 0.8)]
+      paginasMiniaturas.value = [c.toDataURL('image/png')]
     }
 
     showMenu.value = false
@@ -1859,6 +2126,7 @@ const cerrarVentanaHerramienta = () => {
   historialTrazos.value = []
   zoomNivel.value = 100
   modoPan.value = false
+  fondoTransparenteActivo.value = false
   window.api.cerrarMenu()
 }
 
@@ -1982,6 +2250,9 @@ const deshacerTrazo = () => {
   if (!c || historialTrazos.value.length <= 1) return
   const nuevoHistorial = historialTrazos.value.slice(0, -1)
   historialTrazos.value = nuevoHistorial
+  if (nuevoHistorial.length === 1) {
+    fondoTransparenteActivo.value = false
+  }
   const anterior = nuevoHistorial[nuevoHistorial.length - 1]
   const ctx = c.getContext('2d', { willReadFrequently: true })
   if (ctx && anterior) {
@@ -1996,6 +2267,7 @@ const limpiarLienzo = () => {
   if (!c || historialTrazos.value.length === 0) return
   const inicial = historialTrazos.value[0]
   historialTrazos.value = [inicial]
+  fondoTransparenteActivo.value = false
   const ctx = c.getContext('2d', { willReadFrequently: true })
   if (ctx && inicial) {
     ctx.putImageData(inicial, 0, 0)
@@ -2031,17 +2303,18 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
   procesando.value = true
   try {
     const esPdfOrigen = extArchivoActivo.value === 'pdf'
-    const formatoImgDestino = ['jpg', 'png', 'webp'].includes(extArchivoActivo.value)
-      ? extArchivoActivo.value
-      : 'png'
+    const formatoImgDestino = fondoTransparenteActivo.value
+      ? 'png'
+      : ['jpg', 'png', 'webp'].includes(extArchivoActivo.value)
+        ? extArchivoActivo.value
+        : 'png'
 
-    // 1. HERRAMIENTAS MULTIMEDIA (VIDEO / AUDIO / CAPTURA / GIF)
     if (herramientaActual.value === 'capturar' && videoPlayerRef.value) {
       const v = videoPlayerRef.value
       const canvas = document.createElement('canvas')
       canvas.width = v.videoWidth || 1280
       canvas.height = v.videoHeight || 720
-      const ctx = canvas.getContext('2d', { alpha: false })!
+      const ctx = canvas.getContext('2d')!
       ctx.drawImage(v, 0, 0, canvas.width, canvas.height)
       const fmt = (formatoSalidaOpcional || 'jpg') as 'jpg' | 'png'
       const bytes = await canvasToUint8ArrayDirecto(canvas, fmt, 0.95)
@@ -2066,22 +2339,44 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         '_clip'
       )
     } else if (herramientaActual.value === 'multimedia' && bytesMultimediaOriginal.value) {
-      const destino = formatoSalidaOpcional || 'wav'
-      const wavBytes = await extraerAudioAWavDirecto(
-        bytesMultimediaOriginal.value,
-        inicioCorteSeg.value,
-        finCorteSeg.value,
-        volumenMediaPct.value / 100,
-        velocidadMedia.value
-      )
-      await window.api.guardarMultimediaBytes(
-        wavBytes,
-        destino,
-        rutaArchivoActivo.value,
-        '_recorte'
-      )
+      if (formatoSalidaOpcional === 'video-clip' && esVideoActivo.value && mediaUrlActiva.value) {
+        if (videoPlayerRef.value && !videoPlayerRef.value.paused) {
+          videoPlayerRef.value.pause()
+        }
+        const clip = await recortarClipDeVideo(
+          mediaUrlActiva.value,
+          inicioCorteSeg.value,
+          finCorteSeg.value,
+          volumenMediaPct.value / 100,
+          velocidadMedia.value
+        )
+        await window.api.guardarMultimediaBytes(
+          clip.bytes,
+          clip.ext,
+          rutaArchivoActivo.value,
+          '_clip'
+        )
+      } else {
+        const destino = formatoSalidaOpcional || 'wav'
+        const wavBytes = await extraerAudioAWavDirecto(
+          bytesMultimediaOriginal.value,
+          inicioCorteSeg.value,
+          finCorteSeg.value,
+          volumenMediaPct.value / 100,
+          velocidadMedia.value
+        )
+        await window.api.guardarMultimediaBytes(
+          wavBytes,
+          destino,
+          rutaArchivoActivo.value,
+          '_recorte'
+        )
+      }
     } else if (herramientaActual.value === 'dibujar') {
-      if (esPdfOrigen || extArchivoActivo.value === 'docx' || extArchivoActivo.value === 'txt') {
+      if (
+        !fondoTransparenteActivo.value &&
+        (esPdfOrigen || extArchivoActivo.value === 'docx' || extArchivoActivo.value === 'txt')
+      ) {
         const bytesList: Uint8Array[] = []
         const dims: { width: number; height: number }[] = []
         for (const c of paginasCanvases.value) {
@@ -2095,13 +2390,13 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           '_firmado'
         )
       } else {
-        const c = paginasCanvases.value[0]
+        const c = paginasCanvases.value[paginaIndice.value] || paginasCanvases.value[0]
         const bytes = await canvasToUint8ArrayDirecto(c, formatoImgDestino)
         await window.api.guardarPaginasImagen(
           [bytes],
           formatoImgDestino,
           rutaArchivoActivo.value,
-          '_editado'
+          fondoTransparenteActivo.value ? '_sin_fondo' : '_editado'
         )
       }
     } else if (herramientaActual.value === 'recortar') {
@@ -2111,9 +2406,11 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       const ch = Math.max(20, Math.round(cajaRecorte.value.h))
       cropCanvas.width = cw
       cropCanvas.height = ch
-      const ctx = cropCanvas.getContext('2d', { alpha: false })!
-      ctx.fillStyle = '#FFFFFF'
-      ctx.fillRect(0, 0, cw, ch)
+      const ctx = cropCanvas.getContext('2d')!
+      if (!fondoTransparenteActivo.value) {
+        ctx.fillStyle = '#FFFFFF'
+        ctx.fillRect(0, 0, cw, ch)
+      }
       ctx.drawImage(
         src,
         Math.round(cajaRecorte.value.x),
@@ -2126,7 +2423,7 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         ch
       )
 
-      if (esPdfOrigen) {
+      if (esPdfOrigen && !fondoTransparenteActivo.value) {
         const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
         await window.api.guardarPaginasComoPdf(
           [pngBytes],
@@ -2140,7 +2437,7 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           [bytes],
           formatoImgDestino,
           rutaArchivoActivo.value,
-          '_recorte'
+          fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
         )
       }
     } else if (herramientaActual.value === 'rotar') {
@@ -2154,9 +2451,11 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         outCanvas.width = intercambiaLados ? src.height : src.width
         outCanvas.height = intercambiaLados ? src.width : src.height
 
-        const ctx = outCanvas.getContext('2d', { alpha: false })!
-        ctx.fillStyle = '#FFFFFF'
-        ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+        const ctx = outCanvas.getContext('2d')!
+        if (!fondoTransparenteActivo.value) {
+          ctx.fillStyle = '#FFFFFF'
+          ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+        }
 
         ctx.save()
         ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
@@ -2173,7 +2472,7 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         })
       }
 
-      if (esPdfOrigen) {
+      if (esPdfOrigen && !fondoTransparenteActivo.value) {
         await window.api.guardarPaginasComoPdf(
           rotadosBytes,
           rutaArchivoActivo.value,
@@ -2221,7 +2520,7 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       const factor = escalaPorcentaje.value / 100
       const calidad = calidadPorcentaje.value / 100
 
-      if (esPdfOrigen) {
+      if (esPdfOrigen && !fondoTransparenteActivo.value) {
         const bytesList: Uint8Array[] = []
         const dims: { width: number; height: number }[] = []
 
@@ -2229,7 +2528,7 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           const outCanvas = document.createElement('canvas')
           outCanvas.width = Math.max(16, Math.round(src.width * factor))
           outCanvas.height = Math.max(16, Math.round(src.height * factor))
-          const ctx = outCanvas.getContext('2d', { alpha: false })!
+          const ctx = outCanvas.getContext('2d')!
           ctx.fillStyle = '#FFFFFF'
           ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
           ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
@@ -2245,22 +2544,26 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           '_comprimido'
         )
       } else {
-        const src = paginasCanvases.value[0]
+        const src = paginasCanvases.value[paginaIndice.value] || paginasCanvases.value[0]
         const outCanvas = document.createElement('canvas')
         outCanvas.width = Math.max(16, Math.round(src.width * factor))
         outCanvas.height = Math.max(16, Math.round(src.height * factor))
-        const ctx = outCanvas.getContext('2d', { alpha: false })!
-        ctx.fillStyle = '#FFFFFF'
-        ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+        const ctx = outCanvas.getContext('2d')!
+        if (!fondoTransparenteActivo.value) {
+          ctx.fillStyle = '#FFFFFF'
+          ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+        }
         ctx.drawImage(src, 0, 0, outCanvas.width, outCanvas.height)
 
-        const fmt = formatoSalidaOpcional || formatoImgDestino
+        const fmt = fondoTransparenteActivo.value
+          ? 'png'
+          : formatoSalidaOpcional || formatoImgDestino
         const bytes = await canvasToUint8ArrayDirecto(outCanvas, fmt, calidad)
         await window.api.guardarPaginasImagen(
           [bytes],
           fmt,
           rutaArchivoActivo.value,
-          `_${escalaPorcentaje.value}pct`
+          fondoTransparenteActivo.value ? '_transparente' : `_${escalaPorcentaje.value}pct`
         )
       }
     } else if (herramientaActual.value === 'editar') {
@@ -2308,7 +2611,6 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
   const esPdf = ext === 'pdf' || file.type === 'application/pdf'
   const esDocTexto = ext === 'docx' || ext === 'txt'
 
-  // CONVERSIÓN DE VIDEO / AUDIO DESDE LA RUEDA
   if (esVideo || esAudio) {
     const bytes = await window.api.leerArchivoBinario(rutaReal)
     if (formatoDestino === 'wav' || formatoDestino === 'mp3' || formatoDestino === 'webm') {
@@ -2470,13 +2772,12 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
 <template>
   <div
+    :style="estiloVariablesTema"
     class="w-screen h-screen overflow-hidden bg-transparent select-none"
     @dragover="detectarTipoEnVuelo"
     @wheel="onWheelLocal"
   >
-    <!-- =================================================================== -->
-    <!-- 1. RUEDA RADIAL ORBIT                                               -->
-    <!-- =================================================================== -->
+    <!-- 1. RUEDA RADIAL ORBIT + DETECTOR AUTOMÁTICO DE CAPTURA EN PORTAPAPELES -->
     <Transition
       enter-active-class="transition duration-150 ease-out"
       enter-from-class="opacity-0 scale-50"
@@ -2491,7 +2792,11 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         class="fixed -translate-x-1/2 -translate-y-1/2 w-[320px] h-[320px] flex items-center justify-center pointer-events-auto"
       >
         <div
-          class="absolute inset-[8px] rounded-full bg-orange-950/25 backdrop-blur-2xl border-[2px] border-white/40 shadow-[0_20px_50px_rgba(0,0,0,0.45)] pointer-events-none"
+          :style="{
+            backgroundColor: paletaTema.cristalRueda,
+            borderColor: paletaTema.borde
+          }"
+          class="absolute inset-[8px] rounded-full backdrop-blur-2xl border-[2px] shadow-[0_20px_50px_rgba(0,0,0,0.5)] pointer-events-none transition-colors duration-300"
         ></div>
 
         <svg
@@ -2500,13 +2805,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         >
           <defs>
             <linearGradient id="activeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stop-color="#f97316" stop-opacity="0.95" />
-              <stop offset="100%" stop-color="#dc2626" stop-opacity="0.95" />
+              <stop offset="0%" :stop-color="paletaTema.primario" stop-opacity="0.96" />
+              <stop offset="100%" :stop-color="paletaTema.secundario" stop-opacity="0.96" />
             </linearGradient>
 
             <linearGradient id="inactiveGrad" x1="0%" y1="0%" x2="0%" y2="100%">
-              <stop offset="0%" stop-color="#fde68a" stop-opacity="0.62" />
-              <stop offset="100%" stop-color="#fed7aa" stop-opacity="0.48" />
+              <stop offset="0%" :stop-color="paletaTema.inactivoTop" stop-opacity="0.68" />
+              <stop offset="100%" :stop-color="paletaTema.inactivoBottom" stop-opacity="0.52" />
             </linearGradient>
           </defs>
 
@@ -2514,7 +2819,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             cx="160"
             cy="160"
             r="59"
-            fill="rgba(0, 0, 0, 0.12)"
+            fill="rgba(0, 0, 0, 0.18)"
             stroke="rgba(255, 255, 255, 0.35)"
             stroke-width="1.5"
             class="pointer-events-none"
@@ -2526,7 +2831,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               :fill="opcionActiva === seg.id ? 'url(#activeGrad)' : 'url(#inactiveGrad)'"
               :stroke="
                 opcionActiva === seg.id
-                  ? 'rgba(255, 255, 255, 0.85)'
+                  ? 'rgba(255, 255, 255, 0.9)'
                   : 'rgba(255, 255, 255, 0.45)'
               "
               stroke-width="1.5"
@@ -2536,7 +2841,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 transform: opcionActiva === seg.id ? 'scale(1.03)' : 'scale(1)',
                 filter:
                   opcionActiva === seg.id
-                    ? 'drop-shadow(0 0 16px rgba(234, 88, 12, 0.65))'
+                    ? `drop-shadow(0 0 16px ${paletaTema.sombra})`
                     : 'none'
               }"
               @dragenter.prevent="opcionActiva = seg.id"
@@ -2552,7 +2857,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               dominant-baseline="central"
               class="pointer-events-none font-extrabold tracking-wider transition-colors duration-150"
               :class="seg.label.length > 5 ? 'text-[11px]' : 'text-[15px]'"
-              :fill="opcionActiva === seg.id ? '#FFFFFF' : '#1c1917'"
+              :fill="opcionActiva === seg.id ? '#FFFFFF' : paletaTema.textoOscuro"
             >
               {{ seg.label }}
             </text>
@@ -2569,9 +2874,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
           <template v-else>
             <div
-              class="px-4 py-1.5 rounded-full bg-amber-200/55 border border-white/50 shadow-inner backdrop-blur-md flex items-center justify-center min-w-[76px]"
+              :style="{ backgroundColor: `${paletaTema.claro}99` }"
+              class="px-4 py-1.5 rounded-full border border-white/55 shadow-inner backdrop-blur-md flex items-center justify-center min-w-[76px] transition-colors duration-300"
             >
-              <span class="text-[#1c1917] font-extrabold text-[11px] tracking-wider uppercase">
+              <span
+                :style="{ color: paletaTema.textoOscuro }"
+                class="font-extrabold text-[11px] tracking-wider uppercase"
+              >
                 {{ etiquetaCentro }}
               </span>
             </div>
@@ -2579,29 +2888,43 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             <div class="flex items-center gap-1.5 mt-1.5">
               <span
                 class="w-1.5 h-1.5 rounded-full transition-all duration-200"
-                :class="
+                :style="
                   modoRueda === 'conversion'
-                    ? 'bg-orange-500 scale-125 shadow-[0_0_6px_#f97316]'
-                    : 'bg-white/40'
+                    ? {
+                        backgroundColor: paletaTema.primario,
+                        boxShadow: `0 0 8px ${paletaTema.primario}`,
+                        transform: 'scale(1.25)'
+                      }
+                    : { backgroundColor: 'rgba(255,255,255,0.4)' }
                 "
               ></span>
               <span
                 class="w-1.5 h-1.5 rounded-full transition-all duration-200"
-                :class="
+                :style="
                   modoRueda === 'herramientas'
-                    ? 'bg-orange-500 scale-125 shadow-[0_0_6px_#f97316]'
-                    : 'bg-white/40'
+                    ? {
+                        backgroundColor: paletaTema.primario,
+                        boxShadow: `0 0 8px ${paletaTema.primario}`,
+                        transform: 'scale(1.25)'
+                      }
+                    : { backgroundColor: 'rgba(255,255,255,0.4)' }
                 "
               ></span>
             </div>
           </template>
         </div>
+
+        <button
+          v-if="hayCapturaEnPortapapeles && !procesando"
+          @mousedown.stop.prevent="abrirImagenDesdePortapapeles('recortar')"
+          class="orbit-btn-primary absolute -bottom-11 z-30 px-4 py-1.5 rounded-full hover:scale-105 text-white font-extrabold text-[11px] tracking-wide border-2 border-white/85 flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap pointer-events-auto"
+        >
+          <span>📋 Pegar captura detectada</span>
+        </button>
       </div>
     </Transition>
 
-    <!-- =================================================================== -->
-    <!-- 2. NOTIFICACIÓN TOAST FLOTANTE DE ARCHIVO GUARDADO (OPCIÓN 2)       -->
-    <!-- =================================================================== -->
+    <!-- 2. NOTIFICACIÓN TOAST FLOTANTE DE ARCHIVO GUARDADO -->
     <Transition
       enter-active-class="transition duration-200 ease-out"
       enter-from-class="opacity-0 translate-y-6 scale-90"
@@ -2614,16 +2937,23 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         v-if="toastVisible && !ventanaAbierta"
         @mouseenter="configurarMouseToast(false)"
         @mouseleave="configurarMouseToast(true)"
-        class="fixed bottom-6 right-6 z-50 w-[330px] rounded-2xl bg-orange-950/55 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_18px_45px_rgba(0,0,0,0.65)] p-3.5 flex items-center justify-between gap-3 pointer-events-auto"
+        :style="{
+          backgroundColor: paletaTema.cristal,
+          borderColor: paletaTema.borde
+        }"
+        class="fixed bottom-6 right-6 z-50 w-[330px] rounded-2xl backdrop-blur-2xl border-[2px] shadow-[0_18px_45px_rgba(0,0,0,0.65)] p-3.5 flex items-center justify-between gap-3 pointer-events-auto transition-colors duration-300"
       >
         <div class="flex items-center gap-2.5 min-w-0">
           <div
-            class="w-8 h-8 rounded-full bg-gradient-to-br from-[#f97316] to-[#dc2626] border border-white/75 flex items-center justify-center text-white font-extrabold text-xs shrink-0 shadow-md"
+            class="orbit-btn-primary w-8 h-8 rounded-full border border-white/75 flex items-center justify-center text-white font-extrabold text-xs shrink-0 shadow-md"
           >
             ✓
           </div>
           <div class="flex flex-col min-w-0">
-            <span class="text-amber-200 text-[10px] font-extrabold uppercase tracking-wider">
+            <span
+              :style="{ color: paletaTema.claro }"
+              class="text-[10px] font-extrabold uppercase tracking-wider"
+            >
               Guardado en {{ toastData.carpeta }}
             </span>
             <span class="text-white text-xs font-bold truncate">
@@ -2635,13 +2965,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         <div class="flex items-center gap-1.5 shrink-0">
           <button
             @click="abrirArchivoDesdeToast"
-            class="px-3 py-1.5 rounded-full bg-[#fde68a]/80 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white font-extrabold text-[11px] border border-white/60 transition-all cursor-pointer"
+            class="orbit-pill-btn px-3 py-1.5 rounded-full font-extrabold text-[11px] border border-white/60 transition-all cursor-pointer"
           >
             Abrir ↗
           </button>
           <button
             @click="cerrarToast"
-            class="w-6 h-6 rounded-full bg-black/25 hover:bg-red-600 text-white/80 hover:text-white text-[10px] font-extrabold flex items-center justify-center cursor-pointer"
+            class="w-6 h-6 rounded-full bg-black/30 hover:bg-red-600 text-white/85 hover:text-white text-[10px] font-extrabold flex items-center justify-center cursor-pointer"
           >
             ✕
           </button>
@@ -2649,9 +2979,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
       </div>
     </Transition>
 
-    <!-- =================================================================== -->
-    <!-- 3. PANEL DE BANDEJA DEL SISTEMA CON AUTO-UPDATER (OPCIÓN 5)         -->
-    <!-- =================================================================== -->
+    <!-- 3. PANEL DE BANDEJA DEL SISTEMA (MODO CAMALEÓN EN TIEMPO REAL + AUTO-UPDATE) -->
     <Transition
       enter-active-class="transition duration-150 ease-out"
       enter-from-class="opacity-0 translate-y-4 scale-90"
@@ -2667,18 +2995,28 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
         @contextmenu.prevent
       >
         <div
-          :style="{ left: `${trayPosX}px`, top: `${trayPosY}px` }"
-          class="fixed -translate-x-1/2 -translate-y-1/2 w-[340px] rounded-[30px] bg-orange-950/45 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_22px_60px_rgba(0,0,0,0.7)] p-4 flex flex-col gap-2.5"
+          :style="{
+            left: `${trayPosX}px`,
+            top: `${trayPosY}px`,
+            backgroundColor: paletaTema.cristal,
+            borderColor: paletaTema.borde
+          }"
+          class="fixed -translate-x-1/2 -translate-y-1/2 w-[345px] rounded-[30px] backdrop-blur-2xl border-[2px] shadow-[0_22px_60px_rgba(0,0,0,0.75)] p-4 flex flex-col gap-2.5 transition-colors duration-300"
         >
-          <!-- Encabezado con Estado y Versión de Orbit -->
           <div class="flex items-center justify-between pb-2 border-b border-white/25">
             <div class="flex items-center gap-2.5">
               <div class="w-10 h-10 flex items-center justify-center">
                 <svg viewBox="0 0 64 64" class="w-full h-full drop-shadow-md">
                   <defs>
                     <linearGradient id="trayHeaderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-                      <stop offset="0%" :stop-color="trayPausado ? '#78716c' : '#f97316'" />
-                      <stop offset="100%" :stop-color="trayPausado ? '#44403c' : '#dc2626'" />
+                      <stop
+                        offset="0%"
+                        :stop-color="trayPausado ? '#64748b' : paletaTema.primario"
+                      />
+                      <stop
+                        offset="100%"
+                        :stop-color="trayPausado ? '#334155' : paletaTema.secundario"
+                      />
                     </linearGradient>
                   </defs>
                   <ellipse
@@ -2697,16 +3035,16 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     cy="32"
                     r="11"
                     fill="url(#trayHeaderGrad)"
-                    stroke="#1c1917"
+                    stroke="#0f172a"
                     stroke-width="2.5"
                   />
-                  <circle cx="32" cy="32" r="5" :fill="trayPausado ? '#a8a29e' : '#fde68a'" />
+                  <circle cx="32" cy="32" r="5" :fill="trayPausado ? '#94a3b8' : paletaTema.claro" />
                   <circle
                     cx="50"
                     cy="14"
                     r="5.5"
-                    :fill="trayPausado ? '#a8a29e' : '#fde68a'"
-                    :stroke="trayPausado ? '#44403c' : '#dc2626'"
+                    :fill="trayPausado ? '#94a3b8' : paletaTema.claro"
+                    :stroke="trayPausado ? '#334155' : paletaTema.secundario"
                     stroke-width="2"
                   />
                 </svg>
@@ -2717,13 +3055,16 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   <span class="text-white font-extrabold text-sm tracking-wider uppercase leading-none">
                     ORBIT
                   </span>
-                  <span class="px-1.5 py-0.5 rounded-full bg-white/15 text-amber-200 font-extrabold text-[9px]">
+                  <span
+                    :style="{ color: paletaTema.claro }"
+                    class="px-1.5 py-0.5 rounded-full bg-white/15 font-extrabold text-[9px]"
+                  >
                     v{{ trayVersionApp }}
                   </span>
                 </div>
                 <span
                   class="text-[11px] font-bold mt-0.5"
-                  :class="trayPausado ? 'text-amber-300' : 'text-emerald-300'"
+                  :class="trayPausado ? 'text-slate-300' : 'text-emerald-300'"
                 >
                   {{
                     trayPausado
@@ -2738,25 +3079,24 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
             <button
               @click="cerrarMenuTray"
-              class="w-7 h-7 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
+              class="orbit-pill-btn w-7 h-7 rounded-full hover:!bg-red-600 hover:!text-white border border-white/50 font-extrabold text-xs flex items-center justify-center transition-colors cursor-pointer"
             >
               ✕
             </button>
           </div>
 
-          <!-- Botón Principal Pausar + Temporizadores -->
-          <div class="flex flex-col gap-2 bg-black/20 rounded-2xl p-2.5 border border-white/20">
+          <div class="flex flex-col gap-2 bg-black/25 rounded-2xl p-2.5 border border-white/20">
             <button
               @click="ejecutarAccionTray('toggle-gaming')"
               class="w-full py-2 px-4 rounded-xl font-extrabold text-xs tracking-wider uppercase border transition-all flex items-center justify-between cursor-pointer"
               :class="
                 trayPausado
-                  ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-[0_0_16px_rgba(234,88,12,0.6)]'
-                  : 'bg-[#fde68a]/70 hover:bg-[#fde68a] text-[#1c1917] border-white/55'
+                  ? 'orbit-btn-primary text-white border-white'
+                  : 'orbit-pill-btn border-white/55'
               "
             >
               <span>{{ trayPausado ? '▶ Reanudar Orbit' : '⏸ Pausar' }}</span>
-              <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/20 text-white">
+              <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/25 text-white">
                 {{ trayPausado ? 'PAUSADO' : 'ACTIVO' }}
               </span>
             </button>
@@ -2773,8 +3113,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 class="py-1 rounded-full text-[11px] font-extrabold border transition-all cursor-pointer"
                 :class="
                   trayPausado && trayMinutosTimer === t.min
-                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-md'
-                    : 'bg-[#fde68a]/55 hover:bg-[#fde68a]/85 text-[#1c1917] border-white/40'
+                    ? 'orbit-btn-primary text-white border-white shadow-md'
+                    : 'orbit-pill-btn border-white/40'
                 "
               >
                 ⏱ {{ t.label }}
@@ -2782,18 +3122,43 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
-          <!-- Acción Rápida: Pegar Captura del Portapapeles -->
           <button
-            @click="abrirImagenDesdePortapapeles('recortar')"
-            class="w-full py-1.5 px-3.5 rounded-xl bg-[#fde68a]/70 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white font-extrabold text-xs border border-white/55 flex items-center justify-between transition-all cursor-pointer"
+            @click="ejecutarAccionTray('adaptar-fondo', !trayAdaptarColorFondo)"
+            class="w-full py-2 px-3.5 rounded-xl font-extrabold text-xs border transition-all flex items-center justify-between cursor-pointer"
+            :class="
+              trayAdaptarColorFondo
+                ? 'orbit-btn-primary text-white border-white'
+                : 'orbit-pill-btn border-white/50'
+            "
           >
-            <span>📋 Editar captura del portapapeles</span>
-            <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/15">Ctrl+V</span>
+            <div class="flex items-center gap-2">
+              <span>🎨 Adaptar al fondo en tiempo real</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <span
+                class="w-3 h-3 rounded-full border border-white/80 shadow-sm transition-colors duration-300"
+                :style="{ backgroundColor: paletaTema.primario }"
+              ></span>
+              <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/25 text-white">
+                {{ trayAdaptarColorFondo ? 'EN VIVO' : 'ZAFIRO' }}
+              </span>
+            </div>
           </button>
 
-          <!-- Selector de Tecla de Activación -->
+          <button
+            v-if="hayCapturaEnPortapapeles"
+            @click="abrirImagenDesdePortapapeles('recortar')"
+            class="orbit-btn-primary w-full py-2 px-3.5 rounded-xl text-white font-extrabold text-xs border border-white/80 flex items-center justify-between transition-all cursor-pointer"
+          >
+            <span>📋 Pegar captura detectada</span>
+            <span class="text-[10px] px-2 py-0.5 rounded-full bg-black/25">Lista</span>
+          </button>
+
           <div class="flex flex-col gap-1">
-            <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider px-1">
+            <span
+              :style="{ color: paletaTema.claro }"
+              class="text-[10px] font-extrabold uppercase tracking-wider px-1"
+            >
               Tecla para abrir la rueda
             </span>
             <div class="grid grid-cols-2 gap-1.5">
@@ -2809,8 +3174,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 class="py-1.5 px-2.5 rounded-xl text-[11px] font-extrabold border transition-all cursor-pointer truncate"
                 :class="
                   trayModoTecla === tk.id
-                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white shadow-[0_0_12px_rgba(234,88,12,0.5)]'
-                    : 'bg-[#fde68a]/60 hover:bg-[#fde68a]/90 text-[#1c1917] border-white/45'
+                    ? 'orbit-btn-primary text-white border-white'
+                    : 'orbit-pill-btn border-white/45'
                 "
               >
                 {{ tk.label }}
@@ -2818,16 +3183,19 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
-          <!-- Historial de Archivos Recientes -->
           <div class="flex flex-col gap-1">
             <div class="flex items-center justify-between px-1">
-              <span class="text-amber-100/90 text-[10px] font-extrabold uppercase tracking-wider">
+              <span
+                :style="{ color: paletaTema.claro }"
+                class="text-[10px] font-extrabold uppercase tracking-wider"
+              >
                 Conversiones recientes
               </span>
               <button
                 v-if="trayArchivosRecientes.length > 0"
                 @click="ejecutarAccionTray('limpiar-recientes')"
-                class="text-[10px] font-bold text-amber-200 hover:text-white underline cursor-pointer"
+                :style="{ color: paletaTema.claro }"
+                class="text-[10px] font-bold hover:text-white underline cursor-pointer"
               >
                 Limpiar
               </button>
@@ -2835,53 +3203,72 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
             <div
               v-if="trayArchivosRecientes.length === 0"
-              class="py-2 px-3 rounded-xl bg-black/20 border border-white/15 text-center text-white/60 text-xs font-medium"
+              class="py-2 px-3 rounded-xl bg-black/25 border border-white/15 text-center text-white/60 text-xs font-medium"
             >
               Aún no hay archivos recientes
             </div>
 
-            <div v-else class="flex flex-col gap-1 max-h-[85px] overflow-y-auto pr-0.5">
+            <div v-else class="flex flex-col gap-1 max-h-[78px] overflow-y-auto pr-0.5">
               <button
                 v-for="item in trayArchivosRecientes"
                 :key="item.ruta"
                 @click="ejecutarAccionTray('abrir-reciente', item.ruta)"
-                class="w-full py-1.5 px-3 rounded-xl bg-[#fde68a]/60 hover:bg-gradient-to-r hover:from-[#f97316] hover:to-[#dc2626] text-[#1c1917] hover:text-white border border-white/45 flex items-center justify-between text-left transition-colors cursor-pointer group"
+                class="orbit-pill-btn w-full py-1.5 px-3 rounded-xl border border-white/45 flex items-center justify-between text-left transition-colors cursor-pointer group"
               >
                 <span class="text-xs font-extrabold truncate max-w-[230px]">
                   {{ item.nombre }}
                 </span>
-                <span class="text-[10px] font-extrabold opacity-70 group-hover:opacity-100">
+                <span class="text-[10px] font-extrabold opacity-75 group-hover:opacity-100">
                   Abrir ↗
                 </span>
               </button>
             </div>
           </div>
 
-          <!-- Buscador de Actualizaciones (Opción 5) -->
-          <div class="flex flex-col gap-1 bg-black/20 rounded-xl p-2 border border-white/15">
-            <div class="flex items-center justify-between">
-              <span class="text-white/85 text-[11px] font-bold">
+          <div class="flex flex-col gap-1.5 bg-black/25 rounded-xl p-2 border border-white/15">
+            <div class="flex items-center justify-between gap-2">
+              <span class="text-white/90 text-[11px] font-bold truncate">
                 {{ infoUpdate ? infoUpdate.mensaje : 'Actualizaciones de Orbit' }}
               </span>
               <button
                 @click="verificarActualizacionesApp"
                 :disabled="buscandoUpdate"
-                class="px-2.5 py-1 rounded-full bg-[#fde68a]/70 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-[10px] border border-white/50 cursor-pointer shrink-0"
+                class="orbit-pill-btn px-2.5 py-1 rounded-full font-extrabold text-[10px] border border-white/50 cursor-pointer shrink-0 disabled:opacity-60"
               >
-                {{ buscandoUpdate ? 'Buscando...' : '🔄 Buscar' }}
+                {{
+                  infoUpdate?.estado === 'instalando'
+                    ? '⚡ Instalando...'
+                    : buscandoUpdate
+                      ? 'Descargando...'
+                      : '🔄 Actualizar'
+                }}
               </button>
+            </div>
+
+            <div
+              v-if="
+                infoUpdate &&
+                (infoUpdate.estado === 'descargando' ||
+                  infoUpdate.estado === 'instalando' ||
+                  infoUpdate.estado === 'buscando')
+              "
+              class="w-full h-1.5 rounded-full bg-white/15 overflow-hidden"
+            >
+              <div
+                class="orbit-btn-primary h-full transition-all duration-200"
+                :style="{ width: `${infoUpdate.porcentaje || 10}%` }"
+              ></div>
             </div>
           </div>
 
-          <!-- Pie del Panel: Auto-inicio con Windows y Salir -->
           <div class="flex items-center justify-between pt-1.5 border-t border-white/25">
             <button
               @click="ejecutarAccionTray('autostart', !trayIniciarConWindows)"
               class="px-3 py-1.5 rounded-full text-[11px] font-extrabold border transition-all flex items-center gap-1.5 cursor-pointer"
               :class="
                 trayIniciarConWindows
-                  ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                  : 'bg-[#fde68a]/60 text-[#1c1917] border-white/45'
+                  ? 'orbit-btn-primary text-white border-white'
+                  : 'orbit-pill-btn border-white/45'
               "
             >
               <span>{{ trayIniciarConWindows ? '✓' : '○' }}</span>
@@ -2899,9 +3286,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
       </div>
     </Transition>
 
-    <!-- =================================================================== -->
-    <!-- 4. VENTANA DE HERRAMIENTAS (DOCUMENTOS, IMÁGENES, VIDEO Y AUDIO)    -->
-    <!-- =================================================================== -->
+    <!-- 4. VENTANA DE HERRAMIENTAS (DOCUMENTOS, IMÁGENES, VIDEO Y AUDIO) -->
     <Transition
       enter-active-class="transition duration-200 ease-out"
       enter-from-class="opacity-0 scale-90"
@@ -2912,15 +3297,18 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     >
       <div
         v-if="ventanaAbierta"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/30 backdrop-blur-sm pointer-events-auto"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/35 backdrop-blur-sm pointer-events-auto"
       >
         <div
-          class="relative w-[850px] max-h-[90vh] rounded-[34px] bg-orange-950/35 backdrop-blur-2xl border-[2px] border-white/45 shadow-[0_25px_70px_rgba(0,0,0,0.65)] flex flex-col overflow-hidden p-5"
+          :style="{
+            backgroundColor: paletaTema.cristal,
+            borderColor: paletaTema.borde
+          }"
+          class="relative w-[860px] max-h-[90vh] rounded-[34px] backdrop-blur-2xl border-[2px] shadow-[0_25px_70px_rgba(0,0,0,0.7)] flex flex-col overflow-hidden p-5 transition-colors duration-300"
         >
-          <!-- Barra Superior con Selector Rápido de Herramientas -->
           <div class="flex flex-wrap items-center justify-between gap-2 mb-3 pb-3 border-b border-white/25">
             <div class="flex items-center gap-2.5">
-              <div class="flex items-center gap-1 bg-black/25 p-1 rounded-full border border-white/25">
+              <div class="flex items-center gap-1 bg-black/30 p-1 rounded-full border border-white/25">
                 <button
                   v-for="tab in herramientasDisponiblesArchivo"
                   :key="tab.id"
@@ -2928,8 +3316,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-3 py-1 rounded-full font-extrabold text-[11px] tracking-wider uppercase transition-all cursor-pointer"
                   :class="
                     herramientaActual === tab.id
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border border-white/80 shadow-[0_0_12px_rgba(234,88,12,0.5)]'
-                      : 'text-amber-100/85 hover:text-white hover:bg-white/10'
+                      ? 'orbit-btn-primary text-white border border-white/80'
+                      : 'text-white/80 hover:text-white hover:bg-white/10'
                   "
                 >
                   {{ tab.label }}
@@ -2937,61 +3325,86 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- Controles de Zoom de Precisión -->
             <div
-              v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'"
-              class="flex items-center gap-1.5 bg-[#fde68a]/60 border border-white/55 rounded-full px-3 py-1 shadow-inner"
+              v-if="
+                herramientaActual === 'dibujar' ||
+                herramientaActual === 'recortar' ||
+                herramientaActual === 'ajustar'
+              "
+              class="flex items-center gap-2"
             >
               <button
-                @click="cambiarZoom(-25)"
-                class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
+                @click="quitarFondoBlanco"
+                class="px-3 py-1 rounded-full font-extrabold text-xs border transition-all flex items-center gap-1 cursor-pointer"
+                :class="
+                  fondoTransparenteActivo
+                    ? 'orbit-btn-primary text-white border-white shadow-md'
+                    : 'orbit-pill-btn border-white/60'
+                "
+                title="Elimina el fondo blanco de firmas, sellos o logotipos y exporta como PNG transparente"
               >
-                −
-              </button>
-              <button
-                @click="restablecerZoom"
-                class="px-2 text-[#1c1917] font-extrabold text-xs min-w-[48px] text-center cursor-pointer hover:underline"
-              >
-                {{ zoomNivel }}%
-              </button>
-              <button
-                @click="cambiarZoom(25)"
-                class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/30 text-[#1c1917] font-extrabold text-sm flex items-center justify-center cursor-pointer"
-              >
-                +
+                <span>✨ Quitar fondo blanco</span>
               </button>
 
-              <button
-                v-if="zoomNivel > 100"
-                @click="modoPan = !modoPan"
-                class="ml-1 px-2.5 py-0.5 rounded-full text-[11px] font-extrabold border transition-all cursor-pointer"
-                :class="
-                  modoPan || espacioPresionado
-                    ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                    : 'bg-white/50 text-[#1c1917] border-white/60'
-                "
+              <div
+                v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'"
+                :style="{ backgroundColor: `${paletaTema.claro}CC` }"
+                class="flex items-center gap-1.5 border border-white/55 rounded-full px-3 py-1 shadow-inner"
               >
-                ✋ {{ modoPan ? 'Moviendo' : 'Mover' }}
-              </button>
+                <button
+                  @click="cambiarZoom(-25)"
+                  :style="{ color: paletaTema.textoOscuro }"
+                  class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/25 font-extrabold text-sm flex items-center justify-center cursor-pointer"
+                >
+                  −
+                </button>
+                <button
+                  @click="restablecerZoom"
+                  :style="{ color: paletaTema.textoOscuro }"
+                  class="px-2 font-extrabold text-xs min-w-[48px] text-center cursor-pointer hover:underline"
+                >
+                  {{ zoomNivel }}%
+                </button>
+                <button
+                  @click="cambiarZoom(25)"
+                  :style="{ color: paletaTema.textoOscuro }"
+                  class="w-6 h-6 rounded-full bg-black/15 hover:bg-black/25 font-extrabold text-sm flex items-center justify-center cursor-pointer"
+                >
+                  +
+                </button>
+
+                <button
+                  v-if="zoomNivel > 100"
+                  @click="modoPan = !modoPan"
+                  class="ml-1 px-2.5 py-0.5 rounded-full text-[11px] font-extrabold border transition-all cursor-pointer"
+                  :class="
+                    modoPan || espacioPresionado
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'bg-white/60 text-slate-900 border-white/60'
+                  "
+                >
+                  ✋ {{ modoPan ? 'Moviendo' : 'Mover' }}
+                </button>
+              </div>
             </div>
 
-            <!-- Selector de Páginas -->
             <div
               v-if="paginasCanvases.length > 1 && herramientaActual !== 'dividir' && herramientaActual !== 'editar'"
-              class="flex items-center gap-2 bg-[#fde68a]/55 border border-white/50 rounded-full px-3 py-1"
+              :style="{ backgroundColor: `${paletaTema.claro}CC`, color: paletaTema.textoOscuro }"
+              class="flex items-center gap-2 border border-white/50 rounded-full px-3 py-1"
             >
               <button
                 @click="paginaIndice = Math.max(0, paginaIndice - 1)"
-                class="text-[#1c1917] font-extrabold text-xs px-1.5 hover:text-orange-700 cursor-pointer"
+                class="font-extrabold text-xs px-1.5 hover:opacity-75 cursor-pointer"
               >
                 ◀
               </button>
-              <span class="text-[#1c1917] font-extrabold text-xs">
+              <span class="font-extrabold text-xs">
                 Pág {{ paginaIndice + 1 }} / {{ paginasCanvases.length }}
               </span>
               <button
                 @click="paginaIndice = Math.min(paginasCanvases.length - 1, paginaIndice + 1)"
-                class="text-[#1c1917] font-extrabold text-xs px-1.5 hover:text-orange-700 cursor-pointer"
+                class="font-extrabold text-xs px-1.5 hover:opacity-75 cursor-pointer"
               >
                 ▶
               </button>
@@ -2999,15 +3412,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
             <button
               @click="cerrarVentanaHerramienta"
-              class="w-9 h-9 rounded-full bg-[#fde68a]/60 hover:bg-red-600 text-[#1c1917] hover:text-white border border-white/50 font-extrabold text-sm flex items-center justify-center transition-colors cursor-pointer"
+              class="orbit-pill-btn w-9 h-9 rounded-full hover:!bg-red-600 hover:!text-white border border-white/50 font-extrabold text-sm flex items-center justify-center transition-colors cursor-pointer"
             >
               ✕
             </button>
           </div>
 
-          <!-- CONTENIDO SEGÚN LA HERRAMIENTA SELECCIONADA -->
           <div class="flex-1 overflow-hidden flex flex-col items-center justify-center min-h-[400px]">
-            <!-- A. ESTUDIO MULTIMEDIA (VIDEO / AUDIO / CAPTURA / GIF) -->
             <div
               v-if="
                 herramientaActual === 'multimedia' ||
@@ -3016,9 +3427,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               "
               class="w-full flex flex-col items-center gap-4"
             >
-              <!-- Reproductor de Video o Audio -->
               <div
-                class="w-full flex flex-col items-center justify-center bg-black/30 rounded-2xl p-4 border border-white/25"
+                class="w-full flex flex-col items-center justify-center bg-black/35 rounded-2xl p-4 border border-white/25"
               >
                 <video
                   v-if="esVideoActivo"
@@ -3031,7 +3441,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
                 <div v-else class="w-full flex flex-col items-center gap-3 py-6">
                   <div
-                    class="w-16 h-16 rounded-full bg-gradient-to-br from-[#f97316] to-[#dc2626] border-2 border-white/80 flex items-center justify-center text-2xl shadow-lg"
+                    class="orbit-btn-primary w-16 h-16 rounded-full border-2 border-white/80 flex items-center justify-center text-2xl shadow-lg"
                   >
                     🎵
                   </div>
@@ -3045,12 +3455,11 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </div>
               </div>
 
-              <!-- Controles de Recorte de Tiempo, Volumen, Velocidad o GIF -->
               <div
-                class="w-full grid grid-cols-2 gap-3 bg-black/20 rounded-2xl p-3.5 border border-white/20"
+                class="w-full grid grid-cols-2 gap-3 bg-black/25 rounded-2xl p-3.5 border border-white/20"
               >
                 <div class="flex flex-col gap-1.5">
-                  <label class="text-amber-100 text-xs font-extrabold">
+                  <label :style="{ color: paletaTema.claro }" class="text-xs font-extrabold">
                     ⏱ Inicio del recorte: {{ inicioCorteSeg }}s
                   </label>
                   <input
@@ -3059,12 +3468,13 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     :min="0"
                     :max="Math.max(0.5, finCorteSeg - 0.5)"
                     step="0.5"
-                    class="accent-orange-500 cursor-pointer"
+                    :style="{ accentColor: paletaTema.primario }"
+                    class="cursor-pointer"
                   />
                 </div>
 
                 <div class="flex flex-col gap-1.5">
-                  <label class="text-amber-100 text-xs font-extrabold">
+                  <label :style="{ color: paletaTema.claro }" class="text-xs font-extrabold">
                     🏁 Fin del recorte: {{ finCorteSeg }}s (Total: {{ duracionMedia }}s)
                   </label>
                   <input
@@ -3073,11 +3483,11 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     :min="inicioCorteSeg + 0.5"
                     :max="Math.max(1, duracionMedia)"
                     step="0.5"
-                    class="accent-orange-500 cursor-pointer"
+                    :style="{ accentColor: paletaTema.primario }"
+                    class="cursor-pointer"
                   />
                 </div>
 
-                <!-- Controles extra para Audio/Video -->
                 <template v-if="herramientaActual === 'multimedia'">
                   <div class="flex items-center gap-2">
                     <span class="text-white text-xs font-extrabold">🔊 Volumen:</span>
@@ -3088,8 +3498,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                       class="px-2.5 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
                       :class="
                         volumenMediaPct === vol
-                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                          ? 'orbit-btn-primary text-white border-white'
+                          : 'orbit-pill-btn border-white/40'
                       "
                     >
                       {{ vol }}%
@@ -3105,8 +3515,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                       class="px-2.5 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
                       :class="
                         velocidadMedia === vel
-                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                          ? 'orbit-btn-primary text-white border-white'
+                          : 'orbit-pill-btn border-white/40'
                       "
                     >
                       {{ vel }}x
@@ -3114,7 +3524,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   </div>
                 </template>
 
-                <!-- Controles extra para Creador de GIF -->
                 <template v-if="herramientaActual === 'gif'">
                   <div class="flex items-center gap-2">
                     <span class="text-white text-xs font-extrabold">🎞️ Fluidez GIF:</span>
@@ -3125,8 +3534,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                       class="px-3 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
                       :class="
                         fpsGif === f
-                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                          ? 'orbit-btn-primary text-white border-white'
+                          : 'orbit-pill-btn border-white/40'
                       "
                     >
                       {{ f }} FPS
@@ -3142,8 +3551,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                       class="px-3 py-1 rounded-full text-[11px] font-extrabold border cursor-pointer"
                       :class="
                         anchoGif === w
-                          ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                          : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                          ? 'orbit-btn-primary text-white border-white'
+                          : 'orbit-pill-btn border-white/40'
                       "
                     >
                       {{ w }}px
@@ -3153,7 +3562,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- B. VISTA PARA RECORTAR / DIBUJAR / ROTAR / AJUSTAR -->
             <div
               v-else-if="
                 herramientaActual === 'dibujar' ||
@@ -3163,17 +3571,16 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               "
               class="w-full flex flex-col items-center gap-3"
             >
-              <!-- Controles de Dibujo -->
               <div
                 v-if="herramientaActual === 'dibujar'"
-                class="flex flex-wrap items-center justify-center gap-2.5 bg-black/20 border border-white/25 rounded-full px-5 py-1.5"
+                class="flex flex-wrap items-center justify-center gap-2.5 bg-black/25 border border-white/25 rounded-full px-5 py-1.5"
               >
                 <button
                   v-for="col in [
-                    { hex: '#111827', nombre: 'Negro' },
-                    { hex: '#1d4ed8', nombre: 'Azul Firma' },
-                    { hex: '#dc2626', nombre: 'Rojo' },
-                    { hex: '#ea580c', nombre: 'Naranja' }
+                    { hex: '#0f172a', nombre: 'Negro' },
+                    { hex: '#2563eb', nombre: 'Azul Firma' },
+                    { hex: '#0891b2', nombre: 'Cian' },
+                    { hex: '#dc2626', nombre: 'Rojo' }
                   ]"
                   :key="col.hex"
                   @click="colorPincel = col.hex; modoPan = false"
@@ -3197,8 +3604,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-3 py-1 rounded-full text-xs font-extrabold border transition-all cursor-pointer"
                   :class="
                     grosorPincel === g.val
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                      : 'bg-[#fde68a]/60 text-[#1c1917] border-white/40'
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'orbit-pill-btn border-white/40'
                   "
                 >
                   {{ g.label }}
@@ -3208,32 +3615,31 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
                 <button
                   @click="deshacerTrazo"
-                  class="px-3 py-1 rounded-full bg-[#fde68a]/60 hover:bg-[#fde68a] text-[#1c1917] text-xs font-extrabold border border-white/50 cursor-pointer"
+                  class="orbit-pill-btn px-3 py-1 rounded-full text-xs font-extrabold border border-white/50 cursor-pointer"
                 >
                   ↶ Deshacer
                 </button>
                 <button
                   @click="limpiarLienzo"
-                  class="px-3 py-1 rounded-full bg-[#fde68a]/60 hover:bg-[#fde68a] text-[#1c1917] text-xs font-extrabold border border-white/50 cursor-pointer"
+                  class="orbit-pill-btn px-3 py-1 rounded-full text-xs font-extrabold border border-white/50 cursor-pointer"
                 >
                   Limpiar
                 </button>
               </div>
 
-              <!-- Controles de Rotación -->
               <div
                 v-if="herramientaActual === 'rotar'"
-                class="flex items-center gap-3 bg-black/20 border border-white/25 rounded-full px-5 py-2"
+                class="flex items-center gap-3 bg-black/25 border border-white/25 rounded-full px-5 py-2"
               >
                 <button
                   @click="rotacionGrados = (rotacionGrados - 90) % 360"
-                  class="px-4 py-1.5 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs border border-white/50 cursor-pointer"
+                  class="orbit-pill-btn px-4 py-1.5 rounded-full font-extrabold text-xs border border-white/50 cursor-pointer"
                 >
                   ↺ -90°
                 </button>
                 <button
                   @click="rotacionGrados = (rotacionGrados + 90) % 360"
-                  class="px-4 py-1.5 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs border border-white/50 cursor-pointer"
+                  class="orbit-pill-btn px-4 py-1.5 rounded-full font-extrabold text-xs border border-white/50 cursor-pointer"
                 >
                   ↻ +90°
                 </button>
@@ -3242,8 +3648,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-4 py-1.5 rounded-full font-extrabold text-xs border transition-colors cursor-pointer"
                   :class="
                     voltearH
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/50'
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'orbit-pill-btn border-white/50'
                   "
                 >
                   ⇄ Voltear H
@@ -3253,18 +3659,17 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-4 py-1.5 rounded-full font-extrabold text-xs border transition-colors cursor-pointer"
                   :class="
                     voltearV
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/50'
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'orbit-pill-btn border-white/50'
                   "
                 >
                   ⇅ Voltear V
                 </button>
               </div>
 
-              <!-- Controles de Ajuste / Compresión -->
               <div
                 v-if="herramientaActual === 'ajustar'"
-                class="flex flex-wrap items-center justify-center gap-4 bg-black/20 border border-white/25 rounded-full px-6 py-2"
+                class="flex flex-wrap items-center justify-center gap-4 bg-black/25 border border-white/25 rounded-full px-6 py-2"
               >
                 <div class="flex items-center gap-2">
                   <span class="text-white text-xs font-extrabold uppercase">Resolución:</span>
@@ -3275,8 +3680,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     class="px-3 py-1 rounded-full text-xs font-extrabold border cursor-pointer"
                     :class="
                       escalaPorcentaje === pct
-                        ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                        : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                        ? 'orbit-btn-primary text-white border-white'
+                        : 'orbit-pill-btn border-white/40'
                     "
                   >
                     {{ pct }}%
@@ -3298,8 +3703,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     class="px-3 py-1 rounded-full text-xs font-extrabold border cursor-pointer"
                     :class="
                       calidadPorcentaje === cal.v
-                        ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                        : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                        ? 'orbit-btn-primary text-white border-white'
+                        : 'orbit-pill-btn border-white/40'
                     "
                   >
                     {{ cal.l }}
@@ -3307,24 +3712,31 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                 </div>
               </div>
 
-              <!-- Contenedor con Scroll y Zoom -->
               <div
                 ref="contenedorScrollRef"
                 @wheel="onWheelCanvasZoom"
                 @contextmenu.prevent
-                class="relative w-full h-[410px] overflow-auto bg-black/25 rounded-2xl p-4 border border-white/25 flex"
+                class="relative w-full h-[410px] overflow-auto bg-black/30 rounded-2xl p-4 border border-white/25 flex"
               >
                 <div
-                  class="m-auto relative inline-block transition-transform duration-150"
+                  class="m-auto relative inline-block transition-transform duration-150 rounded-lg overflow-hidden"
                   :style="{
-                    transform: `rotate(${rotacionGrados}deg) scaleX(${voltearH ? -1 : 1}) scaleY(${voltearV ? -1 : 1})`
+                    transform: `rotate(${rotacionGrados}deg) scaleX(${voltearH ? -1 : 1}) scaleY(${voltearV ? -1 : 1})`,
+                    backgroundImage: fondoTransparenteActivo
+                      ? 'linear-gradient(45deg, #cbd5e1 25%, transparent 25%), linear-gradient(-45deg, #cbd5e1 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #cbd5e1 75%), linear-gradient(-45deg, transparent 75%, #cbd5e1 75%)'
+                      : 'none',
+                    backgroundSize: '20px 20px',
+                    backgroundPosition: '0 0, 0 10px, 10px -10px, -10px 0px',
+                    backgroundColor: fondoTransparenteActivo ? '#f8fafc' : '#ffffff'
                   }"
                 >
                   <canvas
                     ref="canvasInteractivoRef"
                     :style="estiloCanvasZoom"
-                    class="rounded-lg shadow-xl bg-white block"
+                    class="rounded-lg shadow-xl block"
                     :class="{
+                      'bg-transparent': fondoTransparenteActivo,
+                      'bg-white': !fondoTransparenteActivo,
                       'cursor-grab': modoPan || espacioPresionado,
                       'cursor-grabbing': arrastrandoPan,
                       'cursor-crosshair':
@@ -3340,11 +3752,15 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
 
                   <div
                     v-if="herramientaActual === 'recortar' && cajaRecorte.activo"
-                    :style="estiloOverlayRecorte"
-                    class="absolute border-[2.5px] border-dashed border-orange-500 bg-orange-500/20 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] pointer-events-none flex items-end justify-end p-1"
+                    :style="{
+                      ...estiloOverlayRecorte,
+                      borderColor: paletaTema.primario,
+                      backgroundColor: `${paletaTema.primario}33`
+                    }"
+                    class="absolute border-[2.5px] border-dashed shadow-[0_0_0_9999px_rgba(0,0,0,0.45)] pointer-events-none flex items-end justify-end p-1"
                   >
                     <span
-                      class="px-2 py-0.5 rounded bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-[10px]"
+                      class="orbit-btn-primary px-2 py-0.5 rounded text-white font-extrabold text-[10px]"
                     >
                       {{ Math.round(cajaRecorte.w) }} × {{ Math.round(cajaRecorte.h) }} px
                     </span>
@@ -3353,21 +3769,20 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- C. VISTA PARA DIVIDIR PDF -->
             <div
               v-else-if="herramientaActual === 'dividir'"
               class="w-full flex flex-col items-center gap-4"
             >
               <div
-                class="flex items-center gap-3 bg-black/20 border border-white/25 rounded-full px-5 py-2"
+                class="flex items-center gap-3 bg-black/25 border border-white/25 rounded-full px-5 py-2"
               >
                 <button
                   @click="modoDivisionPdf = 'unico'"
                   class="px-4 py-1.5 rounded-full text-xs font-extrabold border cursor-pointer"
                   :class="
                     modoDivisionPdf === 'unico'
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'orbit-pill-btn border-white/40'
                   "
                 >
                   Unir seleccionadas en 1 PDF
@@ -3377,8 +3792,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                   class="px-4 py-1.5 rounded-full text-xs font-extrabold border cursor-pointer"
                   :class="
                     modoDivisionPdf === 'separados'
-                      ? 'bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white border-white'
-                      : 'bg-[#fde68a]/65 text-[#1c1917] border-white/40'
+                      ? 'orbit-btn-primary text-white border-white'
+                      : 'orbit-pill-btn border-white/40'
                   "
                 >
                   Guardar cada página por separado
@@ -3386,16 +3801,24 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
 
               <div
-                class="grid grid-cols-4 gap-3.5 w-full max-h-[340px] overflow-y-auto p-3 bg-black/20 rounded-2xl border border-white/20"
+                class="grid grid-cols-4 gap-3.5 w-full max-h-[340px] overflow-y-auto p-3 bg-black/25 rounded-2xl border border-white/20"
               >
                 <div
                   v-for="(thumb, idx) in paginasMiniaturas"
                   :key="idx"
                   @click="alternarSeleccionPagina(idx)"
                   class="relative rounded-xl overflow-hidden cursor-pointer border-2 transition-all p-1.5 flex flex-col items-center"
+                  :style="
+                    paginasSeleccionadas.includes(idx)
+                      ? {
+                          borderColor: paletaTema.primario,
+                          backgroundColor: `${paletaTema.primario}40`
+                        }
+                      : {}
+                  "
                   :class="
                     paginasSeleccionadas.includes(idx)
-                      ? 'border-orange-500 bg-gradient-to-b from-[#f97316]/40 to-[#dc2626]/40 scale-[1.02] shadow-lg'
+                      ? 'scale-[1.02] shadow-lg'
                       : 'border-white/25 bg-white/10 opacity-60 hover:opacity-90'
                   "
                 >
@@ -3405,7 +3828,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
             </div>
 
-            <!-- D. VISTA PARA EDITAR DOCUMENTO -->
             <div
               v-else-if="herramientaActual === 'editar'"
               class="w-full flex flex-col gap-3"
@@ -3413,7 +3835,8 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               <textarea
                 v-model="textoEditable"
                 rows="12"
-                class="w-full rounded-2xl bg-[#fde68a]/75 text-[#1c1917] font-medium text-sm p-4 border-2 border-white/60 focus:outline-none focus:border-orange-500 shadow-inner resize-none select-text"
+                :style="{ backgroundColor: `${paletaTema.claro}E6`, color: paletaTema.textoOscuro }"
+                class="w-full rounded-2xl font-medium text-sm p-4 border-2 border-white/60 focus:outline-none shadow-inner resize-none select-text"
                 placeholder="Escribe o edita el contenido del documento..."
               ></textarea>
               <div class="flex justify-between text-white/85 text-xs font-bold px-2">
@@ -3423,14 +3846,16 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
             </div>
           </div>
 
-          <!-- Barra Inferior -->
           <div class="flex items-center justify-between mt-3 pt-3 border-t border-white/25">
             <div class="flex flex-col">
-              <span class="text-white/90 text-xs font-bold truncate max-w-[320px]">
+              <span class="text-white/90 text-xs font-bold truncate max-w-[300px]">
                 📄 {{ nombreArchivoActivo }}
               </span>
-              <span class="text-amber-200/80 text-[11px] font-medium">
-                <template v-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">
+              <span :style="{ color: paletaTema.claro }" class="text-[11px] font-medium opacity-90">
+                <template v-if="fondoTransparenteActivo">
+                  Fondo transparente activo — Se exportará como <b>PNG Transparente</b>
+                </template>
+                <template v-else-if="herramientaActual === 'dibujar' || herramientaActual === 'recortar'">
                   Tip: Usa <b>Ctrl + Rueda</b> para zoom y <b>Espacio + Arrastrar</b> para mover
                 </template>
                 <template v-else>
@@ -3439,10 +3864,11 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </span>
             </div>
 
-            <div class="flex items-center gap-2.5">
+            <div class="flex items-center gap-2">
               <button
                 @click="cerrarVentanaHerramienta"
-                class="px-5 py-2 rounded-full bg-[#fde68a]/65 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/55 transition-transform hover:scale-105 cursor-pointer"
+                :disabled="procesando"
+                class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/55 transition-transform hover:scale-105 cursor-pointer"
               >
                 Cancelar
               </button>
@@ -3450,19 +3876,22 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               <template v-if="herramientaActual === 'editar'">
                 <button
                   @click="guardarResultadoHerramienta('txt')"
-                  class="px-4 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                  :disabled="procesando"
+                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
                   Guardar TXT
                 </button>
                 <button
                   @click="guardarResultadoHerramienta('pdf')"
-                  class="px-4 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                  :disabled="procesando"
+                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
                   Guardar PDF
                 </button>
                 <button
                   @click="guardarResultadoHerramienta('docx')"
-                  class="px-6 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/80 shadow-[0_0_16px_rgba(234,88,12,0.65)] hover:scale-105 transition-transform cursor-pointer"
+                  :disabled="procesando"
+                  class="orbit-btn-primary px-5 py-2 rounded-full text-white font-extrabold text-xs tracking-wider uppercase border border-white/80 hover:scale-105 transition-transform cursor-pointer"
                 >
                   Guardar DOCX en {{ nombreCarpetaOrigen }}
                 </button>
@@ -3471,24 +3900,39 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               <template v-else-if="herramientaActual === 'multimedia'">
                 <button
                   @click="guardarResultadoHerramienta('mp3')"
-                  class="px-5 py-2 rounded-full bg-[#fde68a]/80 hover:bg-[#fde68a] text-[#1c1917] font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
+                  :disabled="procesando"
+                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
-                  Exportar MP3
+                  Audio MP3
                 </button>
                 <button
                   @click="guardarResultadoHerramienta('wav')"
-                  class="px-6 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 shadow-[0_0_18px_rgba(234,88,12,0.7)] hover:scale-105 transition-transform cursor-pointer"
+                  :disabled="procesando"
+                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
                 >
-                  Guardar WAV en {{ nombreCarpetaOrigen }}
+                  Audio WAV
+                </button>
+                <button
+                  v-if="esVideoActivo"
+                  @click="guardarResultadoHerramienta('video-clip')"
+                  :disabled="procesando"
+                  class="orbit-btn-primary px-5 py-2 rounded-full text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 hover:scale-105 transition-transform cursor-pointer"
+                >
+                  {{ procesando ? 'Exportando Clip...' : `🎬 Guardar Video Recortado` }}
                 </button>
               </template>
 
               <button
                 v-else
                 @click="guardarResultadoHerramienta()"
-                class="px-7 py-2 rounded-full bg-gradient-to-r from-[#f97316] to-[#dc2626] text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 shadow-[0_0_18px_rgba(234,88,12,0.7)] hover:scale-105 transition-transform cursor-pointer"
+                :disabled="procesando"
+                class="orbit-btn-primary px-6 py-2 rounded-full text-white font-extrabold text-xs tracking-wider uppercase border border-white/85 hover:scale-105 transition-transform cursor-pointer"
               >
-                Guardar en {{ nombreCarpetaOrigen }}
+                {{
+                  fondoTransparenteActivo
+                    ? `Guardar PNG Transparente`
+                    : `Guardar en ${nombreCarpetaOrigen}`
+                }}
               </button>
             </div>
           </div>
@@ -3497,3 +3941,20 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     </Transition>
   </div>
 </template>
+
+<style scoped>
+.orbit-btn-primary {
+  background: linear-gradient(135deg, var(--o-pri), var(--o-sec));
+  box-shadow: 0 0 18px var(--o-shadow);
+}
+
+.orbit-pill-btn {
+  background-color: color-mix(in srgb, var(--o-light) 78%, transparent);
+  color: var(--o-dark);
+}
+
+.orbit-pill-btn:hover {
+  background: linear-gradient(135deg, var(--o-pri), var(--o-sec));
+  color: #ffffff;
+}
+</style>

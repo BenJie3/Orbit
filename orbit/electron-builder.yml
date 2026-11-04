@@ -29,3 +29,8 @@ nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
 npmRebuild: false
+
+publish:
+  provider: github
+  owner: BenJie3
+  repo: Orbit

@@ -1,8 +1,18 @@
-import { app, BrowserWindow, ipcMain, screen, Tray, nativeImage, shell, clipboard } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  screen,
+  Tray,
+  nativeImage,
+  shell,
+  clipboard,
+  systemPreferences
+} from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
-import { spawn, ChildProcessWithoutNullStreams } from 'child_process'
+import { spawn, execSync, ChildProcessWithoutNullStreams } from 'child_process'
 import sharp from 'sharp'
 import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
@@ -27,7 +37,39 @@ let modoTeclaActual: ModoTecla = 'shift'
 let ultimoToqueTeclaMs = 0
 let esperandoSegundoToque = false
 let archivosRecientes: string[] = []
-let repoGitHubConfig = ''
+let adaptarFondoActivo = false
+
+export interface TemaOrbit {
+  primario: string
+  secundario: string
+  centro: string
+  cristal: string
+  borde: string
+  textoInactivo: string
+  inactivoInicio: string
+  inactivoFin: string
+  sombra: string
+}
+
+// Paleta Profesional por Defecto (Opción A: Azul Zafiro / Cian Fluent)
+const TEMA_ZAFIRO_DEFAULT: TemaOrbit = {
+  primario: '#2563eb',
+  secundario: '#06b6d4',
+  centro: '#e0f2fe',
+  cristal: 'rgba(15, 23, 42, 0.62)',
+  borde: 'rgba(186, 230, 253, 0.42)',
+  textoInactivo: '#0f172a',
+  inactivoInicio: '#e0f2fe',
+  inactivoFin: '#bae6fd',
+  sombra: 'rgba(37, 99, 235, 0.65)'
+}
+
+let temaActual: TemaOrbit = { ...TEMA_ZAFIRO_DEFAULT }
+let ultimaFirmaWallpaper = ''
+let intervaloMonitorWallpaper: NodeJS.Timeout | null = null
+let watchersActivos: fs.FSWatcher[] = []
+let debounceCambioWallpaper: NodeJS.Timeout | null = null
+let rutaConfigWallpaperEngineCache = ''
 
 const rutaConfig = path.join(app.getPath('userData'), 'orbit-settings.json')
 
@@ -36,10 +78,10 @@ function cargarConfiguracion() {
     if (fs.existsSync(rutaConfig)) {
       const data = JSON.parse(fs.readFileSync(rutaConfig, 'utf8'))
       if (data.modoTeclaActual) modoTeclaActual = data.modoTeclaActual
+      if (typeof data.adaptarFondoActivo === 'boolean') adaptarFondoActivo = data.adaptarFondoActivo
       if (Array.isArray(data.archivosRecientes)) {
         archivosRecientes = data.archivosRecientes.filter((r: string) => fs.existsSync(r)).slice(0, 5)
       }
-      if (data.repoGitHub) repoGitHubConfig = data.repoGitHub
     }
   } catch {}
 }
@@ -48,7 +90,7 @@ function guardarConfiguracion() {
   try {
     fs.writeFileSync(
       rutaConfig,
-      JSON.stringify({ modoTeclaActual, archivosRecientes, repoGitHub: repoGitHubConfig }, null, 2),
+      JSON.stringify({ modoTeclaActual, adaptarFondoActivo, archivosRecientes }, null, 2),
       'utf8'
     )
   } catch {}
@@ -59,10 +101,425 @@ function registrarArchivoReciente(rutaArchivo: string) {
   guardarConfiguracion()
 }
 
+// --- CONVERSIÓN MATEMÁTICA RGB <-> HSL PARA TEMAS CAMALEÓNICOS ---
+function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
+  r /= 255
+  g /= 255
+  b /= 255
+  const max = Math.max(r, g, b)
+  const min = Math.min(r, g, b)
+  let h = 0
+  let s = 0
+  const l = (max + min) / 2
+
+  if (max !== min) {
+    const d = max - min
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
+    switch (max) {
+      case r:
+        h = (g - b) / d + (g < b ? 6 : 0)
+        break
+      case g:
+        h = (b - r) / d + 2
+        break
+      case b:
+        h = (r - g) / d + 4
+        break
+    }
+    h /= 6
+  }
+  return [h * 360, s * 100, l * 100]
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  h = ((h % 360) + 360) % 360
+  s = Math.max(0, Math.min(100, s)) / 100
+  l = Math.max(0, Math.min(100, l)) / 100
+
+  const c = (1 - Math.abs(2 * l - 1)) * s
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1))
+  const m = l - c / 2
+  let r = 0,
+    g = 0,
+    b = 0
+
+  if (h < 60) [r, g, b] = [c, x, 0]
+  else if (h < 120) [r, g, b] = [x, c, 0]
+  else if (h < 180) [r, g, b] = [0, c, x]
+  else if (h < 240) [r, g, b] = [0, x, c]
+  else if (h < 300) [r, g, b] = [x, 0, c]
+  else [r, g, b] = [c, 0, x]
+
+  return [Math.round((r + m) * 255), Math.round((g + m) * 255), Math.round((b + m) * 255)]
+}
+
+function hslToHex(h: number, s: number, l: number): string {
+  const [r, g, b] = hslToRgb(h, s, l)
+  return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')
+}
+
+function construirTemaDesdeHsl(h: number, s: number): TemaOrbit {
+  const satViva = Math.max(68, Math.min(92, s))
+  const hSecundario = (h + 24) % 360
+  const primario = hslToHex(h, satViva, 52)
+  const secundario = hslToHex(hSecundario, satViva, 44)
+  const centro = hslToHex(h, Math.min(85, satViva), 90)
+  const inactivoInicio = hslToHex(h, Math.min(80, satViva), 88)
+  const inactivoFin = hslToHex(hSecundario, Math.min(78, satViva), 78)
+  const textoInactivo = hslToHex(h, 45, 11)
+
+  const [cr, cg, cb] = hslToRgb(h, 52, 12)
+  const [br, bg, bb] = hslToRgb(h, 80, 82)
+  const [sr, sg, sb] = hslToRgb(h, satViva, 52)
+
+  return {
+    primario,
+    secundario,
+    centro,
+    cristal: `rgba(${cr}, ${cg}, ${cb}, 0.64)`,
+    borde: `rgba(${br}, ${bg}, ${bb}, 0.44)`,
+    textoInactivo,
+    inactivoInicio,
+    inactivoFin,
+    sombra: `rgba(${sr}, ${sg}, ${sb}, 0.65)`
+  }
+}
+
+// --- LOCALIZADOR DE WALLPAPER ENGINE Y EXTRACCIÓN POR HISTOGRAMA ---
+function localizarConfigWallpaperEngine(): string {
+  if (rutaConfigWallpaperEngineCache && fs.existsSync(rutaConfigWallpaperEngineCache)) {
+    return rutaConfigWallpaperEngineCache
+  }
+
+  // 1. Buscar en Registro de Windows (HKCU\Software\WallpaperEngine -> installPath)
+  try {
+    const regOut = execSync(
+      'reg query "HKCU\\Software\\WallpaperEngine" /v installPath',
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }
+    )
+    const match = regOut.match(/installPath\s+REG_SZ\s+(.+)/i)
+    if (match && match[1]) {
+      const exeOrDir = match[1].trim().replace(/"/g, '')
+      const dir = exeOrDir.toLowerCase().endsWith('.exe') ? path.dirname(exeOrDir) : exeOrDir
+      const cfg = path.join(dir, 'config.json')
+      if (fs.existsSync(cfg)) {
+        rutaConfigWallpaperEngineCache = cfg
+        return cfg
+      }
+    }
+  } catch {}
+
+  // 2. Buscar en rutas comunes de Steam en todas las unidades
+  const unidades = ['C:', 'D:', 'E:', 'F:', 'G:']
+  const subRutas = [
+    'Program Files (x86)/Steam/steamapps/common/wallpaper_engine/config.json',
+    'Program Files/Steam/steamapps/common/wallpaper_engine/config.json',
+    'SteamLibrary/steamapps/common/wallpaper_engine/config.json',
+    'Steam/steamapps/common/wallpaper_engine/config.json',
+    'Games/Steam/steamapps/common/wallpaper_engine/config.json'
+  ]
+
+  for (const u of unidades) {
+    for (const sr of subRutas) {
+      const candidato = path.join(u, sr)
+      if (fs.existsSync(candidato)) {
+        rutaConfigWallpaperEngineCache = candidato
+        return candidato
+      }
+    }
+  }
+
+  return ''
+}
+
+function obtenerWallpaperActivoWallpaperEngine(): {
+  rutaPreview: string
+  schemeColor: string
+  firma: string
+} | null {
+  const cfgPath = localizarConfigWallpaperEngine()
+  if (!cfgPath || !fs.existsSync(cfgPath)) return null
+
+  try {
+    const stat = fs.statSync(cfgPath)
+    const raw = fs.readFileSync(cfgPath, 'utf8')
+
+    // Extraer únicamente el bloque "selectedwallpapers" activo
+    const selIdx = raw.indexOf('"selectedwallpapers"')
+    const zonaBusqueda = selIdx !== -1 ? raw.slice(selIdx, selIdx + 12000) : raw
+
+    const fileMatches = [...zonaBusqueda.matchAll(/"file"\s*:\s*"([^"]+)"/gi)]
+    for (const m of fileMatches) {
+      const fileVal = m[1].replace(/\\\\/g, '/').replace(/\\/g, '/')
+      if (!fileVal) continue
+
+      const folder = fs.existsSync(fileVal) && fs.statSync(fileVal).isDirectory()
+        ? fileVal
+        : path.dirname(fileVal)
+
+      if (!fs.existsSync(folder)) continue
+
+      let previewFile = ''
+      let schemeColor = ''
+      const projPath = path.join(folder, 'project.json')
+
+      if (fs.existsSync(projPath)) {
+        try {
+          const proj = JSON.parse(fs.readFileSync(projPath, 'utf8'))
+          if (proj.preview) {
+            const pCand = path.join(folder, proj.preview)
+            if (fs.existsSync(pCand)) previewFile = pCand
+          }
+          if (proj.schemecolor) {
+            schemeColor = String(proj.schemecolor)
+          }
+        } catch {}
+      }
+
+      if (!previewFile) {
+        for (const nombre of ['preview.jpg', 'preview.png', 'preview.gif', 'preview.webp', 'thumb.jpg']) {
+          const cand = path.join(folder, nombre)
+          if (fs.existsSync(cand)) {
+            previewFile = cand
+            break
+          }
+        }
+      }
+
+      if (!previewFile && /\.(jpg|jpeg|png|webp|bmp)$/i.test(fileVal) && fs.existsSync(fileVal)) {
+        previewFile = fileVal
+      }
+
+      if (previewFile || schemeColor) {
+        return {
+          rutaPreview: previewFile,
+          schemeColor,
+          firma: `WE:${fileVal}:${stat.mtimeMs}`
+        }
+      }
+    }
+  } catch {}
+
+  return null
+}
+
+function obtenerRutasWallpaperWindows(): { ruta: string; firma: string } | null {
+  const candidatos: string[] = []
+  const appData = app.getPath('appData')
+
+  const cachedDir = path.join(appData, 'Microsoft', 'Windows', 'Themes', 'CachedFiles')
+  if (fs.existsSync(cachedDir)) {
+    try {
+      const files = fs
+        .readdirSync(cachedDir)
+        .filter((f) => /\.(jpg|jpeg|png)$/i.test(f))
+        .map((f) => path.join(cachedDir, f))
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)
+      if (files.length > 0) candidatos.push(files[0])
+    } catch {}
+  }
+
+  const transcoded = path.join(appData, 'Microsoft', 'Windows', 'Themes', 'TranscodedWallpaper')
+  if (fs.existsSync(transcoded)) candidatos.push(transcoded)
+
+  for (const c of candidatos) {
+    try {
+      const st = fs.statSync(c)
+      if (st.size > 1024) {
+        return { ruta: c, firma: `WIN:${c}:${st.mtimeMs}:${st.size}` }
+      }
+    } catch {}
+  }
+  return null
+}
+
+async function extraerHslDominanteDeImagen(rutaImagen: string): Promise<[number, number] | null> {
+  try {
+    const raw = await sharp(rutaImagen)
+      .resize(48, 48, { fit: 'cover' })
+      .removeAlpha()
+      .raw()
+      .toBuffer()
+
+    // 36 cubetas de 10 grados cada una para hallar el pico real de color
+    const binsPeso = new Float64Array(36)
+    const binsHueSum = new Float64Array(36)
+    const binsSatSum = new Float64Array(36)
+
+    for (let i = 0; i < raw.length; i += 3) {
+      const r = raw[i]
+      const g = raw[i + 1]
+      const b = raw[i + 2]
+      const [h, s, l] = rgbToHsl(r, g, b)
+
+      // Ignorar negros, blancos y grises apagados
+      if (l < 12 || l > 90 || s < 18) continue
+
+      const bin = Math.min(35, Math.floor(h / 10))
+      const peso = (s / 100) * (1 - Math.abs(l - 50) / 50)
+      binsPeso[bin] += peso
+      binsHueSum[bin] += h * peso
+      binsSatSum[bin] += s * peso
+    }
+
+    let mejorBin = -1
+    let maxPeso = 0
+    for (let b = 0; b < 36; b++) {
+      // Suavizado con cubetas vecinas
+      const prev = (b + 35) % 36
+      const next = (b + 1) % 36
+      const pesoSuavizado = binsPeso[b] + (binsPeso[prev] + binsPeso[next]) * 0.35
+      if (pesoSuavizado > maxPeso) {
+        maxPeso = pesoSuavizado
+        mejorBin = b
+      }
+    }
+
+    if (mejorBin !== -1 && binsPeso[mejorBin] > 0) {
+      const hueFinal = binsHueSum[mejorBin] / binsPeso[mejorBin]
+      const satFinal = binsSatSum[mejorBin] / binsPeso[mejorBin]
+      return [hueFinal, satFinal]
+    }
+  } catch {}
+  return null
+}
+
+async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
+  if (!adaptarFondoActivo) {
+    temaActual = { ...TEMA_ZAFIRO_DEFAULT }
+    ultimaFirmaWallpaper = 'DEFAULT'
+    return true
+  }
+
+  const infoWE = obtenerWallpaperActivoWallpaperEngine()
+  const infoWin = obtenerRutasWallpaperWindows()
+  const accentWin = systemPreferences.getAccentColor?.() || ''
+
+  const firmaActual = `${infoWE?.firma || ''}|${infoWin?.firma || ''}|${accentWin}`
+  if (!forzar && firmaActual === ultimaFirmaWallpaper) {
+    return false
+  }
+  ultimaFirmaWallpaper = firmaActual
+
+  // 1. Intentar extraer de la imagen activa de Wallpaper Engine
+  if (infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)) {
+    const hsl = await extraerHslDominanteDeImagen(infoWE.rutaPreview)
+    if (hsl) {
+      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
+      return true
+    }
+  }
+
+  // 2. Si Wallpaper Engine no tiene imagen pero tiene schemecolor en project.json
+  if (infoWE?.schemeColor) {
+    const partes = infoWE.schemeColor
+      .trim()
+      .split(/\s+/)
+      .map((n) => parseFloat(n))
+    if (partes.length >= 3 && partes.every((n) => !isNaN(n))) {
+      const r = partes[0] <= 1 ? Math.round(partes[0] * 255) : Math.round(partes[0])
+      const g = partes[1] <= 1 ? Math.round(partes[1] * 255) : Math.round(partes[1])
+      const b = partes[2] <= 1 ? Math.round(partes[2] * 255) : Math.round(partes[2])
+      const [h, s] = rgbToHsl(r, g, b)
+      if (s > 10) {
+        temaActual = construirTemaDesdeHsl(h, s)
+        return true
+      }
+    }
+  }
+
+  // 3. Intentar extraer del Wallpaper de Windows (TranscodedWallpaper / CachedFiles)
+  if (infoWin?.ruta && fs.existsSync(infoWin.ruta)) {
+    const hsl = await extraerHslDominanteDeImagen(infoWin.ruta)
+    if (hsl) {
+      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
+      return true
+    }
+  }
+
+  // 4. Respaldo final: Color de acento DWM de Windows
+  if (accentWin && accentWin.length >= 6) {
+    const r = parseInt(accentWin.slice(0, 2), 16)
+    const g = parseInt(accentWin.slice(2, 4), 16)
+    const b = parseInt(accentWin.slice(4, 6), 16)
+    const [h, s] = rgbToHsl(r, g, b)
+    temaActual = construirTemaDesdeHsl(h, Math.max(65, s))
+    return true
+  }
+
+  return false
+}
+
+// Dispara la actualización visual en el Icono del Tray y en la Ventana Vue en tiempo real
+async function aplicarYDifundirCambioDeTema(forzar = false) {
+  const cambio = await sincronizarColorConWallpaper(forzar)
+  if (!cambio && !forzar) return
+
+  if (tray) {
+    const nuevoIcono = await generarIconoTray(!pausado)
+    tray.setImage(nuevoIcono)
+  }
+
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('tema-actualizado', temaActual)
+  }
+}
+
+function dispararVerificacionConDebounce() {
+  if (!adaptarFondoActivo) return
+  if (debounceCambioWallpaper) clearTimeout(debounceCambioWallpaper)
+  debounceCambioWallpaper = setTimeout(() => {
+    aplicarYDifundirCambioDeTema(false)
+  }, 450)
+}
+
+function detenerMonitorWallpaperTiempoReal() {
+  if (intervaloMonitorWallpaper) {
+    clearInterval(intervaloMonitorWallpaper)
+    intervaloMonitorWallpaper = null
+  }
+  for (const w of watchersActivos) {
+    try {
+      w.close()
+    } catch {}
+  }
+  watchersActivos = []
+}
+
+function iniciarMonitorWallpaperTiempoReal() {
+  detenerMonitorWallpaperTiempoReal()
+  if (!adaptarFondoActivo) return
+
+  // 1. Vigilar archivo config.json de Wallpaper Engine en vivo
+  const cfgWE = localizarConfigWallpaperEngine()
+  if (cfgWE && fs.existsSync(cfgWE)) {
+    try {
+      const w = fs.watch(cfgWE, () => dispararVerificacionConDebounce())
+      watchersActivos.push(w)
+    } catch {}
+  }
+
+  // 2. Vigilar carpeta Themes de Windows (TranscodedWallpaper)
+  const dirThemesWin = path.join(app.getPath('appData'), 'Microsoft', 'Windows', 'Themes')
+  if (fs.existsSync(dirThemesWin)) {
+    try {
+      const w = fs.watch(dirThemesWin, () => dispararVerificacionConDebounce())
+      watchersActivos.push(w)
+    } catch {}
+  }
+
+  // 3. Verificación ligera de firma cada 2 segundos (0% CPU si no cambió el wallpaper)
+  intervaloMonitorWallpaper = setInterval(() => {
+    if (adaptarFondoActivo) {
+      aplicarYDifundirCambioDeTema(false)
+    }
+  }, 2000)
+}
+
 async function generarIconoTray(activo: boolean): Promise<Electron.NativeImage> {
-  const colorPrimario = activo ? '#f97316' : '#78716c'
-  const colorSecundario = activo ? '#dc2626' : '#44403c'
-  const colorCentro = activo ? '#fde68a' : '#a8a29e'
+  const colorPrimario = activo ? temaActual.primario : '#64748b'
+  const colorSecundario = activo ? temaActual.secundario : '#334155'
+  const colorCentro = activo ? temaActual.centro : '#94a3b8'
 
   const svg = `
   <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
@@ -73,13 +530,21 @@ async function generarIconoTray(activo: boolean): Promise<Electron.NativeImage> 
       </linearGradient>
     </defs>
     <ellipse cx="32" cy="32" rx="27" ry="11" transform="rotate(-30 32 32)" fill="none" stroke="url(#g)" stroke-width="5.5" stroke-linecap="round"/>
-    <circle cx="32" cy="32" r="11" fill="url(#g)" stroke="#1c1917" stroke-width="2.5"/>
+    <circle cx="32" cy="32" r="11" fill="url(#g)" stroke="#0f172a" stroke-width="2.5"/>
     <circle cx="32" cy="32" r="5" fill="${colorCentro}"/>
     <circle cx="50" cy="14" r="5.5" fill="${colorCentro}" stroke="${colorSecundario}" stroke-width="2"/>
   </svg>`
 
   const pngBuffer = await sharp(Buffer.from(svg)).resize(32, 32).png().toBuffer()
   return nativeImage.createFromBuffer(pngBuffer)
+}
+
+function hayImagenEnPortapapeles(): boolean {
+  try {
+    return !clipboard.readImage().isEmpty()
+  } catch {
+    return false
+  }
 }
 
 function obtenerEstadoTray(mostrar: boolean, x = 0, y = 0) {
@@ -95,7 +560,10 @@ function obtenerEstadoTray(mostrar: boolean, x = 0, y = 0) {
       .filter((r) => fs.existsSync(r))
       .map((r) => ({ nombre: path.basename(r), ruta: r })),
     iniciarConWindows: loginSettings.openAtLogin,
-    versionApp: app.getVersion() || '0.1.0'
+    adaptarFondo: adaptarFondoActivo,
+    temaActual,
+    versionApp: app.getVersion() || '1.0.0',
+    tieneImagenPortapapeles: hayImagenEnPortapapeles()
   }
 }
 
@@ -113,7 +581,6 @@ function ocultarLienzoCompletamente() {
   }
 }
 
-// Dispara la notificación Toast flotante de éxito sin bloquear el escritorio
 function notificarToastArchivoGuardado(rutaArchivo: string) {
   if (!mainWindow || mainWindow.isDestroyed()) return
 
@@ -182,8 +649,8 @@ function abrirPanelTrayPersonalizado() {
   const display = screen.getDisplayNearestPoint(cursor)
   const workArea = display.workArea
 
-  const panelAncho = 340
-  const panelAlto = 520
+  const panelAncho = 345
+  const panelAlto = 560
   const x = Math.max(
     workArea.x + panelAncho / 2 + 12,
     Math.min(workArea.x + workArea.width - panelAncho / 2 - 12, cursor.x)
@@ -208,17 +675,9 @@ async function inicializarTray() {
   tray = new Tray(iconoInicial)
   tray.setToolTip('Orbit — Activo en segundo plano')
 
-  tray.on('right-click', () => {
-    abrirPanelTrayPersonalizado()
-  })
-
-  tray.on('click', () => {
-    abrirPanelTrayPersonalizado()
-  })
-
-  tray.on('double-click', () => {
-    cambiarEstadoPausa(!pausado)
-  })
+  tray.on('right-click', () => abrirPanelTrayPersonalizado())
+  tray.on('click', () => abrirPanelTrayPersonalizado())
+  tray.on('double-click', () => cambiarEstadoPausa(!pausado))
 }
 
 interface SegmentoTexto {
@@ -506,9 +965,7 @@ async function parsearDocxABloques(rutaDocx: string): Promise<BloqueDocumento[]>
           height,
           align
         })
-      } catch (e) {
-        console.error('Error procesando imagen interna de DOCX:', e)
-      }
+      } catch {}
     }
 
     const { segmentos, textoCompleto, maxFontSize, tieneBold } = extraerSegmentosDeRuns(pXml)
@@ -839,7 +1296,7 @@ function mostrarRuedaEnCursor() {
   const display = screen.getPrimaryDisplay()
   const { x: dispX, y: dispY, width, height } = display.bounds
 
-  const margen = 170
+  const margen = 175
   const posX = Math.max(margen, Math.min(width - margen, cursor.x - dispX))
   const posY = Math.max(margen, Math.min(height - margen, cursor.y - dispY))
 
@@ -850,7 +1307,9 @@ function mostrarRuedaEnCursor() {
   mainWindow.webContents.send('toggle-menu', {
     mostrar: true,
     x: posX,
-    y: posY
+    y: posY,
+    tieneImagenPortapapeles: hayImagenEnPortapapeles(),
+    temaActual
   })
 }
 
@@ -898,11 +1357,6 @@ function createWindow(): BrowserWindow {
     win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 
-  win.webContents.on('console-message', (_, level, message, line) => {
-    const niveles = ['DEBUG', 'INFO', 'WARN', 'ERROR']
-    console.log(`[VUE-${niveles[level] || 'LOG'}] ${message} (Línea ${line})`)
-  })
-
   return win
 }
 
@@ -913,8 +1367,20 @@ if (!instanciaUnica) {
   app.whenReady().then(async () => {
     electronApp.setAppUserModelId('com.orbit.converter')
     cargarConfiguracion()
+    await sincronizarColorConWallpaper(true)
     iniciarNotificadorSistemaArchivos()
     await inicializarTray()
+
+    if (adaptarFondoActivo) {
+      iniciarMonitorWallpaperTiempoReal()
+    }
+
+    // Escuchar eventos nativos DWM de cambio de color en Windows 10/11
+    if (process.platform === 'win32') {
+      systemPreferences.on('accent-color-changed', () => {
+        dispararVerificacionConDebounce()
+      })
+    }
 
     app.on('browser-window-created', (_, window) => {
       optimizer.watchWindowShortcuts(window)
@@ -979,6 +1445,10 @@ if (!instanciaUnica) {
 
     uIOhook.start()
 
+    ipcMain.handle('obtener-tema-inicial', async () => {
+      return temaActual
+    })
+
     ipcMain.on('activar-modo-ventana', () => {
       modoVentanaActivo = true
       menuTrayVisible = false
@@ -990,7 +1460,6 @@ if (!instanciaUnica) {
       }
     })
 
-    // Permite que el Toast flotante reciba clics solo cuando el mouse pasa sobre él
     ipcMain.on('set-mouse-ignore', (_, ignorar: boolean) => {
       if (!mainWindow || mainWindow.isDestroyed()) return
       if (modoVentanaActivo || menuTrayVisible || shiftPresionado) return
@@ -1013,64 +1482,133 @@ if (!instanciaUnica) {
       return false
     })
 
-    // BUSCADOR AUTOMÁTICO DE ACTUALIZACIONES (Soporta electron-updater y GitHub Releases)
-    ipcMain.handle('buscar-actualizaciones', async () => {
-      const versionActual = app.getVersion() || '0.1.0'
+    // --- AUTO-ACTUALIZACIÓN 100% DIRECTA Y SILENCIOSA (SIN ABRIR GITHUB) ---
+    ipcMain.handle('buscar-y-actualizar-directo', async () => {
+      const versionActual = app.getVersion() || '1.0.0'
+      const emitirProgreso = (info: any) => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('progreso-actualizacion', info)
+        }
+      }
+
       try {
-        // 1. Intentar con electron-updater si está instalado y la app está empaquetada
-        if (app.isPackaged) {
-          try {
-            // @ts-ignore
-            const { autoUpdater } = eval('require')('electron-updater')
-            autoUpdater.autoDownload = true
-            const res = await autoUpdater.checkForUpdates()
-            if (res && res.updateInfo && res.updateInfo.version !== versionActual) {
-              return {
-                estado: 'descargando',
-                versionNueva: res.updateInfo.version,
-                mensaje: `Descargando Orbit v${res.updateInfo.version} en segundo plano...`
-              }
-            }
-          } catch {}
-        }
+        emitirProgreso({
+          estado: 'buscando',
+          porcentaje: 5,
+          mensaje: 'Buscando nueva versión...'
+        })
 
-        // 2. Verificación directa contra GitHub Releases si existe repositorio configurado en package.json
-        const pkgPath = path.join(app.getAppPath(), 'package.json')
-        let repoUrl = repoGitHubConfig
-        if (!repoUrl && fs.existsSync(pkgPath)) {
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))
-          const rawRepo = typeof pkg.repository === 'string' ? pkg.repository : pkg.repository?.url || ''
-          const match = rawRepo.match(/github\.com[/:]([^/]+\/[^/.]+)/i)
-          if (match) repoUrl = match[1]
-        }
+        const resp = await fetch('https://api.github.com/repos/BenJie3/Orbit/releases/latest', {
+          headers: { 'User-Agent': 'Orbit-Updater' }
+        })
 
-        if (repoUrl) {
-          const resp = await fetch(`https://api.github.com/repos/${repoUrl}/releases/latest`, {
-            headers: { 'User-Agent': 'Orbit-App' }
-          })
-          if (resp.ok) {
-            const release: any = await resp.json()
-            const tagLimpio = String(release.tag_name || '').replace(/^v/i, '')
-            if (tagLimpio && tagLimpio !== versionActual) {
-              return {
-                estado: 'disponible',
-                versionNueva: tagLimpio,
-                mensaje: `¡Nueva versión v${tagLimpio} disponible!`,
-                urlDescarga: release.html_url
-              }
-            }
+        if (!resp.ok) {
+          return {
+            estado: 'actualizado',
+            porcentaje: 100,
+            mensaje: `Estás al día (v${versionActual})`
           }
         }
 
+        const release: any = await resp.json()
+        const tagLimpio = String(release.tag_name || '').replace(/^v/i, '')
+
+        if (!tagLimpio || tagLimpio === versionActual) {
+          const res = {
+            estado: 'actualizado' as const,
+            porcentaje: 100,
+            mensaje: `Estás en la última versión (v${versionActual})`
+          }
+          emitirProgreso(res)
+          return res
+        }
+
+        const assetExe = (release.assets || []).find((a: any) =>
+          String(a.name || '').toLowerCase().endsWith('.exe')
+        )
+
+        if (!assetExe || !assetExe.browser_download_url) {
+          const res = {
+            estado: 'actualizado' as const,
+            porcentaje: 100,
+            mensaje: `Versión v${tagLimpio} detectada (sin instalador .exe adjunto)`
+          }
+          emitirProgreso(res)
+          return res
+        }
+
+        emitirProgreso({
+          estado: 'descargando',
+          porcentaje: 10,
+          versionNueva: tagLimpio,
+          mensaje: `Descargando v${tagLimpio} (10%)...`
+        })
+
+        const dlResp = await fetch(assetExe.browser_download_url, {
+          headers: { 'User-Agent': 'Orbit-Updater' }
+        })
+        if (!dlResp.ok || !dlResp.body) {
+          throw new Error('No se pudo descargar el instalador')
+        }
+
+        const totalBytes = Number(dlResp.headers.get('content-length')) || assetExe.size || 60000000
+        const tempInstallerPath = path.join(app.getPath('temp'), `Orbit-Setup-${tagLimpio}.exe`)
+        const fileStream = fs.createWriteStream(tempInstallerPath)
+        const reader = dlResp.body.getReader()
+
+        let recibidos = 0
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value) {
+            fileStream.write(Buffer.from(value))
+            recibidos += value.byteLength
+            const pct = Math.min(99, Math.max(10, Math.round((recibidos / totalBytes) * 100)))
+            emitirProgreso({
+              estado: 'descargando',
+              porcentaje: pct,
+              versionNueva: tagLimpio,
+              mensaje: `Descargando v${tagLimpio} (${pct}%)...`
+            })
+          }
+        }
+
+        await new Promise<void>((res) => fileStream.end(() => res()))
+
+        emitirProgreso({
+          estado: 'instalando',
+          porcentaje: 100,
+          versionNueva: tagLimpio,
+          mensaje: 'Instalando y reiniciando Orbit...'
+        })
+
+        setTimeout(() => {
+          uIOhook.stop()
+          if (shellNotifierProc) shellNotifierProc.kill()
+          detenerMonitorWallpaperTiempoReal()
+
+          const child = spawn(tempInstallerPath, ['/S'], {
+            detached: true,
+            stdio: 'ignore'
+          })
+          child.unref()
+          app.quit()
+        }, 700)
+
         return {
-          estado: 'actualizado',
-          mensaje: `Estás en la versión más reciente (v${versionActual})`
+          estado: 'instalando',
+          porcentaje: 100,
+          versionNueva: tagLimpio,
+          mensaje: 'Instalando y reiniciando Orbit...'
         }
       } catch {
-        return {
-          estado: 'actualizado',
-          mensaje: `Orbit v${versionActual} está actualizado`
+        const errRes = {
+          estado: 'error' as const,
+          porcentaje: 0,
+          mensaje: 'Error al descargar actualización'
         }
+        emitirProgreso(errRes)
+        return errRes
       }
     })
 
@@ -1087,6 +1625,16 @@ if (!instanciaUnica) {
       } else if (accion.tipo === 'tecla') {
         modoTeclaActual = accion.valor
         guardarConfiguracion()
+      } else if (accion.tipo === 'adaptar-fondo') {
+        adaptarFondoActivo = Boolean(accion.valor)
+        guardarConfiguracion()
+        if (adaptarFondoActivo) {
+          await aplicarYDifundirCambioDeTema(true)
+          iniciarMonitorWallpaperTiempoReal()
+        } else {
+          detenerMonitorWallpaperTiempoReal()
+          await aplicarYDifundirCambioDeTema(true)
+        }
       } else if (accion.tipo === 'autostart') {
         const nuevoValor = Boolean(accion.valor)
         app.setLoginItemSettings({
@@ -1103,13 +1651,13 @@ if (!instanciaUnica) {
       } else if (accion.tipo === 'salir') {
         uIOhook.stop()
         if (shellNotifierProc) shellNotifierProc.kill()
+        detenerMonitorWallpaperTiempoReal()
         app.quit()
       }
 
       return obtenerEstadoTray(true)
     })
 
-    // 1. GUARDAR PÁGINAS DE IMAGEN
     ipcMain.handle(
       'guardar-paginas-imagen',
       async (
@@ -1137,14 +1685,12 @@ if (!instanciaUnica) {
             }
           }
           return true
-        } catch (error) {
-          console.error('Error al guardar páginas de imagen:', error)
+        } catch {
           return false
         }
       }
     )
 
-    // 2. GUARDAR PÁGINAS RENDERIZADAS, EDITADAS O COMPRIMIDAS COMO .PDF
     ipcMain.handle(
       'guardar-paginas-como-pdf',
       async (
@@ -1169,14 +1715,12 @@ if (!instanciaUnica) {
           const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
           await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
           return true
-        } catch (error) {
-          console.error('Error creando PDF:', error)
+        } catch {
           return false
         }
       }
     )
 
-    // 3. GUARDAR DOCUMENTO .DOCX O .TXT
     ipcMain.handle(
       'guardar-texto-documento',
       async (
@@ -1217,14 +1761,12 @@ if (!instanciaUnica) {
             await guardarEnOrigenYRefrescar(outPath, docxBuffer)
           }
           return true
-        } catch (error) {
-          console.error('Error al guardar documento:', error)
+        } catch {
           return false
         }
       }
     )
 
-    // 4. LEER ARCHIVOS .DOCX O .TXT
     ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
       try {
         const ext = path.extname(rutaOriginal).toLowerCase()
@@ -1233,7 +1775,7 @@ if (!instanciaUnica) {
         } else {
           const contenido = await fs.promises.readFile(rutaOriginal, 'utf8')
           const lineas = contenido.split(/\r?\n/)
-          const bloques: BloqueDocumento[] = lineas.map((linea) => ({
+          return lineas.map((linea) => ({
             tipo: 'texto',
             texto: linea,
             segmentos: [{ texto: linea, fontSize: 11, bold: false }],
@@ -1242,15 +1784,12 @@ if (!instanciaUnica) {
             align: 'left',
             espacioDespues: 60
           }))
-          return bloques
         }
-      } catch (error) {
-        console.error('Error leyendo documento:', error)
+      } catch {
         return []
       }
     })
 
-    // 5. CONVERSIÓN ULTRARRÁPIDA DE IMÁGENES
     ipcMain.handle(
       'convertir-imagen-backend',
       async (_, rutaOriginal: string, formatoDestino: string) => {
@@ -1283,14 +1822,12 @@ if (!instanciaUnica) {
           }
 
           return true
-        } catch (error) {
-          console.error('Error convirtiendo imagen:', error)
+        } catch {
           return false
         }
       }
     )
 
-    // 6. UNIR MÚLTIPLES ARCHIVOS PDF EN UNO SOLO
     ipcMain.handle('unir-pdfs-backend', async (_, rutasPdfs: string[]) => {
       try {
         if (!rutasPdfs || rutasPdfs.length === 0) return false
@@ -1310,13 +1847,11 @@ if (!instanciaUnica) {
         const outPath = obtenerRutaSalida(rutasPdfs[0], 'pdf', '_unido')
         await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
         return true
-      } catch (error) {
-        console.error('Error uniendo PDFs:', error)
+      } catch {
         return false
       }
     })
 
-    // 7. UNIR MÚLTIPLES IMÁGENES EN UN SOLO DOCUMENTO PDF
     ipcMain.handle('convertir-imagenes-a-pdf-unico', async (_, rutasImagenes: string[]) => {
       try {
         if (!rutasImagenes || rutasImagenes.length === 0) return false
@@ -1334,13 +1869,11 @@ if (!instanciaUnica) {
         const outPath = obtenerRutaSalida(rutasImagenes[0], 'pdf', '_album')
         await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
         return true
-      } catch (error) {
-        console.error('Error uniendo imágenes en PDF:', error)
+      } catch {
         return false
       }
     })
 
-    // 8. LEER IMAGEN DEL PORTAPAPELES DE WINDOWS (CTRL + V)
     ipcMain.handle('leer-imagen-portapapeles', async () => {
       try {
         const img = clipboard.readImage()
@@ -1354,24 +1887,20 @@ if (!instanciaUnica) {
           rutaSugerida,
           nombre: `Captura_${fecha}.png`
         }
-      } catch (error) {
-        console.error('Error leyendo portapapeles:', error)
+      } catch {
         return null
       }
     })
 
-    // 9. MULTIMEDIA: LEER ARCHIVO BINARIO DE AUDIO / VIDEO DESDE DISCO
     ipcMain.handle('leer-archivo-binario', async (_, rutaOriginal: string) => {
       try {
         const buf = await fs.promises.readFile(rutaOriginal)
         return new Uint8Array(buf)
-      } catch (error) {
-        console.error('Error leyendo binario multimedia:', error)
+      } catch {
         return new Uint8Array(0)
       }
     })
 
-    // 10. MULTIMEDIA: GUARDAR AUDIO / VIDEO / GIF PROCESADO EN CARPETA DE ORIGEN
     ipcMain.handle(
       'guardar-multimedia-bytes',
       async (
@@ -1389,8 +1918,7 @@ if (!instanciaUnica) {
           )
           await guardarEnOrigenYRefrescar(outPath, Buffer.from(bytes))
           return true
-        } catch (error) {
-          console.error('Error guardando archivo multimedia:', error)
+        } catch {
           return false
         }
       }
@@ -1400,6 +1928,7 @@ if (!instanciaUnica) {
 
 app.on('window-all-closed', () => {
   uIOhook.stop()
+  detenerMonitorWallpaperTiempoReal()
   if (shellNotifierProc) {
     shellNotifierProc.kill()
   }

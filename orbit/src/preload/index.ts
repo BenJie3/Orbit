@@ -26,6 +26,18 @@ export interface BloqueDocumento {
   height?: number
 }
 
+export interface TemaOrbit {
+  primario: string
+  secundario: string
+  centro: string
+  cristal: string
+  borde: string
+  textoInactivo: string
+  inactivoInicio: string
+  inactivoFin: string
+  sombra: string
+}
+
 export interface EstadoTrayOrbit {
   mostrar: boolean
   x: number
@@ -35,18 +47,29 @@ export interface EstadoTrayOrbit {
   modoTeclaActual: 'shift' | 'doble-shift' | 'alt' | 'ctrl'
   archivosRecientes: { nombre: string; ruta: string }[]
   iniciarConWindows: boolean
+  adaptarFondo: boolean
+  temaActual: TemaOrbit
   versionApp: string
+  tieneImagenPortapapeles?: boolean
 }
 
-export interface ResultadoActualizacion {
-  estado: 'actualizado' | 'disponible' | 'descargando' | 'error'
+export interface ProgresoUpdateOrbit {
+  estado: 'buscando' | 'disponible' | 'descargando' | 'instalando' | 'actualizado' | 'error'
+  porcentaje: number
   versionNueva?: string
   mensaje: string
-  urlDescarga?: string
 }
 
 contextBridge.exposeInMainWorld('api', {
-  onToggleMenu: (callback: (data: { mostrar: boolean; x: number; y: number }) => void) => {
+  onToggleMenu: (
+    callback: (data: {
+      mostrar: boolean
+      x: number
+      y: number
+      tieneImagenPortapapeles?: boolean
+      temaActual?: TemaOrbit
+    }) => void
+  ) => {
     ipcRenderer.removeAllListeners('toggle-menu')
     ipcRenderer.on('toggle-menu', (_, data) => callback(data))
   },
@@ -61,7 +84,16 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('abrir-menu-tray', (_, estado: EstadoTrayOrbit) => callback(estado))
   },
 
-  // Escucha cuando se guarda cualquier archivo para mostrar la Notificación Toast Flotante
+  onTemaActualizado: (callback: (tema: TemaOrbit) => void) => {
+    ipcRenderer.removeAllListeners('tema-actualizado')
+    ipcRenderer.on('tema-actualizado', (_, tema: TemaOrbit) => callback(tema))
+  },
+
+  onProgresoActualizacion: (callback: (info: ProgresoUpdateOrbit) => void) => {
+    ipcRenderer.removeAllListeners('progreso-actualizacion')
+    ipcRenderer.on('progreso-actualizacion', (_, info: ProgresoUpdateOrbit) => callback(info))
+  },
+
   onArchivoGuardadoToast: (
     callback: (data: { nombre: string; ruta: string; carpeta: string }) => void
   ) => {
@@ -75,14 +107,17 @@ contextBridge.exposeInMainWorld('api', {
       | 'timer'
       | 'tecla'
       | 'autostart'
+      | 'adaptar-fondo'
       | 'abrir-reciente'
       | 'limpiar-recientes'
       | 'salir'
     valor?: any
-  }) => ipcRenderer.invoke('actualizar-config-tray', accion),
+  }) => ipcRenderer.invoke('actualizar-config-tray', accion) as Promise<EstadoTrayOrbit>,
 
-  buscarActualizaciones: () =>
-    ipcRenderer.invoke('buscar-actualizaciones') as Promise<ResultadoActualizacion>,
+  obtenerTemaInicial: () => ipcRenderer.invoke('obtener-tema-inicial') as Promise<TemaOrbit>,
+
+  buscarYActualizarDirecto: () =>
+    ipcRenderer.invoke('buscar-y-actualizar-directo') as Promise<ProgresoUpdateOrbit>,
 
   obtenerRuta: (file: File) => {
     try {
@@ -139,7 +174,6 @@ contextBridge.exposeInMainWorld('api', {
 
   leerImagenPortapapeles: () => ipcRenderer.invoke('leer-imagen-portapapeles'),
 
-  // Multimedia: Lee y guarda archivos de Audio/Video/GIF procesados
   leerArchivoBinario: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-archivo-binario', rutaOriginal) as Promise<Uint8Array>,
 
