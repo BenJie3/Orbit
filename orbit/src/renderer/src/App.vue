@@ -1773,19 +1773,22 @@ const recortarClipDeVideo = async (
     if (tEnd <= tStart) throw new Error('El final del recorte debe ser posterior al inicio')
 
     // Registrar el evento ANTES de cambiar currentTime evita perder 'seeked'.
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        video.removeEventListener('seeked', onSeek)
-        reject(new Error('No se pudo ubicar el inicio del clip'))
-      }, 10000)
-      const onSeek = () => {
-        window.clearTimeout(timeout)
-        video.removeEventListener('seeked', onSeek)
-        resolve()
-      }
-      video.addEventListener('seeked', onSeek)
-      video.currentTime = tStart
-    })
+    // Si ya estamos en el fotograma inicial, no esperar un evento que no ocurrirá.
+    if (Math.abs(video.currentTime - tStart) > 0.02) {
+      await new Promise<void>((resolve, reject) => {
+        const onSeek = () => {
+          window.clearTimeout(timeout)
+          video.removeEventListener('seeked', onSeek)
+          resolve()
+        }
+        const timeout = window.setTimeout(() => {
+          video.removeEventListener('seeked', onSeek)
+          reject(new Error('No se pudo ubicar el inicio del clip'))
+        }, 10000)
+        video.addEventListener('seeked', onSeek)
+        video.currentTime = tStart
+      })
+    }
     video.playbackRate = velocidad
 
     const w = video.videoWidth || 1280
