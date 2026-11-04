@@ -1522,6 +1522,7 @@ if (!instanciaUnica) {
 
       actualizacionEnCurso = true
       let hayActualizacion = false
+      let instalacionProgramada = false
       const marcarDisponible = () => { hayActualizacion = true }
       const informarDescarga = (progreso: { percent: number }) => {
         const porcentaje = Math.min(99, Math.max(0, Math.round(progreso.percent || 0)))
@@ -1574,6 +1575,7 @@ if (!instanciaUnica) {
         }
         emitirProgreso(info)
 
+        instalacionProgramada = true
         setTimeout(() => {
           try {
             uIOhook.stop()
@@ -1604,7 +1606,7 @@ if (!instanciaUnica) {
       } finally {
         autoUpdater.removeListener('update-available', marcarDisponible)
         // Conservar el candado mientras el instalador está arrancando.
-        if (!hayActualizacion || !actualizacionEnCurso) {
+        if (!instalacionProgramada) {
           actualizacionEnCurso = false
         }
       }
