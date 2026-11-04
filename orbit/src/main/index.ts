@@ -1557,7 +1557,7 @@ if (!instanciaUnica) {
         if (!respRelease.ok) throw new Error(`GitHub Releases respondió ${respRelease.status}`)
         const release = (await respRelease.json()) as { tag_name?: string }
         const numeros = (v: string): number[] | null => {
-          const match = v.replace(/^v/i, '').match(/^(\\d+)\\.(\\d+)\\.(\\d+)(?:$|[-+])/)
+          const match = v.replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:$|[-+])/)
           return match ? match.slice(1, 4).map(Number) : null
         }
         const remoto = numeros(String(release.tag_name || ''))
