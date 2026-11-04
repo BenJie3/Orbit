@@ -34,9 +34,14 @@ jobs:
       - name: Verify native prebuilds with Electron 31
         shell: pwsh
         run: |
+          # Some Windows GUI Electron launches return exit 1 even after executing -e.
+          # Check a sentinel produced after both requires, not the process exit code.
+          $marker = Join-Path $env:RUNNER_TEMP "orbit-native-ok.txt"
+          Remove-Item $marker -ErrorAction SilentlyContinue
+          $env:ORBIT_NATIVE_CHECK_FILE = $marker
           $env:ELECTRON_RUN_AS_NODE = "1"
-          & "./node_modules/electron/dist/electron.exe" -e "require('uiohook-napi'); require('sharp'); console.log('Native addons load under Electron'); process.exit(0)"
-          if ($LASTEXITCODE -ne 0) { throw "Native N-API prebuilds failed in Electron" }
+          & "./node_modules/electron/dist/electron.exe" -e "require('uiohook-napi'); require('sharp'); require('node:fs').writeFileSync(process.env.ORBIT_NATIVE_CHECK_FILE, 'ok')"
+          if (!(Test-Path $marker)) { throw "Native N-API prebuilds failed in Electron" }
       - name: Test Wallpaper Engine config selection
         run: npm run test:wallpaper
       - name: Type-check main, preload and renderer
