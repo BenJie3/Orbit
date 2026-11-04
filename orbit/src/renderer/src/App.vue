@@ -2062,7 +2062,7 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
       esVideoActivo.value = esVideo
       const bytes = await window.api.leerArchivoBinario(rutaReal)
       bytesMultimediaOriginal.value = bytes
-      const blob = new Blob([bytes], {
+      const blob = new Blob([new Uint8Array(bytes)], {
         type: file.type || (esVideo ? 'video/mp4' : 'audio/mpeg')
       })
       mediaUrlActiva.value = URL.createObjectURL(blob)
@@ -2639,7 +2639,7 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
       const wavBytes = await extraerAudioAWavDirecto(bytes, 0, undefined, 1.0, 1.0)
       await window.api.guardarMultimediaBytes(wavBytes, formatoDestino, rutaReal)
     } else if (formatoDestino === 'gif' && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const gifBytes = await convertirVideoAGif(url, 0, 5, 10, 360)
@@ -2648,7 +2648,7 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
         URL.revokeObjectURL(url)
       }
     } else if ((formatoDestino === 'jpg' || formatoDestino === 'png') && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const imgBytes = await capturarFrameDeVideo(url, 0.5, formatoDestino)
