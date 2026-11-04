@@ -42,7 +42,7 @@
 
     "build:unpack": "npm run build && electron-builder --dir",
 
-    "build:win": "electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win",
+    "build:win": "npm run typecheck && node scripts/generate-icon.cjs && electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win",
 
     "build:mac": "npm run build && electron-builder --mac",
 
