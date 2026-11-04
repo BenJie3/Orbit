@@ -861,8 +861,13 @@ const quitarFondoBlanco = () => {
     }
   }
 
+  // Conservar el estado anterior para que Ctrl+Z restaure la imagen original.
+  const anterior = ctx.getImageData(0, 0, c.width, c.height)
   ctx.putImageData(imgData, 0, 0)
-  historialTrazos.value = [...historialTrazos.value, imgData]
+  historialTrazos.value = [
+    ...(historialTrazos.value.length ? historialTrazos.value : [anterior]),
+    ctx.getImageData(0, 0, c.width, c.height)
+  ]
   fondoTransparenteActivo.value = true
 
   const pageCanvas = paginasCanvases.value[paginaIndice.value]
@@ -1747,114 +1752,131 @@ const recortarClipDeVideo = async (
   video.src = videoUrl
   video.playsInline = true
   video.crossOrigin = 'anonymous'
+  video.preload = 'auto'
+  let stream: MediaStream | null = null
+  let audioCtx: AudioContext | null = null
+  let recorder: MediaRecorder | null = null
+  let frameId = 0
 
-  await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve()
-    video.onerror = () => reject(new Error('No se pudo cargar el video para recortar'))
-  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      video.onloadedmetadata = () => resolve()
+      video.onerror = () => reject(new Error('No se pudo cargar el video para recortar'))
+    })
 
-  const duracionTotal = video.duration || 10
-  const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.3))
-  const tEnd = Math.min(duracionTotal, Math.max(tStart + 0.5, finSeg))
-
-  video.currentTime = tStart
-  video.playbackRate = velocidad
-
-  await new Promise<void>((res) => {
-    const onSeek = () => {
-      video.removeEventListener('seeked', onSeek)
-      res()
+    const duracionTotal = video.duration
+    if (!Number.isFinite(duracionTotal) || duracionTotal <= 0) {
+      throw new Error('No se puede recortar un video sin duración conocida')
     }
-    video.addEventListener('seeked', onSeek)
-  })
+    const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.1))
+    const tEnd = Math.min(duracionTotal, finSeg)
+    if (tEnd <= tStart) throw new Error('El final del recorte debe ser posterior al inicio')
 
-  const w = video.videoWidth || 1280
-  const h = video.videoHeight || 720
-  const canvas = document.createElement('canvas')
-  canvas.width = w
-  canvas.height = h
-  const ctx = canvas.getContext('2d')!
-  ctx.drawImage(video, 0, 0, w, h)
-
-  const canvasStream = canvas.captureStream(30)
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
-  const sourceNode = audioCtx.createMediaElementSource(video)
-  const gainNode = audioCtx.createGain()
-  gainNode.gain.value = gananciaVolumen
-  const destAudio = audioCtx.createMediaStreamDestination()
-
-  sourceNode.connect(gainNode)
-  gainNode.connect(destAudio)
-
-  const combinedStream = new MediaStream([
-    ...canvasStream.getVideoTracks(),
-    ...destAudio.stream.getAudioTracks()
-  ])
-
-  let mimeElegido = 'video/webm;codecs=vp8,opus'
-  let extSalida = 'webm'
-  const candidatos = [
-    { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
-    { mime: 'video/mp4', ext: 'mp4' },
-    { mime: 'video/webm;codecs=vp9,opus', ext: 'webm' },
-    { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
-    { mime: 'video/webm', ext: 'webm' }
-  ]
-
-  for (const c of candidatos) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c.mime)) {
-      mimeElegido = c.mime
-      extSalida = c.ext
-      break
+    // Registrar el evento ANTES de cambiar currentTime evita perder 'seeked'.
+    // Si ya estamos en el fotograma inicial, no esperar un evento que no ocurrirá.
+    if (Math.abs(video.currentTime - tStart) > 0.02) {
+      await new Promise<void>((resolve, reject) => {
+        const onSeek = () => {
+          window.clearTimeout(timeout)
+          video.removeEventListener('seeked', onSeek)
+          resolve()
+        }
+        const timeout = window.setTimeout(() => {
+          video.removeEventListener('seeked', onSeek)
+          reject(new Error('No se pudo ubicar el inicio del clip'))
+        }, 10000)
+        video.addEventListener('seeked', onSeek)
+        video.currentTime = tStart
+      })
     }
-  }
+    video.playbackRate = velocidad
 
-  const chunks: BlobPart[] = []
-  const recorder = new MediaRecorder(combinedStream, {
-    mimeType: mimeElegido,
-    videoBitsPerSecond: 4500000
-  })
-
-  recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) chunks.push(e.data)
-  }
-
-  const promesaGrabacion = new Promise<Uint8Array>((resolve, reject) => {
-    recorder.onstop = async () => {
-      try {
-        const blobFinal = new Blob(chunks, { type: mimeElegido })
-        const ab = await blobFinal.arrayBuffer()
-        resolve(new Uint8Array(ab))
-      } catch (err) {
-        reject(err)
-      }
-    }
-    recorder.onerror = (err) => reject(err)
-  })
-
-  let activo = true
-  const pintarFrame = () => {
-    if (!activo) return
-    if (video.currentTime >= tEnd || video.ended) {
-      activo = false
-      video.pause()
-      if (recorder.state === 'recording') recorder.stop()
-      return
-    }
+    const w = video.videoWidth || 1280
+    const h = video.videoHeight || 720
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) throw new Error('No fue posible iniciar la captura del video')
     ctx.drawImage(video, 0, 0, w, h)
-    window.requestAnimationFrame(pintarFrame)
+
+    const canvasStream = canvas.captureStream(30)
+    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
+    const sourceNode = audioCtx.createMediaElementSource(video)
+    const gainNode = audioCtx.createGain()
+    gainNode.gain.value = gananciaVolumen
+    const destAudio = audioCtx.createMediaStreamDestination()
+    sourceNode.connect(gainNode)
+    gainNode.connect(destAudio)
+
+    stream = new MediaStream([
+      ...canvasStream.getVideoTracks(),
+      ...destAudio.stream.getAudioTracks()
+    ])
+
+    const candidatos = [
+      { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
+      { mime: 'video/mp4', ext: 'mp4' },
+      { mime: 'video/webm;codecs=vp9,opus', ext: 'webm' },
+      { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
+      { mime: 'video/webm', ext: 'webm' }
+    ]
+    const elegido = candidatos.find((c) => MediaRecorder.isTypeSupported(c.mime))
+    if (!elegido) throw new Error('Este equipo no dispone de un codificador de video compatible')
+
+    const chunks: BlobPart[] = []
+    recorder = new MediaRecorder(stream, {
+      mimeType: elegido.mime,
+      videoBitsPerSecond: 4500000
+    })
+    const grabador = recorder
+    grabador.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data)
+    }
+    const promesaGrabacion = new Promise<Uint8Array>((resolve, reject) => {
+      grabador.onstop = async () => {
+        try {
+          const blob = new Blob(chunks, { type: elegido.mime })
+          resolve(new Uint8Array(await blob.arrayBuffer()))
+        } catch (error) {
+          reject(error)
+        }
+      }
+      grabador.onerror = () => reject(new Error('Falló la codificación del clip'))
+    })
+
+    const pintarFrame = () => {
+      if (!recorder || recorder.state !== 'recording') return
+      if (video.currentTime >= tEnd || video.ended) {
+        video.pause()
+        recorder.stop()
+        return
+      }
+      ctx.drawImage(video, 0, 0, w, h)
+      frameId = window.requestAnimationFrame(pintarFrame)
+    }
+
+    grabador.start(100)
+    try {
+      await video.play()
+    } catch (error) {
+      grabador.stop()
+      // Evitar una promesa de grabación rechazada sin observador.
+      await promesaGrabacion.catch(() => {})
+      throw error
+    }
+    pintarFrame()
+    const bytes = await promesaGrabacion
+    return { bytes, ext: elegido.ext }
+  } finally {
+    video.pause()
+    if (frameId) window.cancelAnimationFrame(frameId)
+    if (recorder?.state === 'recording') recorder.stop()
+    stream?.getTracks().forEach((t) => t.stop())
+    if (audioCtx) await audioCtx.close().catch(() => {})
+    video.removeAttribute('src')
+    video.load()
   }
-
-  recorder.start(100)
-  await video.play()
-  pintarFrame()
-
-  const bytes = await promesaGrabacion
-  activo = false
-  combinedStream.getTracks().forEach((t) => t.stop())
-  await audioCtx.close().catch(() => {})
-
-  return { bytes, ext: extSalida }
 }
 
 const convertirVideoAGif = async (
@@ -2040,7 +2062,7 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
       esVideoActivo.value = esVideo
       const bytes = await window.api.leerArchivoBinario(rutaReal)
       bytesMultimediaOriginal.value = bytes
-      const blob = new Blob([bytes], {
+      const blob = new Blob([new Uint8Array(bytes)], {
         type: file.type || (esVideo ? 'video/mp4' : 'audio/mpeg')
       })
       mediaUrlActiva.value = URL.createObjectURL(blob)
@@ -2617,7 +2639,7 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
       const wavBytes = await extraerAudioAWavDirecto(bytes, 0, undefined, 1.0, 1.0)
       await window.api.guardarMultimediaBytes(wavBytes, formatoDestino, rutaReal)
     } else if (formatoDestino === 'gif' && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const gifBytes = await convertirVideoAGif(url, 0, 5, 10, 360)
@@ -2626,7 +2648,7 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
         URL.revokeObjectURL(url)
       }
     } else if ((formatoDestino === 'jpg' || formatoDestino === 'png') && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const imgBytes = await capturarFrameDeVideo(url, 0.5, formatoDestino)

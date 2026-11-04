@@ -1,0 +1,56 @@
+name: Orbit Windows verification
+
+on:
+  push:
+    branches:
+      - fix/v1.0.0-stability-update-wallpaper
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'orbit/**'
+      - '.github/workflows/orbit-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: orbit
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Install Node 20.18.0 (Orbit native module compatibility)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.0'
+          cache: npm
+          cache-dependency-path: orbit/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --legacy-peer-deps
+      - name: Verify native prebuilds with Electron 31
+        shell: pwsh
+        run: |
+          # Some Windows GUI Electron launches return exit 1 even after executing -e.
+          # Check a sentinel produced after both requires, not the process exit code.
+          $marker = Join-Path $env:RUNNER_TEMP "orbit-native-ok.txt"
+          Remove-Item $marker -ErrorAction SilentlyContinue
+          $env:ORBIT_NATIVE_CHECK_FILE = $marker
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          & "./node_modules/electron/dist/electron.exe" -e "require('uiohook-napi'); require('sharp'); require('node:fs').writeFileSync(process.env.ORBIT_NATIVE_CHECK_FILE, 'ok')"
+          if (!(Test-Path $marker)) { throw "Native N-API prebuilds failed in Electron" }
+      - name: Test Wallpaper Engine config selection
+        run: npm run test:wallpaper
+      - name: Type-check main, preload and renderer
+        run: npm run typecheck
+      - name: Build Electron application (no installer and no release)
+        run: npx electron-vite build
+      - name: Generate Sapphire icon
+        run: node scripts/generate-icon.cjs
+      - name: Verify icon output
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'build/icon.png')) { throw 'Missing build/icon.png' }
