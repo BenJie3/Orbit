@@ -233,75 +233,89 @@ function localizarConfigWallpaperEngine(): string {
   return ''
 }
 
-function obtenerWallpaperActivoWallpaperEngine(): {
-  rutaPreview: string
-  schemeColor: string
-  firma: string
-} | null {
+type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string }
+let cacheSeleccionWallpaper: { firmaArchivo: string; seleccion: SeleccionWallpaper | null } | null = null
+
+function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
   const cfgPath = localizarConfigWallpaperEngine()
   if (!cfgPath || !fs.existsSync(cfgPath)) return null
 
   try {
     const stat = fs.statSync(cfgPath)
-    const raw = fs.readFileSync(cfgPath, 'utf8')
+    const firmaArchivo = `${cfgPath}:${stat.mtimeMs}:${stat.size}`
+    if (cacheSeleccionWallpaper?.firmaArchivo === firmaArchivo) {
+      return cacheSeleccionWallpaper.seleccion
+    }
 
-    // Extraer únicamente el bloque "selectedwallpapers" activo
-    const selIdx = raw.indexOf('"selectedwallpapers"')
-    const zonaBusqueda = selIdx !== -1 ? raw.slice(selIdx, selIdx + 12000) : raw
+    // Usar el árbol JSON real y únicamente los monitores seleccionados.
+    // No buscar 'file' en historiales, playlists u otras configuraciones.
+    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    const seleccionados = parsed?.selectedwallpapers
+    const archivos: string[] = []
+    const visitar = (valor: unknown, profundidad = 0): void => {
+      if (profundidad > 8 || !valor) return
+      if (Array.isArray(valor)) {
+        for (const item of valor) visitar(item, profundidad + 1)
+      } else if (typeof valor === 'object') {
+        const obj = valor as Record<string, unknown>
+        if (typeof obj.file === 'string' && obj.file.trim()) {
+          archivos.push(obj.file.trim())
+        }
+        for (const [clave, item] of Object.entries(obj)) {
+          if (clave !== 'file') visitar(item, profundidad + 1)
+        }
+      }
+    }
+    visitar(seleccionados)
 
-    const fileMatches = [...zonaBusqueda.matchAll(/"file"\s*:\s*"([^"]+)"/gi)]
-    for (const m of fileMatches) {
-      const fileVal = m[1].replace(/\\\\/g, '/').replace(/\\/g, '/')
-      if (!fileVal) continue
-
-      const folder = fs.existsSync(fileVal) && fs.statSync(fileVal).isDirectory()
-        ? fileVal
-        : path.dirname(fileVal)
-
+    let seleccion: SeleccionWallpaper | null = null
+    for (const fileVal of archivos) {
+      const rutaArchivo = path.normalize(fileVal)
+      const folder = fs.existsSync(rutaArchivo) && fs.statSync(rutaArchivo).isDirectory()
+        ? rutaArchivo
+        : path.dirname(rutaArchivo)
       if (!fs.existsSync(folder)) continue
 
-      let previewFile = ''
+      let rutaPreview = ''
       let schemeColor = ''
       const projPath = path.join(folder, 'project.json')
-
       if (fs.existsSync(projPath)) {
         try {
-          const proj = JSON.parse(fs.readFileSync(projPath, 'utf8'))
-          if (proj.preview) {
-            const pCand = path.join(folder, proj.preview)
-            if (fs.existsSync(pCand)) previewFile = pCand
+          const project = JSON.parse(fs.readFileSync(projPath, 'utf8'))
+          if (typeof project.preview === 'string') {
+            const candidato = path.resolve(folder, project.preview)
+            if (fs.existsSync(candidato)) rutaPreview = candidato
           }
-          if (proj.schemecolor) {
-            schemeColor = String(proj.schemecolor)
-          }
-        } catch {}
+          if (project.schemecolor) schemeColor = String(project.schemecolor)
+        } catch (error) {
+          console.warn('[Orbit] No se pudo leer project.json:', error)
+        }
       }
-
-      if (!previewFile) {
-        for (const nombre of ['preview.jpg', 'preview.png', 'preview.gif', 'preview.webp', 'thumb.jpg']) {
-          const cand = path.join(folder, nombre)
-          if (fs.existsSync(cand)) {
-            previewFile = cand
+      if (!rutaPreview) {
+        for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
+          const candidato = path.join(folder, nombre)
+          if (fs.existsSync(candidato)) {
+            rutaPreview = candidato
             break
           }
         }
       }
-
-      if (!previewFile && /\.(jpg|jpeg|png|webp|bmp)$/i.test(fileVal) && fs.existsSync(fileVal)) {
-        previewFile = fileVal
+      if (!rutaPreview && /\\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo) && fs.existsSync(rutaArchivo)) {
+        rutaPreview = rutaArchivo
       }
-
-      if (previewFile || schemeColor) {
-        return {
-          rutaPreview: previewFile,
-          schemeColor,
-          firma: `WE:${fileVal}:${stat.mtimeMs}`
-        }
+      if (rutaPreview || schemeColor) {
+        seleccion = { rutaPreview, schemeColor, firma: `WE:${rutaArchivo}:${firmaArchivo}` }
+        break
       }
     }
-  } catch {}
-
-  return null
+    cacheSeleccionWallpaper = { firmaArchivo, seleccion }
+    return seleccion
+  } catch (error) {
+    // Un JSON escrito parcialmente por Wallpaper Engine puede ser temporal.
+    // Mantener la selección válida anterior hasta el siguiente evento.
+    console.warn('[Orbit] Lectura temporal de Wallpaper Engine fallida:', error)
+    return cacheSeleccionWallpaper?.seleccion ?? null
+  }
 }
 
 function obtenerRutasWallpaperWindows(): { ruta: string; firma: string } | null {
