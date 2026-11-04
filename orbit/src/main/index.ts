@@ -14,6 +14,7 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
 import { spawn, execSync, ChildProcessWithoutNullStreams } from 'child_process'
 import sharp from 'sharp'
+import { autoUpdater } from 'electron-updater'
 import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
 import path from 'path'
@@ -1482,133 +1483,130 @@ if (!instanciaUnica) {
       return false
     })
 
-    // --- AUTO-ACTUALIZACIÓN 100% DIRECTA Y SILENCIOSA (SIN ABRIR GITHUB) ---
+    // Actualización NSIS mediante electron-updater: solo instala versiones superiores y
+    // verifica la integridad del archivo usando latest.yml (SHA-512).
+    let actualizacionEnCurso = false
+    autoUpdater.autoDownload = false
+    autoUpdater.autoInstallOnAppQuit = false
+    autoUpdater.allowPrerelease = false
+    autoUpdater.allowDowngrade = false
+    autoUpdater.on('error', (error) => {
+      console.error('[Orbit] Error de actualización:', error)
+    })
+
     ipcMain.handle('buscar-y-actualizar-directo', async () => {
-      const versionActual = app.getVersion() || '1.0.0'
-      const emitirProgreso = (info: any) => {
+      const versionActual = app.getVersion()
+      const emitirProgreso = (info: {
+        estado: 'buscando' | 'disponible' | 'descargando' | 'instalando' | 'actualizado' | 'error'
+        porcentaje: number
+        versionNueva?: string
+        mensaje: string
+      }) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('progreso-actualizacion', info)
         }
       }
 
-      try {
-        emitirProgreso({
-          estado: 'buscando',
-          porcentaje: 5,
-          mensaje: 'Buscando nueva versión...'
-        })
-
-        const resp = await fetch('https://api.github.com/repos/BenJie3/Orbit/releases/latest', {
-          headers: { 'User-Agent': 'Orbit-Updater' }
-        })
-
-        if (!resp.ok) {
-          return {
-            estado: 'actualizado',
-            porcentaje: 100,
-            mensaje: `Estás al día (v${versionActual})`
-          }
+      if (actualizacionEnCurso) {
+        return { estado: 'descargando', porcentaje: 0, mensaje: 'Ya hay una actualización en curso.' }
+      }
+      if (!app.isPackaged || process.platform !== 'win32') {
+        const info = {
+          estado: 'error' as const,
+          porcentaje: 0,
+          mensaje: 'Las actualizaciones se prueban en Orbit instalado para Windows, no en modo desarrollo.'
         }
+        emitirProgreso(info)
+        return info
+      }
 
-        const release: any = await resp.json()
-        const tagLimpio = String(release.tag_name || '').replace(/^v/i, '')
+      actualizacionEnCurso = true
+      let hayActualizacion = false
+      const marcarDisponible = () => { hayActualizacion = true }
+      const informarDescarga = (progreso: { percent: number }) => {
+        const porcentaje = Math.min(99, Math.max(0, Math.round(progreso.percent || 0)))
+        emitirProgreso({
+          estado: 'descargando',
+          porcentaje,
+          mensaje: `Descargando actualización (${porcentaje}%)...`
+        })
+      }
 
-        if (!tagLimpio || tagLimpio === versionActual) {
-          const res = {
+      try {
+        emitirProgreso({ estado: 'buscando', porcentaje: 0, mensaje: 'Buscando nueva versión...' })
+        autoUpdater.once('update-available', marcarDisponible)
+        const comprobacion = await autoUpdater.checkForUpdates()
+        autoUpdater.removeListener('update-available', marcarDisponible)
+
+        // electron-updater compara SemVer y bloquea downgrades. No interpretar
+        // como nueva versión un release antiguo que tenga un .exe mal nombrado.
+        if (!hayActualizacion || !comprobacion?.updateInfo) {
+          const info = {
             estado: 'actualizado' as const,
             porcentaje: 100,
             mensaje: `Estás en la última versión (v${versionActual})`
           }
-          emitirProgreso(res)
-          return res
+          emitirProgreso(info)
+          return info
         }
 
-        const assetExe = (release.assets || []).find((a: any) =>
-          String(a.name || '').toLowerCase().endsWith('.exe')
-        )
-
-        if (!assetExe || !assetExe.browser_download_url) {
-          const res = {
-            estado: 'actualizado' as const,
-            porcentaje: 100,
-            mensaje: `Versión v${tagLimpio} detectada (sin instalador .exe adjunto)`
-          }
-          emitirProgreso(res)
-          return res
-        }
-
+        const versionNueva = comprobacion.updateInfo.version
         emitirProgreso({
-          estado: 'descargando',
-          porcentaje: 10,
-          versionNueva: tagLimpio,
-          mensaje: `Descargando v${tagLimpio} (10%)...`
+          estado: 'disponible',
+          porcentaje: 0,
+          versionNueva,
+          mensaje: `Actualización v${versionNueva} disponible.`
         })
 
-        const dlResp = await fetch(assetExe.browser_download_url, {
-          headers: { 'User-Agent': 'Orbit-Updater' }
-        })
-        if (!dlResp.ok || !dlResp.body) {
-          throw new Error('No se pudo descargar el instalador')
+        autoUpdater.on('download-progress', informarDescarga)
+        try {
+          // latest.yml incluye la suma SHA-512 validada por electron-updater.
+          await autoUpdater.downloadUpdate()
+        } finally {
+          autoUpdater.removeListener('download-progress', informarDescarga)
         }
 
-        const totalBytes = Number(dlResp.headers.get('content-length')) || assetExe.size || 60000000
-        const tempInstallerPath = path.join(app.getPath('temp'), `Orbit-Setup-${tagLimpio}.exe`)
-        const fileStream = fs.createWriteStream(tempInstallerPath)
-        const reader = dlResp.body.getReader()
-
-        let recibidos = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          if (value) {
-            fileStream.write(Buffer.from(value))
-            recibidos += value.byteLength
-            const pct = Math.min(99, Math.max(10, Math.round((recibidos / totalBytes) * 100)))
-            emitirProgreso({
-              estado: 'descargando',
-              porcentaje: pct,
-              versionNueva: tagLimpio,
-              mensaje: `Descargando v${tagLimpio} (${pct}%)...`
-            })
-          }
-        }
-
-        await new Promise<void>((res) => fileStream.end(() => res()))
-
-        emitirProgreso({
-          estado: 'instalando',
+        const info = {
+          estado: 'instalando' as const,
           porcentaje: 100,
-          versionNueva: tagLimpio,
-          mensaje: 'Instalando y reiniciando Orbit...'
-        })
+          versionNueva,
+          mensaje: 'Descarga verificada. Instalando y reiniciando Orbit...'
+        }
+        emitirProgreso(info)
 
         setTimeout(() => {
-          uIOhook.stop()
-          if (shellNotifierProc) shellNotifierProc.kill()
-          detenerMonitorWallpaperTiempoReal()
-
-          const child = spawn(tempInstallerPath, ['/S'], {
-            detached: true,
-            stdio: 'ignore'
-          })
-          child.unref()
-          app.quit()
-        }, 700)
-
-        return {
-          estado: 'instalando',
-          porcentaje: 100,
-          versionNueva: tagLimpio,
-          mensaje: 'Instalando y reiniciando Orbit...'
-        }
-      } catch {
-        const errRes = {
+          try {
+            uIOhook.stop()
+            detenerMonitorWallpaperTiempoReal()
+            if (shellNotifierProc) shellNotifierProc.kill()
+            // La API de electron-updater v6 fuerza el reinicio tras NSIS silencioso.
+            autoUpdater.quitAndInstall(true, true)
+          } catch (error) {
+            console.error('[Orbit] No se pudo iniciar la instalación:', error)
+            actualizacionEnCurso = false
+            emitirProgreso({
+              estado: 'error',
+              porcentaje: 0,
+              mensaje: 'No se pudo iniciar la instalación de la actualización.'
+            })
+          }
+        }, 900)
+        return info
+      } catch (error) {
+        console.error('[Orbit] Error verificando o descargando actualización:', error)
+        const info = {
           estado: 'error' as const,
           porcentaje: 0,
-          mensaje: 'Error al descargar actualización'
+          mensaje: 'No se pudo actualizar. Verifica la conexión y que el Release incluya latest.yml.'
         }
-        emitirProgreso(errRes)
-        return errRes
+        emitirProgreso(info)
+        return info
+      } finally {
+        autoUpdater.removeListener('update-available', marcarDisponible)
+        // Conservar el candado mientras el instalador está arrancando.
+        if (!hayActualizacion || !actualizacionEnCurso) {
+          actualizacionEnCurso = false
+        }
       }
     })
 
