@@ -19,6 +19,7 @@ import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
+import { seleccionarWallpaperEngine } from './wallpaper-selection'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -71,6 +72,8 @@ let intervaloMonitorWallpaper: NodeJS.Timeout | null = null
 let watchersActivos: fs.FSWatcher[] = []
 let debounceCambioWallpaper: NodeJS.Timeout | null = null
 let rutaConfigWallpaperEngineCache = ''
+let ultimoIntentoLocalizarConfigWallpaper = 0
+let ultimoOrigenTema = ''
 
 const rutaConfig = path.join(app.getPath('userData'), 'orbit-settings.json')
 
@@ -192,6 +195,10 @@ function localizarConfigWallpaperEngine(): string {
     return rutaConfigWallpaperEngineCache
   }
 
+  // Evitar búsquedas síncronas repetidas si no se encuentra Wallpaper Engine.
+  if (Date.now() - ultimoIntentoLocalizarConfigWallpaper < 30000) return ''
+  ultimoIntentoLocalizarConfigWallpaper = Date.now()
+
   // 1. Buscar en Registro de Windows (HKCU\Software\WallpaperEngine -> installPath)
   try {
     const regOut = execSync(
@@ -233,7 +240,7 @@ function localizarConfigWallpaperEngine(): string {
   return ''
 }
 
-type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string }
+type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string; monitor: string }
 let cacheSeleccionWallpaper: { firmaArchivo: string; seleccion: SeleccionWallpaper | null } | null = null
 
 function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
@@ -247,73 +254,74 @@ function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
       return cacheSeleccionWallpaper.seleccion
     }
 
-    // Usar el árbol JSON real y únicamente los monitores seleccionados.
-    // No buscar 'file' en historiales, playlists u otras configuraciones.
-    const parsed = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
-    const seleccionados = parsed?.selectedwallpapers
-    const archivos: string[] = []
-    const visitar = (valor: unknown, profundidad = 0): void => {
-      if (profundidad > 8 || !valor) return
-      if (Array.isArray(valor)) {
-        for (const item of valor) visitar(item, profundidad + 1)
-      } else if (typeof valor === 'object') {
-        const obj = valor as Record<string, unknown>
-        if (typeof obj.file === 'string' && obj.file.trim()) {
-          archivos.push(obj.file.trim())
+    // Wallpaper Engine guarda las selecciones bajo
+    // steamuser.general.wallpaperconfig.selectedwallpapers[monitorId].
+    const configuracion = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    const actual = seleccionarWallpaperEngine(configuracion)
+    if (!actual) {
+      console.warn('[Orbit Wallpaper] No se encontró wallpaper activo en config.json.')
+      cacheSeleccionWallpaper = { firmaArchivo, seleccion: null }
+      return null
+    }
+
+    const rutaArchivo = path.isAbsolute(actual.archivo)
+      ? path.normalize(actual.archivo)
+      : path.resolve(path.dirname(cfgPath), actual.archivo)
+    const carpeta = fs.existsSync(rutaArchivo) && fs.statSync(rutaArchivo).isDirectory()
+      ? rutaArchivo
+      : path.dirname(rutaArchivo)
+
+    if (!fs.existsSync(carpeta)) {
+      console.warn('[Orbit Wallpaper] Carpeta de fondo no encontrada:', carpeta)
+      cacheSeleccionWallpaper = { firmaArchivo, seleccion: null }
+      return null
+    }
+
+    let rutaPreview = ''
+    let schemeColor = ''
+    const proyectoPath = path.join(carpeta, 'project.json')
+    if (fs.existsSync(proyectoPath)) {
+      try {
+        const proyecto = JSON.parse(fs.readFileSync(proyectoPath, 'utf8'))
+        if (typeof proyecto.preview === 'string') {
+          const vista = path.resolve(carpeta, proyecto.preview)
+          if (fs.existsSync(vista)) rutaPreview = vista
         }
-        for (const [clave, item] of Object.entries(obj)) {
-          if (clave !== 'file') visitar(item, profundidad + 1)
+        const colorProyecto =
+          proyecto.schemecolor ??
+          proyecto.general?.properties?.schemecolor?.value ??
+          proyecto.general?.properties?.schemecolor
+        if (typeof colorProyecto === 'string') schemeColor = colorProyecto
+      } catch (error) {
+        console.warn('[Orbit Wallpaper] Error leyendo project.json:', error)
+      }
+    }
+
+    if (!rutaPreview) {
+      for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
+        const posible = path.join(carpeta, nombre)
+        if (fs.existsSync(posible)) {
+          rutaPreview = posible
+          break
         }
       }
     }
-    visitar(seleccionados)
+    if (!rutaPreview && /\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo) && fs.existsSync(rutaArchivo)) {
+      rutaPreview = rutaArchivo
+    }
 
-    let seleccion: SeleccionWallpaper | null = null
-    for (const fileVal of archivos) {
-      const rutaArchivo = path.normalize(fileVal)
-      const folder = fs.existsSync(rutaArchivo) && fs.statSync(rutaArchivo).isDirectory()
-        ? rutaArchivo
-        : path.dirname(rutaArchivo)
-      if (!fs.existsSync(folder)) continue
-
-      let rutaPreview = ''
-      let schemeColor = ''
-      const projPath = path.join(folder, 'project.json')
-      if (fs.existsSync(projPath)) {
-        try {
-          const project = JSON.parse(fs.readFileSync(projPath, 'utf8'))
-          if (typeof project.preview === 'string') {
-            const candidato = path.resolve(folder, project.preview)
-            if (fs.existsSync(candidato)) rutaPreview = candidato
-          }
-          if (project.schemecolor) schemeColor = String(project.schemecolor)
-        } catch (error) {
-          console.warn('[Orbit] No se pudo leer project.json:', error)
-        }
-      }
-      if (!rutaPreview) {
-        for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
-          const candidato = path.join(folder, nombre)
-          if (fs.existsSync(candidato)) {
-            rutaPreview = candidato
-            break
-          }
-        }
-      }
-      if (!rutaPreview && /\\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo) && fs.existsSync(rutaArchivo)) {
-        rutaPreview = rutaArchivo
-      }
-      if (rutaPreview || schemeColor) {
-        seleccion = { rutaPreview, schemeColor, firma: `WE:${rutaArchivo}:${firmaArchivo}` }
-        break
-      }
+    const seleccion: SeleccionWallpaper | null = rutaPreview || schemeColor
+      ? { rutaPreview, schemeColor, monitor: actual.monitor,
+          firma: `WE:${actual.monitor}:${rutaArchivo}:${firmaArchivo}` }
+      : null
+    if (!seleccion) {
+      console.warn('[Orbit Wallpaper] Wallpaper activo sin preview ni schemecolor:', rutaArchivo)
     }
     cacheSeleccionWallpaper = { firmaArchivo, seleccion }
     return seleccion
   } catch (error) {
-    // Un JSON escrito parcialmente por Wallpaper Engine puede ser temporal.
-    // Mantener la selección válida anterior hasta el siguiente evento.
-    console.warn('[Orbit] Lectura temporal de Wallpaper Engine fallida:', error)
+    // Wallpaper Engine puede escribir temporalmente un JSON incompleto.
+    console.warn('[Orbit Wallpaper] Configuración temporalmente ilegible:', error)
     return cacheSeleccionWallpaper?.seleccion ?? null
   }
 }
