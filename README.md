@@ -25,6 +25,16 @@ Al mantener presionada tu tecla de activación (**Shift** por defecto) mientras 
 
 ---
 
+## 🎨 Motor Camaleón (Windows + Wallpaper Engine)
+
+Orbit utiliza por defecto una paleta Azul Zafiro / Cian Fluent. Desde el panel de la bandeja del sistema puedes activar **Adaptar al fondo de pantalla** para aplicar automáticamente una paleta a la rueda radial y al icono de la bandeja.
+
+El motor lee el proyecto seleccionado de Wallpaper Engine cuando existe una vista previa accesible y utiliza un histograma HSL para identificar el tono dominante; también dispone de un respaldo para fondos de Windows. Emplea vigilancia de archivos y comprobaciones periódicas ligeras. La respuesta depende de cómo Wallpaper Engine guarde cada fondo: los cambios de escena dentro de un wallpaper animado pueden no generar un nuevo archivo de configuración.
+
+## 🔄 Actualizaciones
+
+En la versión instalada para Windows, el panel permite comprobar, descargar y aplicar nuevas versiones desde GitHub Releases, sin abrir el navegador. El instalador se valida con los metadatos de publicación de `electron-updater` y se instala mediante NSIS. Para que funcione, el Release debe contener el instalador compatible y el archivo `latest.yml`. Las actualizaciones no se ejecutan desde `npm run dev`.
+
 ## 🚀 Características Principales
 
 ### 1. 🔄 Modo Conversión Instantánea (Rueda Principal)
@@ -69,8 +79,8 @@ Haz clic en el icono orbital de la bandeja del sistema para abrir el centro de c
 ### Pasos para ejecutar en desarrollo
 ```bash
 # 1. Clonar el repositorio
-git clone [https://github.com/TU_USUARIO/orbit.git](https://github.com/TU_USUARIO/orbit.git)
-cd orbit
+git clone https://github.com/BenJie3/Orbit.git
+cd Orbit/orbit
 
 # 2. Instalar dependencias
 npm install --legacy-peer-deps
