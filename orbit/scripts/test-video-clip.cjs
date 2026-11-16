@@ -19,6 +19,7 @@ assert.throws(() => validarRecorteVideo({ ...fake, finSeg: 0.5 }), /rango/)
 assert.throws(() => validarRecorteVideo({ ...fake, velocidad: 0 }), /límites/)
 assert.ok(argumentosRecorte(fake, 'C:\\clips\\temp.mp4', 'copia-rapida').includes('copy'))
 assert.ok(argumentosRecorte(fake, 'C:\\clips\\temp.mp4', 'recodificado').includes('libx264'))
+assert.ok(!argumentosRecorte({ ...fake, velocidad: 1.5 }, 'temp.mp4', 'recodificado', false).includes('-af'))
 
 const sampleOutput = 'Stream #0:0(und): Video: h264 (High), yuv420p, 320x240\n' +
   'Stream #0:1(und): Audio: aac (LC), 48000 Hz'
@@ -39,6 +40,8 @@ assert.equal(metadatosCompatibles('Stream #0:0: Video: h264 (High 4:4:4), yuv444
     const original = path.join(tmp, 'entrada.mp4')
     const rapido = path.join(tmp, 'salida-copia.mp4')
     const ajustado = path.join(tmp, 'salida-recodificada.mp4')
+    const sinAudio = path.join(tmp, 'sin-audio.mp4')
+    const recorteSilencioso = path.join(tmp, 'recorte-silencioso.mp4')
     execFileSync(ffmpeg, [
       '-hide_banner', '-loglevel', 'error', '-y',
       '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=15',
@@ -65,7 +68,19 @@ assert.equal(metadatosCompatibles('Stream #0:0: Video: h264 (High 4:4:4), yuv444
     execFileSync(ffmpeg, ['-hide_banner', '-v', 'error', '-i', ajustado,
       '-f', 'null', '-'], { timeout: 45000, stdio: 'pipe' })
 
-    console.log('[Orbit] Vídeo MP4: copia rápida y recodificación H264/AAC válidas.')
+    execFileSync(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', 'testsrc2=size=160x120:rate=15',
+      '-t', '3', '-c:v', 'libx264', '-preset', 'ultrafast', '-an', sinAudio
+    ], { timeout: 45000, stdio: 'pipe' })
+    await recortarVideoConFfmpeg({
+      origen: sinAudio, salida: recorteSilencioso, inicioSeg: 0.5, finSeg: 2.0,
+      duracionTotal: 3, velocidad: 1.5, volumen: 1, ffmpeg
+    })
+    execFileSync(ffmpeg, ['-hide_banner', '-v', 'error', '-i', recorteSilencioso,
+      '-f', 'null', '-'], { timeout: 45000, stdio: 'pipe' })
+
+    console.log('[Orbit] MP4 validado: copia, recodificación y vídeo sin audio.')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
   }
