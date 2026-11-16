@@ -138,6 +138,18 @@ declare global {
       buscarYActualizarDirecto?: () => Promise<ResultadoActualizacion>
       buscarActualizaciones?: () => Promise<ResultadoActualizacion>
       obtenerRuta: (file: File) => string
+      guardarImagenSinPerdida: (datos: {
+        rutaOriginal: string
+        operacion:
+          | { tipo: 'recortar'; region: { x: number; y: number; w: number; h: number } }
+          | { tipo: 'rotar'; grados: number; voltearH: boolean; voltearV: boolean }
+        conservarJpg?: boolean
+      }) => Promise<{
+        formato: 'png' | 'webp' | 'jpg'
+        modo: 'sin-perdida-adicional' | 'jpeg-recodificado'
+        ancho: number
+        alto: number
+      }>
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
         formatoDestino: string,
@@ -295,6 +307,10 @@ const grosorPincel = ref(3)
 const dibujando = ref(false)
 const ultimoPuntoTrazo = ref<{ x: number; y: number } | null>(null)
 const fondoTransparenteActivo = ref(false)
+// JPEG se exporta por defecto como PNG para evitar una segunda compresión con pérdida.
+// Mantener JPG es opt-in y supone recodificación, incluso con calidad 100.
+const conservarJpgAlEditar = ref(false)
+const imagenModificadaEnCanvas = ref(false)
 
 const zoomNivel = ref(100)
 const modoPan = ref(false)
@@ -1914,6 +1930,8 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
   zoomNivel.value = 100
   modoPan.value = false
   fondoTransparenteActivo.value = false
+  conservarJpgAlEditar.value = false
+  imagenModificadaEnCanvas.value = false
   volumenMediaPct.value = 100
   velocidadMedia.value = 1
 
@@ -2203,6 +2221,12 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       : ['jpg', 'png', 'webp'].includes(extArchivoActivo.value)
         ? extArchivoActivo.value
         : 'png'
+    const esFotoOriginalSinCambios = !esPdfOrigen &&
+      ['jpg', 'jpeg', 'png', 'webp'].includes(extArchivoActivo.value) &&
+      !fondoTransparenteActivo.value && !imagenModificadaEnCanvas.value
+    const formatoConEdicionSinPerdida = fondoTransparenteActivo.value ||
+      (['jpg', 'jpeg', 'webp'].includes(extArchivoActivo.value) && !conservarJpgAlEditar.value)
+      ? 'png' : formatoImgDestino
 
     if (herramientaActual.value === 'capturar' && videoPlayerRef.value) {
       const v = videoPlayerRef.value
@@ -2297,6 +2321,13 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         )
       }
     } else if (herramientaActual.value === 'recortar') {
+      if (esFotoOriginalSinCambios) {
+        await window.api.guardarImagenSinPerdida({
+          rutaOriginal: rutaArchivoActivo.value,
+          operacion: { tipo: 'recortar', region: { ...cajaRecorte.value } },
+          conservarJpg: conservarJpgAlEditar.value
+        })
+      } else {
       const src = paginasCanvases.value[paginaIndice.value]
       const cropCanvas = document.createElement('canvas')
       const cw = Math.max(20, Math.round(cajaRecorte.value.w))
@@ -2329,15 +2360,29 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           '_recorte'
         )
       } else {
-        const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoImgDestino)
+        const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoConEdicionSinPerdida,
+          formatoConEdicionSinPerdida === 'jpg' ? 1 : 0.92)
         await window.api.guardarPaginasImagen(
           [bytes],
-          formatoImgDestino,
+          formatoConEdicionSinPerdida,
           rutaArchivoActivo.value,
           fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
         )
       }
+      }
     } else if (herramientaActual.value === 'rotar') {
+      if (esFotoOriginalSinCambios) {
+        await window.api.guardarImagenSinPerdida({
+          rutaOriginal: rutaArchivoActivo.value,
+          operacion: {
+            tipo: 'rotar',
+            grados: rotacionGrados.value,
+            voltearH: voltearH.value,
+            voltearV: voltearV.value
+          },
+          conservarJpg: conservarJpgAlEditar.value
+        })
+      } else {
       const rotadosBytes: Uint8Array[] = []
       const dims: { width: number; height: number }[] = []
 
@@ -2361,8 +2406,8 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         ctx.drawImage(src, -src.width / 2, -src.height / 2)
         ctx.restore()
 
-        const fmt = esPdfOrigen ? 'png' : formatoImgDestino
-        rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt))
+        const fmt = esPdfOrigen ? 'png' : formatoConEdicionSinPerdida
+        rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt, fmt === 'jpg' ? 1 : 0.92))
         dims.push({
           width: Math.round(outCanvas.width * 0.5),
           height: Math.round(outCanvas.height * 0.5)
@@ -2379,10 +2424,11 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       } else {
         await window.api.guardarPaginasImagen(
           rotadosBytes,
-          formatoImgDestino,
+          formatoConEdicionSinPerdida,
           rutaArchivoActivo.value,
           '_rotado'
         )
+      }
       }
     } else if (herramientaActual.value === 'dividir') {
       if (modoDivisionPdf.value === 'unico') {
@@ -3614,6 +3660,25 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
                     {{ cal.l }}
                   </button>
                 </div>
+              </div>
+
+              <div
+                v-if="(extArchivoActivo === 'jpg' || extArchivoActivo === 'jpeg') &&
+                  (herramientaActual === 'recortar' || herramientaActual === 'rotar') &&
+                  !fondoTransparenteActivo"
+                class="flex flex-wrap items-center gap-2 justify-center text-white text-xs bg-black/25 rounded-full px-4 py-2 border border-white/25"
+              >
+                <span class="font-bold">Guardar como:</span>
+                <button
+                  @click="conservarJpgAlEditar = false"
+                  :class="!conservarJpgAlEditar ? 'orbit-btn-primary border-white' : 'orbit-pill-btn border-white/40'"
+                  class="px-3 py-1 rounded-full border cursor-pointer"
+                >PNG sin pérdida adicional</button>
+                <button
+                  @click="conservarJpgAlEditar = true"
+                  :class="conservarJpgAlEditar ? 'orbit-btn-primary border-white' : 'orbit-pill-btn border-white/40'"
+                  class="px-3 py-1 rounded-full border cursor-pointer"
+                >JPG calidad máxima (recomprime)</button>
               </div>
 
               <div
