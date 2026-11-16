@@ -482,7 +482,15 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
     return forzar || anterior !== temaActual.primario
   }
 
-  const infoWE = obtenerWallpaperActivoWallpaperEngine()
+  const infoConfig = obtenerWallpaperActivoWallpaperEngine()
+  const rutaActivaCli = await obtenerRutaCliWallpaper(forzar)
+  const cfgPath = localizarConfigWallpaperEngine()
+  // CLI refleja el wallpaper realmente reproducido, incluso en playlists.
+  // Si no responde o carece de preview, conservar el fallback de config.json.
+  const infoCli = rutaActivaCli && cfgPath
+    ? resolverProyectoWallpaper(rutaActivaCli, '0', rutaActivaCli, 'cli', path.dirname(cfgPath))
+    : null
+  const infoWE = infoCli || infoConfig
   const infoWin = obtenerRutasWallpaperWindows()
   // El acento de Windows NO es el fondo. Usarlo como fuente final causaba
   // que Orbit se quedara rosa incluso si el wallpaper había cambiado.
@@ -498,7 +506,7 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
     if (hsl) {
       temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
       ultimaFirmaWallpaper = firmaActual
-      informarOrigenTema('Wallpaper Engine (preview)', `Monitor: ${infoWE.monitor}; archivo: ${path.basename(infoWE.rutaPreview)}`)
+      informarOrigenTema(infoWE.origen === 'cli' ? 'Wallpaper Engine (activo / preview)' : 'Wallpaper Engine (config / preview)', `Monitor: ${infoWE.monitor}; preview: ${path.basename(infoWE.rutaPreview)}`)
       return true
     }
   }
@@ -514,7 +522,7 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
       if (saturacion > 10) {
         temaActual = construirTemaDesdeHsl(h, saturacion)
         ultimaFirmaWallpaper = firmaActual
-        informarOrigenTema('Wallpaper Engine (schemecolor)', `Monitor: ${infoWE.monitor}`)
+        informarOrigenTema(infoWE.origen === 'cli' ? 'Wallpaper Engine (activo / schemecolor)' : 'Wallpaper Engine (config / schemecolor)', `Monitor: ${infoWE.monitor}`)
         return true
       }
     }
