@@ -14,6 +14,7 @@ const SHA256_ARCHIVO = 'db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d74
 const CARPETA_FINAL = path.join(__dirname, '..', 'build', 'video-engine')
 const BINARIO = path.join(CARPETA_FINAL, 'ffmpeg.exe')
 const REGISTRO = path.join(CARPETA_FINAL, 'motor-verificado.json')
+const LICENCIA = path.join(CARPETA_FINAL, 'COPYING.GPL-3.0.txt')
 
 async function descargar(url, destino, redirects = 0) {
   if (redirects > 5) throw new Error('Demasiadas redirecciones al descargar FFmpeg.')
@@ -56,7 +57,8 @@ async function main() {
     try {
       const registro = JSON.parse(fs.readFileSync(REGISTRO, 'utf8'))
       const hashActual = await hashArchivo(BINARIO)
-      if (registro.archiveSha256 === SHA256_ARCHIVO && registro.exeSha256 === hashActual) {
+      if (registro.archiveSha256 === SHA256_ARCHIVO && registro.exeSha256 === hashActual &&
+          fs.existsSync(LICENCIA)) {
         execFileSync(BINARIO, ['-hide_banner', '-version'], { timeout: 12000, stdio: 'ignore' })
         console.log('[Orbit] Motor de vídeo ya preparado y verificado.')
         return
@@ -93,6 +95,10 @@ async function main() {
       '\nSHA-256: ' + SHA256_ARCHIVO + '\n' +
       'Licencia: https://ffmpeg.org/legal.html\nFuentes: https://ffmpeg.org/download.html\n' +
       'La redistribución exige comprobar que se suministran los avisos, licencias y fuentes correspondientes.\n')
+    await descargar('https://www.gnu.org/licenses/gpl-3.0.txt', LICENCIA)
+    if (!fs.readFileSync(LICENCIA, 'utf8').includes('GNU GENERAL PUBLIC LICENSE')) {
+      throw new Error('No se pudo verificar el texto de licencia GPLv3.')
+    }
     fs.writeFileSync(REGISTRO, JSON.stringify({
       version: VERSION,
       archiveSha256: SHA256_ARCHIVO,
