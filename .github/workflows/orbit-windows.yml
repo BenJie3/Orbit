@@ -59,3 +59,6 @@ jobs:
           if (!(Test-Path 'dist/orbit-1.0.0-Setup.exe')) { throw 'Missing Windows installer' }
           if (!(Test-Path 'dist/win-unpacked/resources/video-engine/ffmpeg.exe')) { throw 'Missing packaged FFmpeg' }
           & 'dist/win-unpacked/resources/video-engine/ffmpeg.exe' -hide_banner -version | Select-Object -First 1
+          $setup = (Get-Item 'dist/orbit-1.0.0-Setup.exe').Length / 1MB
+          $engine = (Get-Item 'dist/win-unpacked/resources/video-engine/ffmpeg.exe').Length / 1MB
+          Write-Host ('Instalador MB: {0:N1}; FFmpeg MB: {1:N1}' -f $setup, $engine)
