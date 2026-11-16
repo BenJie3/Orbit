@@ -26,6 +26,7 @@ import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
 import { generarPdfDesdeTexto, MAX_CARACTERES_TXT_PDF } from './text-to-pdf'
 import { recortarVideoConFfmpeg } from './video-clip'
 import { compararVersiones } from './update-version'
+import { formatoImagenCalidad, procesarImagenConCalidad, type OperacionImagenCalidad } from './image-quality'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -1763,6 +1764,38 @@ if (!instanciaUnica) {
       }
 
       return obtenerEstadoTray(true)
+    })
+
+    // El recorte y la rotación de fotografías se hacen desde la imagen
+    // ORIGINAL usando Sharp, sin pasar por el canvas ni aplicar su JPEG 92%.
+    // Solo se aplica cuando el renderer no ha editado manualmente los píxeles.
+    ipcMain.handle('guardar-imagen-sin-perdida', async (_, datos: {
+      rutaOriginal: string
+      operacion: OperacionImagenCalidad
+      conservarJpg?: boolean
+    }) => {
+      if (!datos || typeof datos.rutaOriginal !== 'string' ||
+          !datos.operacion || !['recortar', 'rotar'].includes(datos.operacion.tipo)) {
+        throw new Error('Los datos de edición de imagen no son válidos.')
+      }
+      const formato = formatoImagenCalidad(path.extname(datos.rutaOriginal), datos.conservarJpg)
+      const sufijo = datos.operacion.tipo === 'recortar' ? '_recorte' : '_rotado'
+      const outPath = obtenerRutaSalida(datos.rutaOriginal, formato, sufijo)
+      const resultado = await procesarImagenConCalidad({
+        rutaOriginal: datos.rutaOriginal,
+        rutaSalida: outPath,
+        operacion: datos.operacion,
+        conservarJpg: datos.conservarJpg
+      })
+      if (shellNotifierProc && shellNotifierProc.stdin.writable) {
+        shellNotifierProc.stdin.write(outPath + '\\n')
+      }
+      registrarArchivoReciente(outPath)
+      notificarToastArchivoGuardado(outPath)
+      console.log('[Orbit Imagen] ' + datos.operacion.tipo + ' -> ' +
+        resultado.formato.toUpperCase() + ' (' + resultado.modo + '), ' +
+        resultado.ancho + 'x' + resultado.alto)
+      return resultado
     })
 
     ipcMain.handle(
