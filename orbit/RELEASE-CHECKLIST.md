@@ -7,6 +7,8 @@ Este documento separa lo **verificado automáticamente** de lo **comprobado manu
 - [x] Compilación Electron/TypeScript en Windows, Node 20.18.0.
 - [x] Pruebas unitarias de selección de wallpapers y gestión de foco.
 - [x] Pruebas del generador TXT→PDF.
+- [ ] Pruebas de píxeles en rotación/recorte PNG, WebP y JPEG→PNG, más orientación EXIF (CI: `npm run test:images`).
+- [ ] Validación visual manual de imagen JPG/JPEG, PNG transparente y WebP: guardar, comparar con original, verificar rotación, coordenadas y metadatos.
 - [x] Pruebas de salida MP4 con copia de pistas, recodificación y archivo sin audio.
 - [x] Instalador NSIS con FFmpeg como recurso separado en el flujo de CI.
 - [ ] Auditoría de integridad del instalador: ejecutar `npm run audit:installer` después de `npm run build:win` y comprobar que no reporte errores.
