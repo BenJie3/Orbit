@@ -71,14 +71,17 @@ export async function generarPdfDesdeTexto(contenido: string): Promise<Uint8Arra
       continue
     }
 
-    let restante = caracteres
-    while (restante.length > caracteresPorLinea) {
-      const corteEspacio = restante.lastIndexOf(' ', caracteresPorLinea)
-      const corte = corteEspacio > caracteresPorLinea / 2 ? corteEspacio + 1 : caracteresPorLinea
-      await nuevaLinea(restante.slice(0, corte).trimEnd())
-      restante = restante.slice(corte)
+    // Trabajar por segmentos acotados: no copiar repetidamente todo el texto
+    // restante, especialmente si el TXT incluye una línea de cientos de KB.
+    let cursor = 0
+    while (cursor < caracteres.length) {
+      const tramo = caracteres.slice(cursor, cursor + caracteresPorLinea)
+      const hayMas = cursor + caracteresPorLinea < caracteres.length
+      const espacio = hayMas ? tramo.lastIndexOf(' ') : -1
+      const corte = espacio > caracteresPorLinea / 2 ? espacio + 1 : tramo.length
+      await nuevaLinea(tramo.slice(0, corte).trimEnd())
+      cursor += corte
     }
-    await nuevaLinea(restante)
   }
 
   return doc.save()
