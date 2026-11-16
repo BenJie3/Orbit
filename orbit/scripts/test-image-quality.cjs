@@ -151,7 +151,7 @@ test('Nunca se sobrescribe el archivo original', async () => {
   // Insertar Orientation=6 en un bloque EXIF APP1 real. Algunos codificadores
   // normalizan esa etiqueta al generar el JPG, anulando el caso de prueba.
   const tiff = Buffer.alloc(6 + 8 + 2 + 12 + 4)
-  tiff.write('Exif\\0\\0', 0, 'binary')
+  Buffer.from([0x45, 0x78, 0x69, 0x66, 0, 0]).copy(tiff, 0)
   tiff.write('II', 6, 'ascii')
   tiff.writeUInt16LE(42, 8)
   tiff.writeUInt32LE(8, 10)
