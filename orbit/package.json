@@ -37,6 +37,7 @@
     "test:video": "node scripts/test-video-clip.cjs",
     "audit:installer": "node scripts/audit-installer.cjs",
     "test:updater": "node scripts/test-update-version.cjs",
+    "test:images": "node scripts/test-image-quality.cjs",
     "setup:video": "node scripts/prepare-video-engine.cjs",
 
     "start": "electron-vite preview",
