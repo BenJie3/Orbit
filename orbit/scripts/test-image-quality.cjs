@@ -4,6 +4,8 @@ const os = require('node:os')
 const path = require('node:path')
 const ts = require('typescript')
 const sharp = require('sharp')
+// Evita que la caché de libvips retenga archivos de pruebas en Windows.
+sharp.cache(false)
 
 const source = fs.readFileSync(path.join(__dirname, '../src/main/image-quality.ts'), 'utf8')
 const js = ts.transpileModule(source, {
@@ -175,6 +177,6 @@ test('Nunca se sobrescribe el archivo original', async () => {
   .finally(async () => {
     // En Windows libvips puede cerrar los manejadores unas milésimas más tarde.
     await new Promise((resolve) => setTimeout(resolve, 300))
-    await fs.promises.rm(tmp, { recursive: true, force: true, maxRetries: 6, retryDelay: 300 })
+    await fs.promises.rm(tmp, { recursive: true, force: true, maxRetries: 2, retryDelay: 200 })
       .catch((error) => console.warn('[Orbit] Limpieza temporal diferida:', error.message))
   })
