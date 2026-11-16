@@ -39,6 +39,8 @@ jobs:
         run: npm run test:focus
       - name: Test TXT-to-PDF and media export regressions
         run: npm run test:conversiones
+      - name: Test lossless image crop, rotation and EXIF preservation
+        run: npm run test:images
       - name: Test stable and prerelease updater version ordering
         run: npm run test:updater
       - name: Cache pinned video engine
