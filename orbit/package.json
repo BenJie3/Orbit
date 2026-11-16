@@ -32,6 +32,7 @@
 
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
     "test:wallpaper": "node scripts/test-wallpaper-selection.cjs && node scripts/test-wallpaper-colors.cjs",
+    "test:focus": "node scripts/test-window-focus.cjs",
 
     "start": "electron-vite preview",
 
