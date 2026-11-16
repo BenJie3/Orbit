@@ -2,7 +2,7 @@
 import { ref, shallowRef, computed, onMounted, nextTick, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
-import { validarRangoRecorte, elegirFormatoVideo, formatoAudioDisponible } from './media-export'
+import { formatoAudioDisponible } from './media-export'
 
 if (typeof (Promise as any).try !== 'function') {
   ;(Promise as any).try = function (callback: Function, ...args: any[]) {
