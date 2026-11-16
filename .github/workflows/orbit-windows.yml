@@ -35,6 +35,8 @@ jobs:
         run: node scripts/check-native.cjs
       - name: Test Wallpaper Engine config selection
         run: npm run test:wallpaper
+      - name: Test focused, passive and hidden window transitions
+        run: npm run test:focus
       - name: Type-check main, preload and renderer
         run: npm run typecheck
       - name: Build Electron application (no installer and no release)
