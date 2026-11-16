@@ -518,7 +518,14 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
   // de Windows. Conservar el tema Zafiro permite diagnosticar el origen.
   temaActual = { ...TEMA_ZAFIRO_DEFAULT }
   ultimaFirmaWallpaper = firmaActual
-  informarOrigenTema('Zafiro (ninguna imagen de fondo identificada)')
+  const razon = infoWE
+    ? 'preview: ' + Boolean(infoWE.rutaPreview) +
+      ', schemecolor: ' + Boolean(infoWE.schemeColor) +
+      ', video: ' + (infoWE.rutaVideo ? path.extname(infoWE.rutaVideo) : 'no')
+    : rutaActivaCli
+      ? 'Fondo activo sin miniatura ni metadatos útiles (extensión: ' + path.extname(rutaActivaCli) + ')'
+      : 'Wallpaper Engine no devolvió un fondo activo legible'
+  informarOrigenTema('Zafiro (ninguna imagen de fondo identificada)', razon)
   return true
 }
 
