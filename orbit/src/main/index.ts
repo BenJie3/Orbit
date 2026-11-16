@@ -20,6 +20,7 @@ import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
 import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallpaper-selection'
+import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wallpaper-colors'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -163,8 +164,8 @@ function hslToHex(h: number, s: number, l: number): string {
   return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')
 }
 
-function construirTemaDesdeHsl(h: number, s: number): TemaOrbit {
-  const satViva = Math.max(68, Math.min(92, s))
+function construirTemaDesdeHsl(h: number, s: number, neutro = false): TemaOrbit {
+  const satViva = neutro ? 10 : Math.max(48, Math.min(92, s))
   const hSecundario = (h + 24) % 360
   const primario = hslToHex(h, satViva, 52)
   const secundario = hslToHex(hSecundario, satViva, 44)
@@ -173,8 +174,8 @@ function construirTemaDesdeHsl(h: number, s: number): TemaOrbit {
   const inactivoFin = hslToHex(hSecundario, Math.min(78, satViva), 78)
   const textoInactivo = hslToHex(h, 45, 11)
 
-  const [cr, cg, cb] = hslToRgb(h, 52, 12)
-  const [br, bg, bb] = hslToRgb(h, 80, 82)
+  const [cr, cg, cb] = hslToRgb(h, neutro ? 10 : 52, 12)
+  const [br, bg, bb] = hslToRgb(h, neutro ? 12 : 80, 82)
   const [sr, sg, sb] = hslToRgb(h, satViva, 52)
 
   return {
@@ -241,7 +242,7 @@ function localizarConfigWallpaperEngine(): string {
   return ''
 }
 
-type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string; monitor: string; origen: string }
+type SeleccionWallpaper = { rutaPreview: string; rutaVideo: string; schemeColor: unknown; firma: string; monitor: string; origen: string }
 let cacheSeleccionWallpaper: { firmaArchivo: string; seleccion: SeleccionWallpaper | null } | null = null
 let rutaCliWallpaper: string | null = null
 let ultimaConsultaCli = 0
@@ -259,7 +260,8 @@ function resolverProyectoWallpaper(
   if (!fs.existsSync(rutaArchivo)) return null
   const carpeta = fs.statSync(rutaArchivo).isDirectory() ? rutaArchivo : path.dirname(rutaArchivo)
   let rutaPreview = ''
-  let schemeColor = ''
+  let rutaVideo = /\.(mp4|webm|mov|mkv|avi|wmv|m4v|mpeg|mpg)$/i.test(rutaArchivo) ? rutaArchivo : ''
+  let schemeColor: unknown = ''
 
   const proyectoPath = path.join(carpeta, 'project.json')
   if (fs.existsSync(proyectoPath)) {
@@ -271,13 +273,19 @@ function resolverProyectoWallpaper(
       }
       const esquema = proyecto.general?.properties?.schemecolor?.value ??
         proyecto.schemecolor
-      if (typeof esquema === 'string') schemeColor = esquema
+      if (esquema !== undefined && esquema !== null) schemeColor = esquema
+      if (typeof proyecto.file === 'string') {
+        const contenido = path.resolve(carpeta, proyecto.file)
+        if (/\.(mp4|webm|mov|mkv|avi|wmv|m4v|mpeg|mpg)$/i.test(contenido) && fs.existsSync(contenido)) {
+          rutaVideo = contenido
+        }
+      }
     } catch (error) {
       console.warn('[Orbit Wallpaper] No se pudo leer project.json:', error)
     }
   }
   if (!rutaPreview) {
-    for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
+    for (const nombre of ['preview.jpg', 'preview.jpeg', 'preview.png', 'preview.webp', 'preview.gif', 'preview.avif', 'thumb.jpg']) {
       const candidato = path.join(carpeta, nombre)
       if (fs.existsSync(candidato)) {
         rutaPreview = candidato
@@ -288,9 +296,9 @@ function resolverProyectoWallpaper(
   if (!rutaPreview && /\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo)) {
     rutaPreview = rutaArchivo
   }
-  if (!rutaPreview && !schemeColor) return null
+  if (!rutaPreview && !schemeColor && !rutaVideo) return null
   return {
-    rutaPreview, schemeColor, firma: origen + ':' + monitor + ':' + rutaArchivo + ':' + firma,
+    rutaPreview, rutaVideo, schemeColor, firma: origen + ':' + monitor + ':' + rutaArchivo + ':' + firma,
     monitor, origen
   }
 }
