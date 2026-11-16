@@ -183,6 +183,15 @@ contextBridge.exposeInMainWorld('api', {
   leerArchivoBinario: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-archivo-binario', rutaOriginal) as Promise<Uint8Array>,
 
+  recortarVideoCompatible: (opciones: {
+    rutaOriginal: string
+    inicioSeg: number
+    finSeg: number
+    duracionTotal: number
+    velocidad: number
+    volumen: number
+  }) => ipcRenderer.invoke('recortar-video-compatible', opciones) as Promise<{ ruta: string; modo: string }>,
+
   guardarMultimediaBytes: (
     bytes: Uint8Array,
     extDestino: string,
