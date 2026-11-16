@@ -47,7 +47,7 @@
 
     "build:unpack": "npm run build && electron-builder --dir",
 
-    "build:win": "npm run typecheck && node scripts/prepare-video-engine.cjs && node scripts/generate-icon.cjs && electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win",
+    "build:win": "npm run typecheck && node scripts/prepare-video-engine.cjs && node scripts/generate-icon.cjs && electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win --publish never",
 
     "build:mac": "npm run build && electron-builder --mac",
 
