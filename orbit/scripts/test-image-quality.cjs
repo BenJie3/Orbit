@@ -148,12 +148,33 @@ test('Nunca se sobrescribe el archivo original', async () => {
   await sharp(rgba, { raw: { width, height, channels: 4 } }).webp({ quality: 78 }).toFile(webp)
   await sharp(rgba, { raw: { width, height, channels: 4 } }).flatten({ background: '#ffffff' })
     .jpeg({ quality: 82 }).toFile(jpg)
-  await sharp(rgba, { raw: { width, height, channels: 4 } }).flatten({ background: '#ffffff' })
-    .jpeg({ quality: 82 }).withExif({ IFD0: { Orientation: '6', Artist: 'Orbit QA' } }).toFile(jpegExif)
+  // Insertar Orientation=6 en un bloque EXIF APP1 real. Algunos codificadores
+  // normalizan esa etiqueta al generar el JPG, anulando el caso de prueba.
+  const tiff = Buffer.alloc(6 + 8 + 2 + 12 + 4)
+  tiff.write('Exif\\0\\0', 0, 'binary')
+  tiff.write('II', 6, 'ascii')
+  tiff.writeUInt16LE(42, 8)
+  tiff.writeUInt32LE(8, 10)
+  tiff.writeUInt16LE(1, 14)
+  tiff.writeUInt16LE(0x0112, 16)
+  tiff.writeUInt16LE(3, 18)
+  tiff.writeUInt32LE(1, 20)
+  tiff.writeUInt16LE(6, 24)
+  tiff.writeUInt32LE(0, 28)
+  const marker = Buffer.from([0xff, 0xe1, 0, tiff.length + 2])
+  const baseline = await fs.promises.readFile(jpg)
+  await fs.promises.writeFile(jpegExif, Buffer.concat([
+    baseline.subarray(0, 2), marker, tiff, baseline.subarray(2)
+  ]))
   for (const t of tests) {
     await t.fn()
     console.log('[OK] ' + t.name)
   }
   console.log('[Orbit] Calidad de imagen: ' + tests.length + ' pruebas superadas.')
 })().catch((error) => { console.error(error); process.exitCode = 1 })
-  .finally(() => fs.rmSync(tmp, { recursive: true, force: true }))
+  .finally(async () => {
+    // En Windows libvips puede cerrar los manejadores unas milésimas más tarde.
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await fs.promises.rm(tmp, { recursive: true, force: true, maxRetries: 6, retryDelay: 300 })
+      .catch((error) => console.warn('[Orbit] Limpieza temporal diferida:', error.message))
+  })
