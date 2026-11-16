@@ -168,6 +168,14 @@ declare global {
         nombre: string
       } | null>
       leerArchivoBinario: (rutaOriginal: string) => Promise<Uint8Array>
+      recortarVideoCompatible: (opciones: {
+        rutaOriginal: string
+        inicioSeg: number
+        finSeg: number
+        duracionTotal: number
+        velocidad: number
+        volumen: number
+      }) => Promise<{ ruta: string; modo: string }>
       guardarMultimediaBytes: (
         bytes: Uint8Array,
         extDestino: string,
@@ -1741,169 +1749,6 @@ const extraerAudioAWavDirecto = async (
 }
 
 // --- FUNCIÓN PRO A: RECORTAR CLIP DE VIDEO CON IMAGEN Y SONIDO ---
-const recortarClipDeVideo = async (
-  videoUrl: string,
-  inicioSeg: number,
-  finSeg: number,
-  gananciaVolumen = 1.0,
-  velocidad = 1.0
-): Promise<{ bytes: Uint8Array; ext: string }> => {
-  const video = document.createElement('video')
-  video.playsInline = true
-  video.preload = 'auto'
-  // Blob URL del archivo local: no es necesario leer el vídeo completo a RAM.
-  let stream: MediaStream | null = null
-  let canvasStream: MediaStream | null = null
-  let audioCtx: AudioContext | null = null
-  let recorder: MediaRecorder | null = null
-  let timerFrames: number | null = null
-  let timerLimite: number | null = null
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        limpiar()
-        reject(new Error('El vídeo no entregó metadatos en 15 segundos.'))
-      }, 15000)
-      const cargado = () => { limpiar(); resolve() }
-      const fallo = () => { limpiar(); reject(new Error('El formato o códec de este vídeo no es compatible con Chromium.')) }
-      const limpiar = () => {
-        window.clearTimeout(timeout)
-        video.removeEventListener('loadedmetadata', cargado)
-        video.removeEventListener('error', fallo)
-      }
-      video.addEventListener('loadedmetadata', cargado)
-      video.addEventListener('error', fallo)
-      video.src = videoUrl
-      video.load()
-    })
-
-    const intervalo = validarRangoRecorte(inicioSeg, finSeg, video.duration, velocidad)
-    if (Math.abs(video.currentTime - intervalo.inicio) > 0.02) {
-      await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => {
-          limpiar()
-          reject(new Error('No se pudo buscar el inicio del vídeo en 10 segundos.'))
-        }, 10000)
-        const localizado = () => { limpiar(); resolve() }
-        const limpiar = () => {
-          window.clearTimeout(timeout)
-          video.removeEventListener('seeked', localizado)
-        }
-        video.addEventListener('seeked', localizado)
-        video.currentTime = intervalo.inicio
-      })
-    }
-
-    video.playbackRate = velocidad
-    const w = video.videoWidth
-    const h = video.videoHeight
-    if (!w || !h) throw new Error('No se pudieron determinar las dimensiones del vídeo.')
-    const canvas = document.createElement('canvas')
-    canvas.width = w
-    canvas.height = h
-    const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('No se pudo iniciar el lienzo de vídeo.')
-    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) ctx.drawImage(video, 0, 0, w, h)
-
-    canvasStream = canvas.captureStream(30)
-    audioCtx = new AudioContext()
-    const source = audioCtx.createMediaElementSource(video)
-    const gain = audioCtx.createGain()
-    gain.gain.value = Math.max(0, Math.min(2, gananciaVolumen))
-    const audioDestino = audioCtx.createMediaStreamDestination()
-    source.connect(gain)
-    gain.connect(audioDestino)
-    stream = new MediaStream([...canvasStream.getVideoTracks(), ...audioDestino.stream.getAudioTracks()])
-
-    const elegido = elegirFormatoVideo((mime) => MediaRecorder.isTypeSupported(mime))
-    recorder = new MediaRecorder(stream, { mimeType: elegido.mime, videoBitsPerSecond: 4000000 })
-    const grabador = recorder
-    const partes: BlobPart[] = []
-    let grabacionTerminada = false
-    let rechazarGrabacion: (motivo: Error) => void = () => {}
-    const resultado = new Promise<Uint8Array>((resolve, reject) => {
-      rechazarGrabacion = reject
-      grabador.ondataavailable = (e) => {
-        if (e.data.size > 0) partes.push(e.data)
-      }
-      grabador.onstop = async () => {
-        if (grabacionTerminada) return
-        grabacionTerminada = true
-        try {
-          const blob = new Blob(partes, { type: elegido.mime })
-          if (blob.size < 1024) throw new Error('El codificador generó un clip vacío.')
-          resolve(new Uint8Array(await blob.arrayBuffer()))
-        } catch (error) {
-          reject(error)
-        }
-      }
-      grabador.onerror = () => reject(new Error('El codificador de vídeo notificó un error.'))
-    })
-    // Evita rechazos sin observador si video.play() falla antes de await resultado.
-    void resultado.catch(() => {})
-
-    const detenerGrabacion = () => {
-      if (grabador.state === 'recording') {
-        video.pause()
-        grabador.stop()
-      }
-    }
-    video.addEventListener('ended', detenerGrabacion)
-    video.addEventListener('error', () => {
-      rechazarGrabacion(new Error('Error de decodificación durante el recorte del vídeo.'))
-      detenerGrabacion()
-    })
-
-    // No usar requestAnimationFrame en un proceso que puede quedar oculto:
-    // el intervalo también revisa la posición incluso cuando cambia el foco.
-    timerFrames = window.setInterval(() => {
-      if (grabador.state !== 'recording') return
-      if (video.ended || video.currentTime >= intervalo.fin - 0.025) {
-        detenerGrabacion()
-        return
-      }
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        try { ctx.drawImage(video, 0, 0, w, h) } catch {}
-      }
-    }, 33)
-
-    // Evitar una espera infinita si MediaRecorder deja de emitir eventos.
-    timerLimite = window.setTimeout(() => {
-      rechazarGrabacion(new Error('La grabación excedió el tiempo límite previsto.'))
-      detenerGrabacion()
-    }, Math.min(30 * 60 * 1000, Math.max(15000, intervalo.duracionSalida * 2000 + 12000)))
-
-    if (audioCtx.state === 'suspended') {
-      await Promise.race([
-        audioCtx.resume().catch(() => {}),
-        new Promise<void>((resolve) => window.setTimeout(resolve, 1400))
-      ])
-    }
-
-    grabador.start(250)
-    try {
-      await video.play()
-    } catch (error) {
-      throw new Error('No se pudo reproducir el vídeo para recortarlo. Comprueba que Windows admite su códec.', { cause: error })
-    }
-    const bytes = await resultado
-    return { bytes, ext: elegido.ext }
-  } finally {
-    video.pause()
-    if (timerFrames !== null) window.clearInterval(timerFrames)
-    if (timerLimite !== null) window.clearTimeout(timerLimite)
-    if (recorder && recorder.state !== 'inactive') {
-      try { recorder.stop() } catch {}
-    }
-    stream?.getTracks().forEach((track) => track.stop())
-    canvasStream?.getTracks().forEach((track) => track.stop())
-    if (audioCtx) await audioCtx.close().catch(() => {})
-    video.removeAttribute('src')
-    video.load()
-  }
-}
-
 const convertirVideoAGif = async (
   videoUrl: string,
   inicioSeg: number,
@@ -2394,20 +2239,16 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         if (videoPlayerRef.value && !videoPlayerRef.value.paused) {
           videoPlayerRef.value.pause()
         }
-        const clip = await recortarClipDeVideo(
-          mediaUrlActiva.value,
-          inicioCorteSeg.value,
-          finCorteSeg.value,
-          volumenMediaPct.value / 100,
-          velocidadMedia.value
-        )
-        const guardado = await window.api.guardarMultimediaBytes(
-          clip.bytes,
-          clip.ext,
-          rutaArchivoActivo.value,
-          '_clip'
-        )
-        if (!guardado) throw new Error('No se pudo escribir el clip en la carpeta de origen.')
+        // FFmpeg trabaja en disco fuera del renderer y evita la recaptura
+        // cuadro a cuadro, que tardaba lo mismo que duraba el clip.
+        await window.api.recortarVideoCompatible({
+          rutaOriginal: rutaArchivoActivo.value,
+          inicioSeg: inicioCorteSeg.value,
+          finSeg: finCorteSeg.value,
+          duracionTotal: duracionMedia.value,
+          velocidad: velocidadMedia.value,
+          volumen: volumenMediaPct.value / 100
+        })
       } else {
         const destino = formatoAudioDisponible(formatoSalidaOpcional || 'wav')
         const bytesOrigen = bytesMultimediaOriginal.value ??
