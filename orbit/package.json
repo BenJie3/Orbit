@@ -35,6 +35,7 @@
     "test:focus": "node scripts/test-window-focus.cjs",
     "test:conversiones": "node scripts/test-text-to-pdf.cjs && node scripts/test-media-export.cjs",
     "test:video": "node scripts/test-video-clip.cjs",
+    "audit:installer": "node scripts/audit-installer.cjs",
     "setup:video": "node scripts/prepare-video-engine.cjs",
 
     "start": "electron-vite preview",
