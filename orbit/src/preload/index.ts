@@ -164,6 +164,12 @@ contextBridge.exposeInMainWorld('api', {
   leerDocumentoTexto: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-documento-texto', rutaOriginal),
 
+  convertirTxtAPdf: (rutaOriginal: string) =>
+    ipcRenderer.invoke('convertir-txt-a-pdf', rutaOriginal) as Promise<boolean>,
+
+  guardarTextoComoPdf: (texto: string, rutaOriginal: string, sufijo?: string) =>
+    ipcRenderer.invoke('guardar-texto-como-pdf', texto, rutaOriginal, sufijo) as Promise<boolean>,
+
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
 
