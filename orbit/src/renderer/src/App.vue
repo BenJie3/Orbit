@@ -2,6 +2,7 @@
 import { ref, shallowRef, computed, onMounted, nextTick, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
+import { validarRangoRecorte, elegirFormatoVideo, formatoAudioDisponible } from './media-export'
 
 if (typeof (Promise as any).try !== 'function') {
   ;(Promise as any).try = function (callback: Function, ...args: any[]) {
@@ -1747,130 +1748,155 @@ const recortarClipDeVideo = async (
   velocidad = 1.0
 ): Promise<{ bytes: Uint8Array; ext: string }> => {
   const video = document.createElement('video')
-  video.src = videoUrl
   video.playsInline = true
-  video.crossOrigin = 'anonymous'
   video.preload = 'auto'
+  // Blob URL del archivo local: no es necesario leer el vídeo completo a RAM.
   let stream: MediaStream | null = null
+  let canvasStream: MediaStream | null = null
   let audioCtx: AudioContext | null = null
   let recorder: MediaRecorder | null = null
-  let frameId = 0
+  let timerFrames: number | null = null
+  let timerLimite: number | null = null
 
   try {
     await new Promise<void>((resolve, reject) => {
-      video.onloadedmetadata = () => resolve()
-      video.onerror = () => reject(new Error('No se pudo cargar el video para recortar'))
+      const timeout = window.setTimeout(() => {
+        limpiar()
+        reject(new Error('El vídeo no entregó metadatos en 15 segundos.'))
+      }, 15000)
+      const cargado = () => { limpiar(); resolve() }
+      const fallo = () => { limpiar(); reject(new Error('El formato o códec de este vídeo no es compatible con Chromium.')) }
+      const limpiar = () => {
+        window.clearTimeout(timeout)
+        video.removeEventListener('loadedmetadata', cargado)
+        video.removeEventListener('error', fallo)
+      }
+      video.addEventListener('loadedmetadata', cargado)
+      video.addEventListener('error', fallo)
+      video.src = videoUrl
+      video.load()
     })
 
-    const duracionTotal = video.duration
-    if (!Number.isFinite(duracionTotal) || duracionTotal <= 0) {
-      throw new Error('No se puede recortar un video sin duración conocida')
-    }
-    const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.1))
-    const tEnd = Math.min(duracionTotal, finSeg)
-    if (tEnd <= tStart) throw new Error('El final del recorte debe ser posterior al inicio')
-
-    // Registrar el evento ANTES de cambiar currentTime evita perder 'seeked'.
-    // Si ya estamos en el fotograma inicial, no esperar un evento que no ocurrirá.
-    if (Math.abs(video.currentTime - tStart) > 0.02) {
+    const intervalo = validarRangoRecorte(inicioSeg, finSeg, video.duration, velocidad)
+    if (Math.abs(video.currentTime - intervalo.inicio) > 0.02) {
       await new Promise<void>((resolve, reject) => {
-        const onSeek = () => {
-          window.clearTimeout(timeout)
-          video.removeEventListener('seeked', onSeek)
-          resolve()
-        }
         const timeout = window.setTimeout(() => {
-          video.removeEventListener('seeked', onSeek)
-          reject(new Error('No se pudo ubicar el inicio del clip'))
+          limpiar()
+          reject(new Error('No se pudo buscar el inicio del vídeo en 10 segundos.'))
         }, 10000)
-        video.addEventListener('seeked', onSeek)
-        video.currentTime = tStart
+        const localizado = () => { limpiar(); resolve() }
+        const limpiar = () => {
+          window.clearTimeout(timeout)
+          video.removeEventListener('seeked', localizado)
+        }
+        video.addEventListener('seeked', localizado)
+        video.currentTime = intervalo.inicio
       })
     }
-    video.playbackRate = velocidad
 
-    const w = video.videoWidth || 1280
-    const h = video.videoHeight || 720
+    video.playbackRate = velocidad
+    const w = video.videoWidth
+    const h = video.videoHeight
+    if (!w || !h) throw new Error('No se pudieron determinar las dimensiones del vídeo.')
     const canvas = document.createElement('canvas')
     canvas.width = w
     canvas.height = h
     const ctx = canvas.getContext('2d')
-    if (!ctx) throw new Error('No fue posible iniciar la captura del video')
-    ctx.drawImage(video, 0, 0, w, h)
+    if (!ctx) throw new Error('No se pudo iniciar el lienzo de vídeo.')
+    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) ctx.drawImage(video, 0, 0, w, h)
 
-    const canvasStream = canvas.captureStream(30)
-    audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
-    const sourceNode = audioCtx.createMediaElementSource(video)
-    const gainNode = audioCtx.createGain()
-    gainNode.gain.value = gananciaVolumen
-    const destAudio = audioCtx.createMediaStreamDestination()
-    sourceNode.connect(gainNode)
-    gainNode.connect(destAudio)
+    canvasStream = canvas.captureStream(30)
+    audioCtx = new AudioContext()
+    const source = audioCtx.createMediaElementSource(video)
+    const gain = audioCtx.createGain()
+    gain.gain.value = Math.max(0, Math.min(2, gananciaVolumen))
+    const audioDestino = audioCtx.createMediaStreamDestination()
+    source.connect(gain)
+    gain.connect(audioDestino)
+    stream = new MediaStream([...canvasStream.getVideoTracks(), ...audioDestino.stream.getAudioTracks()])
 
-    stream = new MediaStream([
-      ...canvasStream.getVideoTracks(),
-      ...destAudio.stream.getAudioTracks()
-    ])
-
-    const candidatos = [
-      { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
-      { mime: 'video/mp4', ext: 'mp4' },
-      { mime: 'video/webm;codecs=vp9,opus', ext: 'webm' },
-      { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
-      { mime: 'video/webm', ext: 'webm' }
-    ]
-    const elegido = candidatos.find((c) => MediaRecorder.isTypeSupported(c.mime))
-    if (!elegido) throw new Error('Este equipo no dispone de un codificador de video compatible')
-
-    const chunks: BlobPart[] = []
-    recorder = new MediaRecorder(stream, {
-      mimeType: elegido.mime,
-      videoBitsPerSecond: 4500000
-    })
+    const elegido = elegirFormatoVideo((mime) => MediaRecorder.isTypeSupported(mime))
+    recorder = new MediaRecorder(stream, { mimeType: elegido.mime, videoBitsPerSecond: 4000000 })
     const grabador = recorder
-    grabador.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data)
-    }
-    const promesaGrabacion = new Promise<Uint8Array>((resolve, reject) => {
+    const partes: BlobPart[] = []
+    let grabacionTerminada = false
+    let rechazarGrabacion: (motivo: Error) => void = () => {}
+    const resultado = new Promise<Uint8Array>((resolve, reject) => {
+      rechazarGrabacion = reject
+      grabador.ondataavailable = (e) => {
+        if (e.data.size > 0) partes.push(e.data)
+      }
       grabador.onstop = async () => {
+        if (grabacionTerminada) return
+        grabacionTerminada = true
         try {
-          const blob = new Blob(chunks, { type: elegido.mime })
+          const blob = new Blob(partes, { type: elegido.mime })
+          if (blob.size < 1024) throw new Error('El codificador generó un clip vacío.')
           resolve(new Uint8Array(await blob.arrayBuffer()))
         } catch (error) {
           reject(error)
         }
       }
-      grabador.onerror = () => reject(new Error('Falló la codificación del clip'))
+      grabador.onerror = () => reject(new Error('El codificador de vídeo notificó un error.'))
+    })
+    // Evita rechazos sin observador si video.play() falla antes de await resultado.
+    void resultado.catch(() => {})
+
+    const detenerGrabacion = () => {
+      if (grabador.state === 'recording') {
+        video.pause()
+        grabador.stop()
+      }
+    }
+    video.addEventListener('ended', detenerGrabacion)
+    video.addEventListener('error', () => {
+      rechazarGrabacion(new Error('Error de decodificación durante el recorte del vídeo.'))
+      detenerGrabacion()
     })
 
-    const pintarFrame = () => {
-      if (!recorder || recorder.state !== 'recording') return
-      if (video.currentTime >= tEnd || video.ended) {
-        video.pause()
-        recorder.stop()
+    // No usar requestAnimationFrame en un proceso que puede quedar oculto:
+    // el intervalo también revisa la posición incluso cuando cambia el foco.
+    timerFrames = window.setInterval(() => {
+      if (grabador.state !== 'recording') return
+      if (video.ended || video.currentTime >= intervalo.fin - 0.025) {
+        detenerGrabacion()
         return
       }
-      ctx.drawImage(video, 0, 0, w, h)
-      frameId = window.requestAnimationFrame(pintarFrame)
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
+        try { ctx.drawImage(video, 0, 0, w, h) } catch {}
+      }
+    }, 33)
+
+    // Evitar una espera infinita si MediaRecorder deja de emitir eventos.
+    timerLimite = window.setTimeout(() => {
+      rechazarGrabacion(new Error('La grabación excedió el tiempo límite previsto.'))
+      detenerGrabacion()
+    }, Math.min(30 * 60 * 1000, Math.max(15000, intervalo.duracionSalida * 2000 + 12000)))
+
+    if (audioCtx.state === 'suspended') {
+      await Promise.race([
+        audioCtx.resume().catch(() => {}),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 1400))
+      ])
     }
 
-    grabador.start(100)
+    grabador.start(250)
     try {
       await video.play()
     } catch (error) {
-      grabador.stop()
-      // Evitar una promesa de grabación rechazada sin observador.
-      await promesaGrabacion.catch(() => {})
-      throw error
+      throw new Error('No se pudo reproducir el vídeo para recortarlo. Comprueba que Windows admite su códec.', { cause: error })
     }
-    pintarFrame()
-    const bytes = await promesaGrabacion
+    const bytes = await resultado
     return { bytes, ext: elegido.ext }
   } finally {
     video.pause()
-    if (frameId) window.cancelAnimationFrame(frameId)
-    if (recorder?.state === 'recording') recorder.stop()
-    stream?.getTracks().forEach((t) => t.stop())
+    if (timerFrames !== null) window.clearInterval(timerFrames)
+    if (timerLimite !== null) window.clearTimeout(timerLimite)
+    if (recorder && recorder.state !== 'inactive') {
+      try { recorder.stop() } catch {}
+    }
+    stream?.getTracks().forEach((track) => track.stop())
+    canvasStream?.getTracks().forEach((track) => track.stop())
     if (audioCtx) await audioCtx.close().catch(() => {})
     video.removeAttribute('src')
     video.load()
