@@ -24,6 +24,7 @@ import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallp
 import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wallpaper-colors'
 import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
 import { generarPdfDesdeTexto, MAX_CARACTERES_TXT_PDF } from './text-to-pdf'
+import { recortarVideoConFfmpeg } from './video-clip'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -2046,6 +2047,44 @@ if (!instanciaUnica) {
         return new Uint8Array(0)
       }
     })
+
+    // Ejecutar FFmpeg fuera de Chromium: copia de pistas MP4 en segundos cuando
+    // son H.264/AAC, o recodificación cuando el origen requiere convertirlas.
+    // No cargar el archivo entero a memoria ni usar una captura a tiempo real.
+    ipcMain.handle(
+      'recortar-video-compatible',
+      async (_, opciones: {
+        rutaOriginal: string
+        inicioSeg: number
+        finSeg: number
+        duracionTotal: number
+        velocidad: number
+        volumen: number
+      }) => {
+        const ffmpeg = app.isPackaged
+          ? path.join(process.resourcesPath, 'video-engine', 'ffmpeg.exe')
+          : path.join(app.getAppPath(), 'build', 'video-engine', 'ffmpeg.exe')
+        const salida = obtenerRutaSalida(opciones.rutaOriginal, 'mp4', '_clip')
+        const modo = await recortarVideoConFfmpeg({
+          origen: opciones.rutaOriginal,
+          salida,
+          inicioSeg: opciones.inicioSeg,
+          finSeg: opciones.finSeg,
+          duracionTotal: opciones.duracionTotal,
+          velocidad: opciones.velocidad,
+          volumen: opciones.volumen,
+          ffmpeg
+        })
+        if (shellNotifierProc && shellNotifierProc.stdin.writable) {
+          shellNotifierProc.stdin.write(salida + '\n')
+        }
+        registrarArchivoReciente(salida)
+        notificarToastArchivoGuardado(salida)
+        console.log('[Orbit Video] Clip MP4 verificado; modo: ' + modo + '; tamaño: ' +
+          (await fs.promises.stat(salida)).size + ' bytes')
+        return { ruta: salida, modo }
+      }
+    )
 
     ipcMain.handle(
       'guardar-multimedia-bytes',
