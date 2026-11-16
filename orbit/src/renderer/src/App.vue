@@ -62,10 +62,6 @@ if (typeof (RegExp as any).escape !== 'function') {
 ;(window as any).Worker = undefined
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 
-window.requestAnimationFrame = (cb: FrameRequestCallback): number => {
-  return window.setTimeout(() => cb(performance.now()), 0)
-}
-
 interface SegmentoTexto {
   texto: string
   bold?: boolean
@@ -159,6 +155,8 @@ declare global {
         rutaOriginal: string
       ) => Promise<boolean>
       leerDocumentoTexto: (rutaOriginal: string) => Promise<BloqueDocumento[]>
+      convertirTxtAPdf: (rutaOriginal: string) => Promise<boolean>
+      guardarTextoComoPdf: (texto: string, rutaOriginal: string, sufijo?: string) => Promise<boolean>
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
       unirPdfsBackend: (rutasPdfs: string[]) => Promise<boolean>
       convertirImagenesAPdfUnico: (rutasImagenes: string[]) => Promise<boolean>
@@ -2605,13 +2603,8 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         | 'txt'
         | 'pdf'
       if (destino === 'pdf') {
-        const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
-        await window.api.guardarPaginasComoPdf(
-          paginasPng,
-          rutaArchivoActivo.value,
-          undefined,
-          '_editado'
-        )
+        const guardado = await window.api.guardarTextoComoPdf(textoEditable.value, rutaArchivoActivo.value, '_editado')
+        if (!guardado) throw new Error('No se pudo guardar el PDF de texto.')
       } else {
         await window.api.guardarTextoDocumento(bloques, destino, rutaArchivoActivo.value)
       }
@@ -2722,6 +2715,12 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
       rutaReal
     )
   } else if (esDocTexto) {
+    // El TXT no se rasteriza: evita saturar memoria con páginas PNG grandes.
+    if (ext === 'txt' && formatoDestino === 'pdf') {
+      const guardado = await window.api.convertirTxtAPdf(rutaReal)
+      if (!guardado) throw new Error('La conversión TXT a PDF no pudo completarse.')
+      return
+    }
     const bloques = await window.api.leerDocumentoTexto(rutaReal)
 
     if (formatoDestino === 'txt' || formatoDestino === 'docx') {
