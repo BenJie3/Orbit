@@ -21,6 +21,7 @@ import path from 'path'
 import zlib from 'zlib'
 import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallpaper-selection'
 import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wallpaper-colors'
+import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -651,12 +652,9 @@ function ocultarLienzoCompletamente() {
   modoVentanaActivo = false
   menuTrayVisible = false
 
-  if (toastActivo) return
-
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setIgnoreMouseEvents(true)
-    mainWindow.setSkipTaskbar(true)
-    mainWindow.hide()
+    // Si hay un aviso visible, mantenerlo pero soltar igualmente el foco.
+    ocultarSuperficieOrbit(mainWindow, toastActivo)
   }
 }
 
@@ -742,9 +740,7 @@ function abrirPanelTrayPersonalizado() {
   modoVentanaActivo = true
   menuTrayVisible = true
 
-  mainWindow.setSkipTaskbar(true)
-  mainWindow.setIgnoreMouseEvents(false)
-  mainWindow.showInactive()
+  mostrarSuperficieOrbit(mainWindow)
   mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
   mainWindow.webContents.send('abrir-menu-tray', obtenerEstadoTray(true, x, y))
 }
@@ -1379,9 +1375,7 @@ function mostrarRuedaEnCursor() {
   const posX = Math.max(margen, Math.min(width - margen, cursor.x - dispX))
   const posY = Math.max(margen, Math.min(height - margen, cursor.y - dispY))
 
-  mainWindow.setSkipTaskbar(true)
-  mainWindow.setIgnoreMouseEvents(false)
-  mainWindow.showInactive()
+  mostrarSuperficieOrbit(mainWindow)
   mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
   mainWindow.webContents.send('toggle-menu', {
     mostrar: true,
@@ -1410,7 +1404,7 @@ function createWindow(): BrowserWindow {
     fullscreenable: false,
     alwaysOnTop: true,
     skipTaskbar: true,
-    focusable: true,
+    focusable: false,
     hasShadow: false,
     paintWhenInitiallyHidden: true,
     webPreferences: {
@@ -1532,10 +1526,7 @@ if (!instanciaUnica) {
       modoVentanaActivo = true
       menuTrayVisible = false
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setSkipTaskbar(true)
-        mainWindow.setIgnoreMouseEvents(false)
-        mainWindow.showInactive()
-        mainWindow.focus()
+        mostrarSuperficieOrbit(mainWindow, true)
       }
     })
 
