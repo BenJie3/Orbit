@@ -2647,6 +2647,8 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
     }
   } catch (error) {
     console.error('Error guardando desde herramienta:', error)
+    const detalle = error instanceof Error ? error.message : String(error)
+    await window.api.mostrarErrorOperacion(detalle)
   } finally {
     procesando.value = false
     cerrarVentanaHerramienta()
@@ -2820,6 +2822,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     const detalle =
       error instanceof Error ? `${error.name}: ${error.message}` : JSON.stringify(error)
     console.error(`[ERROR EN CONVERSIÓN]: ${detalle}`)
+    await window.api.mostrarErrorOperacion(detalle)
   } finally {
     procesando.value = false
     showMenu.value = false
