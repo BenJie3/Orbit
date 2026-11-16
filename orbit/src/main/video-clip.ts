@@ -49,10 +49,10 @@ export function metadatosCompatibles(salidaFfmpeg: string): { h264: boolean; aac
 export function argumentosRecorte(p: RecorteVideo, destinoTemporal: string, modo: ModoRecorteVideo): string[] {
   const duracion = validarRecorteVideo(p)
   const comun = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
-    '-ss', String(p.inicioSeg), '-i', p.origen, '-t', String(duracion),
+    '-ss', String(p.inicioSeg), '-i', p.origen,
     '-map', '0:v:0', '-map', '0:a:0?']
   if (modo === 'copia-rapida') {
-    return [...comun, '-c:v', 'copy', '-c:a', 'copy', '-avoid_negative_ts', 'make_zero',
+    return [...comun, '-t', String(duracion), '-c:v', 'copy', '-c:a', 'copy', '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart', '-f', 'mp4', destinoTemporal]
   }
   // La recodificación se reserva para códecs no compatibles o cambios de
@@ -101,14 +101,35 @@ async function ejecutar(ffmpeg: string, args: string[], maxMs: number): Promise<
 }
 
 async function inspeccionar(ffmpeg: string, archivo: string): Promise<ReturnType<typeof metadatosCompatibles>> {
-  // FFmpeg indica códecs al leer la cabecera, sin decodificar todo el vídeo.
-  let salida = ''
-  try {
-    await ejecutar(ffmpeg, ['-hide_banner', '-i', archivo], 15000)
-  } catch (error) {
-    salida = error instanceof Error ? error.message : String(error)
-  }
-  return metadatosCompatibles(salida)
+  // FFmpeg -i termina con código 1 por no tener salida, aunque lee metadatos.
+  // Conservar su stderr para detectar los códecs reales del archivo.
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpeg, ['-hide_banner', '-nostdin', '-i', archivo],
+      { windowsHide: true, shell: false, stdio: ['ignore', 'ignore', 'pipe'] })
+    let salida = ''
+    let finalizado = false
+    const terminar = (error?: Error, resultado?: ReturnType<typeof metadatosCompatibles>) => {
+      if (finalizado) return
+      finalizado = true
+      clearTimeout(timeout)
+      if (error) reject(error)
+      else resolve(resultado!)
+    }
+    const timeout = setTimeout(() => {
+      proc.kill()
+      terminar(new Error('Tiempo agotado inspeccionando el archivo multimedia.'))
+    }, 15000)
+    proc.stderr.on('data', (buffer: Buffer) => {
+      if (salida.length < 120000) salida += buffer.toString('utf8')
+    })
+    proc.once('error', (err) => terminar(err))
+    proc.once('close', () => {
+      const info = metadatosCompatibles(salida)
+      if (!/Stream #.*: Video:/i.test(salida)) {
+        terminar(new Error('No se detectó una pista de vídeo válida.'))
+      } else terminar(undefined, info)
+    })
+  })
 }
 
 export async function recortarVideoConFfmpeg(p: RecorteVideo): Promise<ModoRecorteVideo> {
@@ -122,7 +143,7 @@ export async function recortarVideoConFfmpeg(p: RecorteVideo): Promise<ModoRecor
   if (fs.existsSync(p.salida)) throw new Error('El destino ya existe. Vuelve a intentar el recorte.')
 
   const origen = await inspeccionar(p.ffmpeg, p.origen)
-  if (!origen.h264 && !(await fs.promises.stat(p.origen)).size) {
+  if ((await fs.promises.stat(p.origen)).size === 0) {
     throw new Error('El vídeo de origen está vacío.')
   }
   const permiteCopia = origen.h264 && (!origen.audio || origen.aac) &&
