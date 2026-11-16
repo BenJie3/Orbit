@@ -50,11 +50,12 @@ jobs:
         run: npm run test:video
       - name: Type-check main, preload and renderer
         run: npm run typecheck
-      - name: Build Electron application (no installer and no release)
-        run: npx electron-vite build
-      - name: Generate Sapphire icon
-        run: node scripts/generate-icon.cjs
-      - name: Verify icon output
+      - name: Build Windows installer including bundled video engine (no release)
+        run: npm run build:win
+      - name: Verify NSIS installer and bundled FFmpeg
         shell: pwsh
         run: |
           if (!(Test-Path 'build/icon.png')) { throw 'Missing build/icon.png' }
+          if (!(Test-Path 'dist/orbit-1.0.0-Setup.exe')) { throw 'Missing Windows installer' }
+          if (!(Test-Path 'dist/win-unpacked/resources/video-engine/ffmpeg.exe')) { throw 'Missing packaged FFmpeg' }
+          & 'dist/win-unpacked/resources/video-engine/ffmpeg.exe' -hide_banner -version | Select-Object -First 1
