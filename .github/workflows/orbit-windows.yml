@@ -37,6 +37,8 @@ jobs:
         run: npm run test:wallpaper
       - name: Test focused, passive and hidden window transitions
         run: npm run test:focus
+      - name: Test TXT-to-PDF and media export regressions
+        run: npm run test:conversiones
       - name: Type-check main, preload and renderer
         run: npm run typecheck
       - name: Build Electron application (no installer and no release)
