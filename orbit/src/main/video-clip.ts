@@ -59,9 +59,9 @@ export function argumentosRecorte(p: RecorteVideo, destinoTemporal: string, modo
   // velocidad/volumen. H.264 + AAC + yuv420p es la combinación de mayor
   // compatibilidad de la salida MP4 para Windows.
   const vf = p.velocidad === 1 ? [] : ['-vf', 'setpts=(PTS-STARTPTS)/' + p.velocidad]
-  const af = []
+  const af: string[] = []
   if (p.volumen !== 1 || p.velocidad !== 1) {
-    const filtros = []
+    const filtros: string[] = []
     if (p.velocidad !== 1) filtros.push('atempo=' + p.velocidad)
     if (p.volumen !== 1) filtros.push('volume=' + p.volumen)
     af.push('-af', filtros.join(','))
