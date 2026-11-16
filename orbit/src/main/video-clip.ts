@@ -47,7 +47,7 @@ export function metadatosCompatibles(salidaFfmpeg: string): { h264: boolean; aac
   }
 }
 
-export function argumentosRecorte(p: RecorteVideo, destinoTemporal: string, modo: ModoRecorteVideo): string[] {
+export function argumentosRecorte(p: RecorteVideo, destinoTemporal: string, modo: ModoRecorteVideo, tieneAudio = true): string[] {
   const duracion = validarRecorteVideo(p)
   const comun = ['-hide_banner', '-loglevel', 'error', '-nostdin', '-y',
     '-ss', String(p.inicioSeg), '-i', p.origen,
@@ -61,7 +61,7 @@ export function argumentosRecorte(p: RecorteVideo, destinoTemporal: string, modo
   // compatibilidad de la salida MP4 para Windows.
   const vf = p.velocidad === 1 ? [] : ['-vf', 'setpts=(PTS-STARTPTS)/' + p.velocidad]
   const af: string[] = []
-  if (p.volumen !== 1 || p.velocidad !== 1) {
+  if (tieneAudio && (p.volumen !== 1 || p.velocidad !== 1)) {
     const filtros: string[] = []
     if (p.velocidad !== 1) filtros.push('atempo=' + p.velocidad)
     if (p.volumen !== 1) filtros.push('volume=' + p.volumen)
@@ -157,7 +157,7 @@ export async function recortarVideoConFfmpeg(p: RecorteVideo): Promise<ModoRecor
     const destinoTemporal = path.join(path.dirname(p.salida),
       '.orbit-' + randomUUID() + '.mp4')
     try {
-      const args = argumentosRecorte(p, destinoTemporal, modo)
+      const args = argumentosRecorte(p, destinoTemporal, modo, origen.audio)
       await ejecutar(p.ffmpeg, args, Math.min(30 * 60 * 1000, Math.max(60000, duracion * 20000)))
       const info = await fs.promises.stat(destinoTemporal)
       if (info.size < 1024) throw new Error('FFmpeg produjo un archivo demasiado pequeño.')
