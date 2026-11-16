@@ -178,6 +178,7 @@ declare global {
       setMouseIgnore: (ignorar: boolean) => void
       activarModoVentana: () => void
       cerrarMenu: () => void
+      mostrarErrorOperacion: (mensaje: string) => Promise<void>
     }
   }
 }
@@ -475,13 +476,13 @@ const catalogoConversion = {
   video: [
     { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
     { id: 'gif', label: 'GIF', angulo: 0, tx: 265, ty: 160 },
-    { id: 'mp3', label: 'MP3', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:multimedia', label: 'CLIP', angulo: 90, tx: 160, ty: 265 },
     { id: 'jpg', label: 'FRAME', angulo: 180, tx: 55, ty: 160 }
   ],
   audio: [
     { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
-    { id: 'mp3', label: 'MP3', angulo: 0, tx: 265, ty: 160 },
-    { id: 'webm', label: 'WEBM', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:multimedia', label: 'RECORTAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:multimedia', label: 'AJUSTAR', angulo: 90, tx: 160, ty: 265 },
     { id: 'txt', label: 'INFO', angulo: 180, tx: 55, ty: 160 }
   ]
 }
@@ -2084,12 +2085,15 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
 
     if (esVideo || esAudio) {
       esVideoActivo.value = esVideo
-      const bytes = await window.api.leerArchivoBinario(rutaReal)
-      bytesMultimediaOriginal.value = bytes
-      const blob = new Blob([new Uint8Array(bytes)], {
-        type: file.type || (esVideo ? 'video/mp4' : 'audio/mpeg')
-      })
-      mediaUrlActiva.value = URL.createObjectURL(blob)
+      // El vídeo se reproduce directamente desde su File/Blob:
+      // no copiar el archivo completo varias veces en la RAM del renderer.
+      bytesMultimediaOriginal.value = esVideo
+        ? null
+        : await window.api.leerArchivoBinario(rutaReal)
+      if (!esVideo && !bytesMultimediaOriginal.value?.length) {
+        throw new Error('No se pudo leer el audio de origen.')
+      }
+      mediaUrlActiva.value = URL.createObjectURL(file)
       showMenu.value = false
       ventanaAbierta.value = true
       return
@@ -2384,7 +2388,8 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         rutaArchivoActivo.value,
         '_clip'
       )
-    } else if (herramientaActual.value === 'multimedia' && bytesMultimediaOriginal.value) {
+    } else if (herramientaActual.value === 'multimedia' &&
+      (esVideoActivo.value || bytesMultimediaOriginal.value)) {
       if (formatoSalidaOpcional === 'video-clip' && esVideoActivo.value && mediaUrlActiva.value) {
         if (videoPlayerRef.value && !videoPlayerRef.value.paused) {
           videoPlayerRef.value.pause()
@@ -2396,27 +2401,32 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           volumenMediaPct.value / 100,
           velocidadMedia.value
         )
-        await window.api.guardarMultimediaBytes(
+        const guardado = await window.api.guardarMultimediaBytes(
           clip.bytes,
           clip.ext,
           rutaArchivoActivo.value,
           '_clip'
         )
+        if (!guardado) throw new Error('No se pudo escribir el clip en la carpeta de origen.')
       } else {
-        const destino = formatoSalidaOpcional || 'wav'
+        const destino = formatoAudioDisponible(formatoSalidaOpcional || 'wav')
+        const bytesOrigen = bytesMultimediaOriginal.value ??
+          await window.api.leerArchivoBinario(rutaArchivoActivo.value)
+        if (!bytesOrigen.length) throw new Error('No se pudo leer el audio de origen.')
         const wavBytes = await extraerAudioAWavDirecto(
-          bytesMultimediaOriginal.value,
+          bytesOrigen,
           inicioCorteSeg.value,
           finCorteSeg.value,
           volumenMediaPct.value / 100,
           velocidadMedia.value
         )
-        await window.api.guardarMultimediaBytes(
+        const guardado = await window.api.guardarMultimediaBytes(
           wavBytes,
           destino,
           rutaArchivoActivo.value,
           '_recorte'
         )
+        if (!guardado) throw new Error('No se pudo guardar el audio WAV recortado.')
       }
     } else if (herramientaActual.value === 'dibujar') {
       if (
@@ -2654,9 +2664,12 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
 
   if (esVideo || esAudio) {
     const bytes = await window.api.leerArchivoBinario(rutaReal)
-    if (formatoDestino === 'wav' || formatoDestino === 'mp3' || formatoDestino === 'webm') {
+    if (formatoDestino === 'wav') {
       const wavBytes = await extraerAudioAWavDirecto(bytes, 0, undefined, 1.0, 1.0)
-      await window.api.guardarMultimediaBytes(wavBytes, formatoDestino, rutaReal)
+      const guardado = await window.api.guardarMultimediaBytes(wavBytes, 'wav', rutaReal)
+      if (!guardado) throw new Error('No se pudo guardar el audio WAV.')
+    } else if (formatoDestino === 'mp3' || formatoDestino === 'webm') {
+      formatoAudioDisponible(formatoDestino)
     } else if (formatoDestino === 'gif' && esVideo) {
       const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
@@ -3945,13 +3958,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </template>
 
               <template v-else-if="herramientaActual === 'multimedia'">
-                <button
-                  @click="guardarResultadoHerramienta('mp3')"
-                  :disabled="procesando"
-                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
-                >
-                  Audio MP3
-                </button>
                 <button
                   @click="guardarResultadoHerramienta('wav')"
                   :disabled="procesando"
