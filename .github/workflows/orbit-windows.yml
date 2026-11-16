@@ -52,6 +52,8 @@ jobs:
         run: npm run typecheck
       - name: Build Windows installer including bundled video engine (no release)
         run: npm run build:win
+      - name: Audit installer integrity and updater metadata (no release)
+        run: npm run audit:installer
       - name: Verify NSIS installer and bundled FFmpeg
         shell: pwsh
         run: |
