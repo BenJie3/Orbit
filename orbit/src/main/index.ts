@@ -5,6 +5,7 @@ import {
   screen,
   Tray,
   nativeImage,
+  dialog,
   shell,
   clipboard,
   systemPreferences
@@ -1524,6 +1525,18 @@ if (!instanciaUnica) {
 
     ipcMain.handle('obtener-tema-inicial', async () => {
       return temaActual
+    })
+
+    ipcMain.handle('mostrar-error-operacion', async (_, detalle: string) => {
+      const mensaje = typeof detalle === 'string' ? detalle.slice(0, 900) : 'Error desconocido.'
+      await dialog.showMessageBox({
+        type: 'error',
+        title: 'Orbit',
+        message: 'No se pudo completar la operación',
+        detail: mensaje,
+        buttons: ['Aceptar'],
+        noLink: true
+      })
     })
 
     ipcMain.on('activar-modo-ventana', () => {
