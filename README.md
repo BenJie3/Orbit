@@ -55,6 +55,13 @@ Mientras mantienes abierta la rueda radial, gira la **rueda del ratón hacia aba
 * **📐 Ajustar (`Imágenes`):** Redimensiona la escala (`25%`, `50%`, `75%`, `100%`) y comprime la calidad (`Ligera`, `Óptima`, `Máxima`).
 * **📝 Editar (`DOCX`, `TXT`):** Editor rápido con contador de palabras y caracteres con exportación directa a `TXT`, `PDF` o `DOCX`.
 
+### Correcciones de estabilidad (fase 0)
+
+* **TXT → PDF:** el texto se convierte en el proceso principal a páginas PDF con texto seleccionable, sin generar PNG de página completa. Por seguridad, los TXT de entrada tienen un límite de 4 MB y 1,5 millones de caracteres; los archivos extraordinariamente extensos muestran un error en lugar de bloquear la interfaz.
+* **Recorte de vídeo:** exporta un clip MP4 o WebM según los codificadores `MediaRecorder` disponibles. El recorte se realiza durante la reproducción del tramo seleccionado; puede tardar aproximadamente lo mismo que dura el fragmento y depende de los códecs compatibles con Electron/Chromium. No equivale a un recorte con FFmpeg.
+* **Recorte de audio:** produce **WAV PCM**. No se ofrece MP3 ni WebM cuando no existe un codificador para esos formatos; antes podían producirse archivos WAV con una extensión incorrecta.
+* **Fallos de conversión:** Orbit muestra un mensaje de error en lugar de ocultarlo silenciosamente. La compatibilidad real de algunos vídeos y audios requiere pruebas con archivos de cada formato en Windows.
+
 ### 3. 🎛️ Panel de Control en la Bandeja del Sistema (System Tray)
 Haz clic en el icono orbital de la bandeja del sistema para abrir el centro de control de Orbit:
 * **Modo Pausa y Temporizadores:** Pausa la tecla de activación indefinidamente o por **30 min**, **1 hora** o **2 horas** (ideal al jugar o redactar). También puedes hacer **doble clic** en el icono de la bandeja para pausar/reanudar al instante.
