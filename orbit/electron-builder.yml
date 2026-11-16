@@ -15,6 +15,9 @@ asarUnpack:
   - '**/node_modules/@img/**/*'
   - '**/node_modules/uiohook-napi/**/*'
 win:
+  extraResources:
+    - from: build/video-engine
+      to: video-engine
   executableName: Orbit
   icon: build/icon.png
   target:
