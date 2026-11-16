@@ -12,14 +12,15 @@ import {
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
-import { spawn, execSync, ChildProcessWithoutNullStreams } from 'child_process'
+import { spawn, execSync, execFile, ChildProcessWithoutNullStreams } from 'child_process'
 import sharp from 'sharp'
 import { autoUpdater } from 'electron-updater'
 import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
-import { seleccionarWallpaperEngine } from './wallpaper-selection'
+import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallpaper-selection'
+import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -240,8 +241,59 @@ function localizarConfigWallpaperEngine(): string {
   return ''
 }
 
-type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string; monitor: string }
+type SeleccionWallpaper = { rutaPreview: string; schemeColor: string; firma: string; monitor: string; origen: string }
 let cacheSeleccionWallpaper: { firmaArchivo: string; seleccion: SeleccionWallpaper | null } | null = null
+let rutaCliWallpaper: string | null = null
+let ultimaConsultaCli = 0
+let consultaCliEnCurso: Promise<string | null> | null = null
+
+// Resolver escena, vídeo o página web a su proyecto y miniatura.
+function resolverProyectoWallpaper(
+  archivo: string,
+  monitor: string,
+  firma: string,
+  origen: string,
+  configDir: string
+): SeleccionWallpaper | null {
+  const rutaArchivo = path.isAbsolute(archivo) ? path.normalize(archivo) : path.resolve(configDir, archivo)
+  if (!fs.existsSync(rutaArchivo)) return null
+  const carpeta = fs.statSync(rutaArchivo).isDirectory() ? rutaArchivo : path.dirname(rutaArchivo)
+  let rutaPreview = ''
+  let schemeColor = ''
+
+  const proyectoPath = path.join(carpeta, 'project.json')
+  if (fs.existsSync(proyectoPath)) {
+    try {
+      const proyecto = JSON.parse(fs.readFileSync(proyectoPath, 'utf8'))
+      if (typeof proyecto.preview === 'string') {
+        const posible = path.resolve(carpeta, proyecto.preview)
+        if (fs.existsSync(posible)) rutaPreview = posible
+      }
+      const esquema = proyecto.general?.properties?.schemecolor?.value ??
+        proyecto.schemecolor
+      if (typeof esquema === 'string') schemeColor = esquema
+    } catch (error) {
+      console.warn('[Orbit Wallpaper] No se pudo leer project.json:', error)
+    }
+  }
+  if (!rutaPreview) {
+    for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
+      const candidato = path.join(carpeta, nombre)
+      if (fs.existsSync(candidato)) {
+        rutaPreview = candidato
+        break
+      }
+    }
+  }
+  if (!rutaPreview && /\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo)) {
+    rutaPreview = rutaArchivo
+  }
+  if (!rutaPreview && !schemeColor) return null
+  return {
+    rutaPreview, schemeColor, firma: origen + ':' + monitor + ':' + rutaArchivo + ':' + firma,
+    monitor, origen
+  }
+}
 
 function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
   const cfgPath = localizarConfigWallpaperEngine()
@@ -249,80 +301,86 @@ function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
 
   try {
     const stat = fs.statSync(cfgPath)
-    const firmaArchivo = `${cfgPath}:${stat.mtimeMs}:${stat.size}`
+    const firmaArchivo = cfgPath + ':' + stat.mtimeMs + ':' + stat.size
     if (cacheSeleccionWallpaper?.firmaArchivo === firmaArchivo) {
       return cacheSeleccionWallpaper.seleccion
     }
 
-    // Wallpaper Engine guarda las selecciones bajo
-    // steamuser.general.wallpaperconfig.selectedwallpapers[monitorId].
+    // Wallpaper Engine guarda un bloque por nombre de usuario de Windows.
+    // No asumir que el bloque se llama literalmente "steamuser".
     const configuracion = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
-    const actual = seleccionarWallpaperEngine(configuracion)
+    const usuarioWindows = process.env.USERNAME || os.userInfo().username
+    const actual = seleccionarWallpaperEngine(configuracion, usuarioWindows)
     if (!actual) {
-      console.warn('[Orbit Wallpaper] No se encontró wallpaper activo en config.json.')
+      const diagnostico = diagnosticarWallpaperEngine(configuracion)
+      console.warn(
+        '[Orbit Wallpaper] Sin selección de fondo en config.json.',
+        'Cuentas detectadas: ' + diagnostico.cuentas +
+          '; cuentas con selección: ' + diagnostico.cuentasConSeleccion + '.'
+      )
       cacheSeleccionWallpaper = { firmaArchivo, seleccion: null }
       return null
     }
 
-    const rutaArchivo = path.isAbsolute(actual.archivo)
-      ? path.normalize(actual.archivo)
-      : path.resolve(path.dirname(cfgPath), actual.archivo)
-    const carpeta = fs.existsSync(rutaArchivo) && fs.statSync(rutaArchivo).isDirectory()
-      ? rutaArchivo
-      : path.dirname(rutaArchivo)
-
-    if (!fs.existsSync(carpeta)) {
-      console.warn('[Orbit Wallpaper] Carpeta de fondo no encontrada:', carpeta)
-      cacheSeleccionWallpaper = { firmaArchivo, seleccion: null }
-      return null
-    }
-
-    let rutaPreview = ''
-    let schemeColor = ''
-    const proyectoPath = path.join(carpeta, 'project.json')
-    if (fs.existsSync(proyectoPath)) {
-      try {
-        const proyecto = JSON.parse(fs.readFileSync(proyectoPath, 'utf8'))
-        if (typeof proyecto.preview === 'string') {
-          const vista = path.resolve(carpeta, proyecto.preview)
-          if (fs.existsSync(vista)) rutaPreview = vista
-        }
-        const colorProyecto =
-          proyecto.schemecolor ??
-          proyecto.general?.properties?.schemecolor?.value ??
-          proyecto.general?.properties?.schemecolor
-        if (typeof colorProyecto === 'string') schemeColor = colorProyecto
-      } catch (error) {
-        console.warn('[Orbit Wallpaper] Error leyendo project.json:', error)
-      }
-    }
-
-    if (!rutaPreview) {
-      for (const nombre of ['preview.jpg', 'preview.png', 'preview.webp', 'thumb.jpg']) {
-        const posible = path.join(carpeta, nombre)
-        if (fs.existsSync(posible)) {
-          rutaPreview = posible
-          break
-        }
-      }
-    }
-    if (!rutaPreview && /\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo) && fs.existsSync(rutaArchivo)) {
-      rutaPreview = rutaArchivo
-    }
-
-    const seleccion: SeleccionWallpaper | null = rutaPreview || schemeColor
-      ? { rutaPreview, schemeColor, monitor: actual.monitor,
-          firma: `WE:${actual.monitor}:${rutaArchivo}:${firmaArchivo}` }
-      : null
+    const seleccion = resolverProyectoWallpaper(
+      actual.archivo, actual.monitor, firmaArchivo, 'config', path.dirname(cfgPath)
+    )
     if (!seleccion) {
-      console.warn('[Orbit Wallpaper] Wallpaper activo sin preview ni schemecolor:', rutaArchivo)
+      console.warn('[Orbit Wallpaper] Hay fondo seleccionado, pero no encontré preview ni color de proyecto.')
     }
     cacheSeleccionWallpaper = { firmaArchivo, seleccion }
     return seleccion
   } catch (error) {
-    // Wallpaper Engine puede escribir temporalmente un JSON incompleto.
-    console.warn('[Orbit Wallpaper] Configuración temporalmente ilegible:', error)
+    console.warn('[Orbit Wallpaper] No se pudo interpretar temporalmente config.json:', error)
     return cacheSeleccionWallpaper?.seleccion ?? null
+  }
+}
+
+// Comando oficial de Wallpaper Engine: consulta el fondo que se reproduce,
+// también cuando una playlist cambia sin modificar config.json.
+function consultarFondoViaCli(exe: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      exe, ['-control', 'getWallpaper', '-monitor', '0'],
+      { encoding: 'utf8', windowsHide: true, timeout: 2000, maxBuffer: 8192 },
+      (_error, stdout) => {
+        const archivo = String(stdout || '').split(/\r?\n/)
+          .map((linea) => linea.trim().replace(/^["']|["']$/g, ''))
+          .find((linea) => path.isAbsolute(linea) && fs.existsSync(linea))
+        resolve(archivo || null)
+      }
+    )
+  })
+}
+
+async function obtenerRutaCliWallpaper(forzar = false): Promise<string | null> {
+  if (process.platform !== 'win32') return null
+  const configPath = localizarConfigWallpaperEngine()
+  if (!configPath) return null
+  if (consultaCliEnCurso) return consultaCliEnCurso
+  const ahora = Date.now()
+  // fs.watch procesa cambios de configuración inmediatamente. La consulta
+  // CLI cada 8 s también detecta cambios internos de una playlist.
+  if (!forzar && ahora - ultimaConsultaCli < 8000) return rutaCliWallpaper
+  ultimaConsultaCli = ahora
+
+  const carpeta = path.dirname(configPath)
+  const exes = ['wallpaper64.exe', 'wallpaper32.exe']
+    .map((nombre) => path.join(carpeta, nombre))
+    .filter((archivo) => fs.existsSync(archivo))
+
+  consultaCliEnCurso = (async () => {
+    for (const exe of exes) {
+      const ruta = await consultarFondoViaCli(exe)
+      if (ruta) return ruta
+    }
+    return null
+  })()
+  try {
+    rutaCliWallpaper = await consultaCliEnCurso
+    return rutaCliWallpaper
+  } finally {
+    consultaCliEnCurso = null
   }
 }
 
