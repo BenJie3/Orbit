@@ -25,6 +25,7 @@ import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wall
 import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
 import { generarPdfDesdeTexto, MAX_CARACTERES_TXT_PDF } from './text-to-pdf'
 import { recortarVideoConFfmpeg } from './video-clip'
+import { compararVersiones } from './update-version'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -1629,23 +1630,17 @@ if (!instanciaUnica) {
         })
         if (!respRelease.ok) throw new Error(`GitHub Releases respondió ${respRelease.status}`)
         const release = (await respRelease.json()) as { tag_name?: string }
-        const numeros = (v: string): number[] | null => {
-          const match = v.replace(/^v/i, '').match(/^(\d+)\.(\d+)\.(\d+)(?:$|[-+])/)
-          return match ? match.slice(1, 4).map(Number) : null
-        }
-        const remoto = numeros(String(release.tag_name || ''))
-        const local = numeros(versionActual)
-        if (remoto && local) {
-          const comparacion = remoto.findIndex((n, i) => n !== local[i])
-          if (comparacion === -1 || remoto[comparacion] < local[comparacion]) {
-            const info = {
-              estado: 'actualizado' as const,
-              porcentaje: 100,
-              mensaje: `Estás en la última versión (v${versionActual})`
-            }
-            emitirProgreso(info)
-            return info
+        // Las versiones preliminares tienen precedencia inferior a la
+        // versión estable equivalente (1.0.0-rc.1 < 1.0.0).
+        const comparacion = compararVersiones(String(release.tag_name || ''), versionActual)
+        if (comparacion !== null && comparacion <= 0) {
+          const info = {
+            estado: 'actualizado' as const,
+            porcentaje: 100,
+            mensaje: `Estás en la última versión (v${versionActual})`
           }
+          emitirProgreso(info)
+          return info
         }
         autoUpdater.once('update-available', marcarDisponible)
         const comprobacion = await autoUpdater.checkForUpdates()
