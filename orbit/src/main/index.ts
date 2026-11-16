@@ -492,42 +492,52 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
   const firmaActual = `${infoWE?.firma || ''}|${previewFirma}|${infoWin?.firma || ''}`
   if (!forzar && firmaActual === ultimaFirmaWallpaper) return false
 
-  // 1. El wallpaper realmente seleccionado en Wallpaper Engine.
-  if (infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)) {
-    const hsl = await extraerHslDominanteDeImagen(infoWE.rutaPreview)
-    if (hsl) {
-      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
-      ultimaFirmaWallpaper = firmaActual
-      informarOrigenTema(infoWE.origen === 'cli' ? 'Wallpaper Engine (activo / preview)' : 'Wallpaper Engine (config / preview)', `Monitor: ${infoWE.monitor}; preview: ${path.basename(infoWE.rutaPreview)}`)
-      return true
-    }
+  const aplicarTono = (tono: TonoWallpaper, origen: string, detalle: string) => {
+    temaActual = construirTemaDesdeHsl(tono.h, tono.s, tono.neutro)
+    ultimaFirmaWallpaper = firmaActual
+    informarOrigenTema(origen, detalle)
+    return true
   }
 
-  // 2. Algunos proyectos solo proporcionan un schemecolor.
-  if (infoWE?.schemeColor) {
-    const partes = infoWE.schemeColor.trim().split(/\s+/).map(Number)
-    if (partes.length >= 3 && partes.slice(0, 3).every((n) => Number.isFinite(n))) {
-      const [r, g, b] = partes.slice(0, 3).map((n) =>
-        Math.max(0, Math.min(255, Math.round(n <= 1 ? n * 255 : n)))
-      )
-      const [h, saturacion] = rgbToHsl(r, g, b)
-      if (saturacion > 10) {
-        temaActual = construirTemaDesdeHsl(h, saturacion)
-        ultimaFirmaWallpaper = firmaActual
-        informarOrigenTema(infoWE.origen === 'cli' ? 'Wallpaper Engine (activo / schemecolor)' : 'Wallpaper Engine (config / schemecolor)', `Monitor: ${infoWE.monitor}`)
-        return true
-      }
-    }
+  // 1. Preview real del fondo activo. El analizador acepta píxeles oscuros
+  // y también paletas neutras (negro, blanco y gris).
+  const tonoPreview = infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)
+    ? await extraerTonoDeImagen(infoWE.rutaPreview)
+    : null
+  const tonoProyecto = infoWE ? leerColorProyecto(infoWE.schemeColor) : null
+  const tonoVideo = infoWE?.rutaVideo && fs.existsSync(infoWE.rutaVideo)
+    ? await extraerTonoMiniaturaVideo(infoWE.rutaVideo)
+    : null
+  const etiquetaWE = infoWE?.origen === 'cli' ? 'Wallpaper Engine (activo)' : 'Wallpaper Engine (config)'
+  const detalleWE = infoWE ? 'Monitor: ' + infoWE.monitor : ''
+
+  // Priorizar imágenes y colores definidos por el autor. En previews totalmente
+  // grises preferimos el schemecolor (si es cromático) o el frame de un vídeo.
+  if (tonoPreview && !tonoPreview.neutro) {
+    return aplicarTono(tonoPreview, etiquetaWE + ' / preview', detalleWE)
+  }
+  if (tonoProyecto && !tonoProyecto.neutro) {
+    return aplicarTono(tonoProyecto, etiquetaWE + ' / schemecolor', detalleWE)
+  }
+  if (tonoVideo && !tonoVideo.neutro) {
+    return aplicarTono(tonoVideo, etiquetaWE + ' / miniatura de video', detalleWE)
+  }
+  if (tonoPreview) {
+    return aplicarTono(tonoPreview, etiquetaWE + ' / preview neutra', detalleWE)
+  }
+  if (tonoProyecto) {
+    return aplicarTono(tonoProyecto, etiquetaWE + ' / schemecolor neutro', detalleWE)
+  }
+  if (tonoVideo) {
+    return aplicarTono(tonoVideo, etiquetaWE + ' / video neutro', detalleWE)
   }
 
-  // 3. Fondo estático de Windows (no confundir con su color de acento).
+  // 2. Solo si Wallpaper Engine no ofrece recursos útiles, probar la imagen
+  // estática de Windows (no confundirla con el color de acento de Windows).
   if (infoWin?.ruta && fs.existsSync(infoWin.ruta)) {
-    const hsl = await extraerHslDominanteDeImagen(infoWin.ruta)
-    if (hsl) {
-      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
-      ultimaFirmaWallpaper = firmaActual
-      informarOrigenTema('Imagen de fondo de Windows', path.basename(infoWin.ruta))
-      return true
+    const tono = await extraerTonoDeImagen(infoWin.ruta)
+    if (tono) {
+      return aplicarTono(tono, 'Imagen de fondo de Windows', path.basename(infoWin.ruta))
     }
   }
 
