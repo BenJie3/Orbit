@@ -39,6 +39,10 @@ jobs:
         run: npm run test:focus
       - name: Test TXT-to-PDF and media export regressions
         run: npm run test:conversiones
+      - name: Prepare SHA-256 verified FFmpeg
+        run: npm run setup:video
+      - name: Test real playable MP4 video clips
+        run: npm run test:video
       - name: Type-check main, preload and renderer
         run: npm run typecheck
       - name: Build Electron application (no installer and no release)
