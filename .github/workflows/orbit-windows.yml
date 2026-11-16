@@ -39,6 +39,11 @@ jobs:
         run: npm run test:focus
       - name: Test TXT-to-PDF and media export regressions
         run: npm run test:conversiones
+      - name: Cache pinned video engine
+        uses: actions/cache@v4
+        with:
+          path: orbit/build/video-engine
+          key: orbit-video-win64-ffmpeg-8.1.2-db580001
       - name: Prepare SHA-256 verified FFmpeg
         run: npm run setup:video
       - name: Test real playable MP4 video clips
