@@ -22,6 +22,7 @@ import zlib from 'zlib'
 import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallpaper-selection'
 import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wallpaper-colors'
 import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
+import { generarPdfDesdeTexto, MAX_CARACTERES_TXT_PDF } from './text-to-pdf'
 import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
@@ -1863,6 +1864,41 @@ if (!instanciaUnica) {
         }
       }
     )
+
+    // TXT a PDF: texto real y seleccionable, sin crear imágenes/canvases ni
+    // transferir cientos de MB entre renderer y proceso principal.
+    ipcMain.handle(
+      'guardar-texto-como-pdf',
+      async (_, texto: string, rutaOriginal: string, sufijoPersonalizado?: string) => {
+        if (typeof texto !== 'string' || texto.length > MAX_CARACTERES_TXT_PDF) {
+          throw new Error('El texto no es válido o excede el límite seguro de conversión.')
+        }
+        const pdfBytes = await generarPdfDesdeTexto(texto)
+        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
+        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+        return true
+      }
+    )
+
+    ipcMain.handle('convertir-txt-a-pdf', async (_, rutaOriginal: string) => {
+      if (path.extname(rutaOriginal).toLowerCase() !== '.txt') {
+        throw new Error('Esta operación solo acepta documentos TXT.')
+      }
+      const stat = await fs.promises.stat(rutaOriginal)
+      // UTF-8: cuatro bytes por carácter como máximo. Limitar entrada reduce
+      // el riesgo de bloquear la interfaz ante archivos desproporcionados.
+      if (stat.size > 4 * 1024 * 1024) {
+        throw new Error('El archivo TXT supera los 4 MB permitidos para esta conversión.')
+      }
+      const texto = await fs.promises.readFile(rutaOriginal, 'utf8')
+      if (texto.length > MAX_CARACTERES_TXT_PDF) {
+        throw new Error('El documento TXT es demasiado extenso para convertirlo a PDF.')
+      }
+      const pdfBytes = await generarPdfDesdeTexto(texto)
+      const outPath = obtenerRutaSalida(rutaOriginal, 'pdf')
+      await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+      return true
+    })
 
     ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
       try {
