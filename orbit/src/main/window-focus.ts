@@ -15,8 +15,11 @@ export interface VentanaFocoOrbit {
 // requieren el teclado: siempre habilitar focusable antes de focus().
 export function mostrarSuperficieOrbit(ventana: VentanaFocoOrbit, enfocarEditor = false): void {
   if (ventana.isDestroyed()) return
-  ventana.setSkipTaskbar(true)
+  // En Windows, cambiar focusable puede modificar estilos nativos.
+  // Reafirmar skipTaskbar DESPUÉS de habilitar el foco evita que la rueda
+  // aparezca temporalmente como ventana normal en la barra de tareas.
   ventana.setFocusable(true)
+  ventana.setSkipTaskbar(true)
   ventana.setIgnoreMouseEvents(false)
   ventana.showInactive()
   if (enfocarEditor) ventana.focus()
