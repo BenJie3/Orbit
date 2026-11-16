@@ -33,12 +33,13 @@ function simularVentana({ focused = false, destroyed = false } = {}) {
 // Rueda y menú de bandeja visibles sin activar teclado.
 const radial = simularVentana()
 mostrarSuperficieOrbit(radial.ventana)
-assert.deepEqual(radial.llamadas, ['taskbar:true', 'focusable:true', 'mouse:false', 'showInactive'])
+assert.deepEqual(radial.llamadas, ['focusable:true', 'taskbar:true', 'mouse:false', 'showInactive'])
 assert.equal(radial.focused, false)
 
 // Herramientas interactivas sí pueden recibir teclado.
 const editor = simularVentana()
 mostrarSuperficieOrbit(editor.ventana, true)
+assert.deepEqual(editor.llamadas.slice(0, 2), ['focusable:true', 'taskbar:true'])
 assert.equal(editor.focused, true)
 assert.equal(editor.llamadas.at(-1), 'focus')
 
