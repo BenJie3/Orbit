@@ -108,35 +108,6 @@ function registrarArchivoReciente(rutaArchivo: string) {
 }
 
 // --- CONVERSIÓN MATEMÁTICA RGB <-> HSL PARA TEMAS CAMALEÓNICOS ---
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  r /= 255
-  g /= 255
-  b /= 255
-  const max = Math.max(r, g, b)
-  const min = Math.min(r, g, b)
-  let h = 0
-  let s = 0
-  const l = (max + min) / 2
-
-  if (max !== min) {
-    const d = max - min
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-    switch (max) {
-      case r:
-        h = (g - b) / d + (g < b ? 6 : 0)
-        break
-      case g:
-        h = (b - r) / d + 2
-        break
-      case b:
-        h = (r - g) / d + 4
-        break
-    }
-    h /= 6
-  }
-  return [h * 360, s * 100, l * 100]
-}
-
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360
   s = Math.max(0, Math.min(100, s)) / 100
@@ -505,9 +476,6 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
     ? await extraerTonoDeImagen(infoWE.rutaPreview)
     : null
   const tonoProyecto = infoWE ? leerColorProyecto(infoWE.schemeColor) : null
-  const tonoVideo = infoWE?.rutaVideo && fs.existsSync(infoWE.rutaVideo)
-    ? await extraerTonoMiniaturaVideo(infoWE.rutaVideo)
-    : null
   const etiquetaWE = infoWE?.origen === 'cli' ? 'Wallpaper Engine (activo)' : 'Wallpaper Engine (config)'
   const detalleWE = infoWE ? 'Monitor: ' + infoWE.monitor : ''
 
@@ -519,6 +487,11 @@ async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
   if (tonoProyecto && !tonoProyecto.neutro) {
     return aplicarTono(tonoProyecto, etiquetaWE + ' / schemecolor', detalleWE)
   }
+  // Pedir a Windows una miniatura solo cuando preview y schemecolor
+  // no han proporcionado ya un color útil: evita trabajo de E/S innecesario.
+  const tonoVideo = infoWE?.rutaVideo && fs.existsSync(infoWE.rutaVideo)
+    ? await extraerTonoMiniaturaVideo(infoWE.rutaVideo)
+    : null
   if (tonoVideo && !tonoVideo.neutro) {
     return aplicarTono(tonoVideo, etiquetaWE + ' / miniatura de video', detalleWE)
   }
