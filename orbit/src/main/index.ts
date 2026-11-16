@@ -1788,7 +1788,7 @@ if (!instanciaUnica) {
         conservarJpg: datos.conservarJpg
       })
       if (shellNotifierProc && shellNotifierProc.stdin.writable) {
-        shellNotifierProc.stdin.write(outPath + '\\n')
+        shellNotifierProc.stdin.write(outPath + '\n')
       }
       registrarArchivoReciente(outPath)
       notificarToastArchivoGuardado(outPath)
