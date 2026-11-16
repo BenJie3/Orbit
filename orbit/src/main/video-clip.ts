@@ -40,7 +40,8 @@ export function metadatosCompatibles(salidaFfmpeg: string): { h264: boolean; aac
   const video = lineas.find((l) => /: Video:/i.test(l))
   const audio = lineas.find((l) => /: Audio:/i.test(l))
   return {
-    h264: Boolean(video && /:\s*Video:\s*h264(?:[\s,(]|$)/i.test(video)),
+    h264: Boolean(video && /:\s*Video:\s*h264(?:[\s,(]|$)/i.test(video) &&
+      /\b(?:yuv420p|nv12)\b(?!\d)/i.test(video)),
     aac: Boolean(audio && /:\s*Audio:\s*aac(?:[\s,(]|$)/i.test(audio)),
     audio: Boolean(audio)
   }
