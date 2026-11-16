@@ -13,6 +13,7 @@ const URL_ARCHIVO = 'https://www.gyan.dev/ffmpeg/builds/packages/' + ARCHIVO
 const SHA256_ARCHIVO = 'db580001caa24ac104c8cb856cd113a87b0a443f7bdf47d8c12b1d740584a2ec'
 const CARPETA_FINAL = path.join(__dirname, '..', 'build', 'video-engine')
 const BINARIO = path.join(CARPETA_FINAL, 'ffmpeg.exe')
+const REGISTRO = path.join(CARPETA_FINAL, 'motor-verificado.json')
 
 async function descargar(url, destino, redirects = 0) {
   if (redirects > 5) throw new Error('Demasiadas redirecciones al descargar FFmpeg.')
@@ -51,11 +52,20 @@ async function main() {
     return
   }
   fs.mkdirSync(CARPETA_FINAL, { recursive: true })
-  if (fs.existsSync(BINARIO)) {
-    execFileSync(BINARIO, ['-hide_banner', '-version'], { timeout: 12000, stdio: 'ignore' })
-    console.log('[Orbit] Motor de vídeo ya preparado.')
-    return
+  if (fs.existsSync(BINARIO) && fs.existsSync(REGISTRO)) {
+    try {
+      const registro = JSON.parse(fs.readFileSync(REGISTRO, 'utf8'))
+      const hashActual = await hashArchivo(BINARIO)
+      if (registro.archiveSha256 === SHA256_ARCHIVO && registro.exeSha256 === hashActual) {
+        execFileSync(BINARIO, ['-hide_banner', '-version'], { timeout: 12000, stdio: 'ignore' })
+        console.log('[Orbit] Motor de vídeo ya preparado y verificado.')
+        return
+      }
+    } catch {}
   }
+  // Si el ejecutable local no coincide, nunca ejecutarlo antes de regenerarlo.
+  fs.rmSync(BINARIO, { force: true })
+  fs.rmSync(REGISTRO, { force: true })
 
   const temporal = fs.mkdtempSync(path.join(os.tmpdir(), 'orbit-ffmpeg-'))
   const zip = path.join(temporal, ARCHIVO)
@@ -83,9 +93,16 @@ async function main() {
       '\nSHA-256: ' + SHA256_ARCHIVO + '\n' +
       'Licencia: https://ffmpeg.org/legal.html\nFuentes: https://ffmpeg.org/download.html\n' +
       'La redistribución exige comprobar que se suministran los avisos, licencias y fuentes correspondientes.\n')
-    console.log('[Orbit] FFmpeg preparado y verificado.')
+    fs.writeFileSync(REGISTRO, JSON.stringify({
+      version: VERSION,
+      archiveSha256: SHA256_ARCHIVO,
+      exeSha256: await hashArchivo(BINARIO)
+    }, null, 2))
+    console.log('[Orbit] FFmpeg preparado y verificado. Binario: ' +
+      (fs.statSync(BINARIO).size / (1024 * 1024)).toFixed(1) + ' MB.')
   } catch (error) {
     fs.rmSync(BINARIO, { force: true })
+    fs.rmSync(REGISTRO, { force: true })
     throw error
   } finally {
     fs.rmSync(temporal, { recursive: true, force: true })
