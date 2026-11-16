@@ -204,5 +204,8 @@ contextBridge.exposeInMainWorld('api', {
 
   activarModoVentana: () => ipcRenderer.send('activar-modo-ventana'),
 
+  mostrarErrorOperacion: (mensaje: string) =>
+    ipcRenderer.invoke('mostrar-error-operacion', mensaje) as Promise<void>,
+
   cerrarMenu: () => ipcRenderer.send('forzar-cierre-menu')
 })
