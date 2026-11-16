@@ -26,6 +26,8 @@ assert.deepEqual(metadatosCompatibles(sampleOutput), { h264: true, aac: true, au
 assert.deepEqual(metadatosCompatibles('Stream #0:0: Video: vp9, yuv420p'), {
   h264: false, aac: false, audio: false
 })
+assert.equal(metadatosCompatibles('Stream #0:0: Video: h264 (High 10), yuv420p10le').h264, false)
+assert.equal(metadatosCompatibles('Stream #0:0: Video: h264 (High 4:4:4), yuv444p').h264, false)
 
 ;(async () => {
   const ffmpeg = path.join(__dirname, '..', 'build', 'video-engine', 'ffmpeg.exe')
