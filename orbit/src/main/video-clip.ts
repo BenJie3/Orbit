@@ -146,6 +146,8 @@ export async function recortarVideoConFfmpeg(p: RecorteVideo): Promise<ModoRecor
   if ((await fs.promises.stat(p.origen)).size === 0) {
     throw new Error('El vídeo de origen está vacío.')
   }
+  // No reemitir como MP4 pistas que Windows no tiene por qué reconocer.
+  // Los cambios de velocidad o volumen obligan a procesar las muestras.
   const permiteCopia = origen.h264 && (!origen.audio || origen.aac) &&
     p.velocidad === 1 && p.volumen === 1
   const intentos: ModoRecorteVideo[] = permiteCopia ? ['copia-rapida', 'recodificado'] : ['recodificado']
