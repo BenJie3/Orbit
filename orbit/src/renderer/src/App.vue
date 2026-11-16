@@ -893,6 +893,7 @@ const quitarFondoBlanco = () => {
     ctx.getImageData(0, 0, c.width, c.height)
   ]
   fondoTransparenteActivo.value = true
+  imagenModificadaEnCanvas.value = true
 
   const pageCanvas = paginasCanvases.value[paginaIndice.value]
   if (pageCanvas) {
@@ -2152,6 +2153,7 @@ const onCanvasMouseUp = () => {
         pageCtx.clearRect(0, 0, pageCanvas.width, pageCanvas.height)
         pageCtx.drawImage(c, 0, 0)
       }
+      imagenModificadaEnCanvas.value = true
     }
   } else if (herramientaActual.value === 'recortar') {
     arrastrandoRecorte.value = false
@@ -2163,6 +2165,7 @@ const deshacerTrazo = () => {
   if (!c || historialTrazos.value.length <= 1) return
   const nuevoHistorial = historialTrazos.value.slice(0, -1)
   historialTrazos.value = nuevoHistorial
+  imagenModificadaEnCanvas.value = true
   if (nuevoHistorial.length === 1) {
     fondoTransparenteActivo.value = false
   }
@@ -2180,6 +2183,7 @@ const limpiarLienzo = () => {
   if (!c || historialTrazos.value.length === 0) return
   const inicial = historialTrazos.value[0]
   historialTrazos.value = [inicial]
+  imagenModificadaEnCanvas.value = true
   fondoTransparenteActivo.value = false
   const ctx = c.getContext('2d', { willReadFrequently: true })
   if (ctx && inicial) {
@@ -2328,46 +2332,46 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           conservarJpg: conservarJpgAlEditar.value
         })
       } else {
-      const src = paginasCanvases.value[paginaIndice.value]
-      const cropCanvas = document.createElement('canvas')
-      const cw = Math.max(20, Math.round(cajaRecorte.value.w))
-      const ch = Math.max(20, Math.round(cajaRecorte.value.h))
-      cropCanvas.width = cw
-      cropCanvas.height = ch
-      const ctx = cropCanvas.getContext('2d')!
-      if (!fondoTransparenteActivo.value) {
-        ctx.fillStyle = '#FFFFFF'
-        ctx.fillRect(0, 0, cw, ch)
+        const src = paginasCanvases.value[paginaIndice.value]
+        const cropCanvas = document.createElement('canvas')
+        const cw = Math.max(20, Math.round(cajaRecorte.value.w))
+        const ch = Math.max(20, Math.round(cajaRecorte.value.h))
+        cropCanvas.width = cw
+        cropCanvas.height = ch
+        const ctx = cropCanvas.getContext('2d')!
+        if (!fondoTransparenteActivo.value) {
+          ctx.fillStyle = '#FFFFFF'
+          ctx.fillRect(0, 0, cw, ch)
       }
-      ctx.drawImage(
-        src,
-        Math.round(cajaRecorte.value.x),
-        Math.round(cajaRecorte.value.y),
-        cw,
-        ch,
-        0,
-        0,
-        cw,
-        ch
-      )
+        ctx.drawImage(
+          src,
+          Math.round(cajaRecorte.value.x),
+          Math.round(cajaRecorte.value.y),
+          cw,
+          ch,
+          0,
+          0,
+          cw,
+          ch
+        )
 
-      if (esPdfOrigen && !fondoTransparenteActivo.value) {
-        const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
-        await window.api.guardarPaginasComoPdf(
-          [pngBytes],
-          rutaArchivoActivo.value,
-          [{ width: Math.round(cw * 0.5), height: Math.round(ch * 0.5) }],
-          '_recorte'
-        )
-      } else {
-        const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoConEdicionSinPerdida,
-          formatoConEdicionSinPerdida === 'jpg' ? 1 : 0.92)
-        await window.api.guardarPaginasImagen(
-          [bytes],
-          formatoConEdicionSinPerdida,
-          rutaArchivoActivo.value,
-          fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
-        )
+        if (esPdfOrigen && !fondoTransparenteActivo.value) {
+          const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
+          await window.api.guardarPaginasComoPdf(
+            [pngBytes],
+            rutaArchivoActivo.value,
+            [{ width: Math.round(cw * 0.5), height: Math.round(ch * 0.5) }],
+            '_recorte'
+          )
+        } else {
+          const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoConEdicionSinPerdida,
+            formatoConEdicionSinPerdida === 'jpg' ? 1 : 0.92)
+          await window.api.guardarPaginasImagen(
+            [bytes],
+            formatoConEdicionSinPerdida,
+            rutaArchivoActivo.value,
+            fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
+          )
       }
       }
     } else if (herramientaActual.value === 'rotar') {
@@ -2383,35 +2387,35 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
           conservarJpg: conservarJpgAlEditar.value
         })
       } else {
-      const rotadosBytes: Uint8Array[] = []
-      const dims: { width: number; height: number }[] = []
+        const rotadosBytes: Uint8Array[] = []
+        const dims: { width: number; height: number }[] = []
 
-      for (const src of paginasCanvases.value) {
-        const rad = ((rotacionGrados.value % 360) * Math.PI) / 180
-        const intercambiaLados = Math.abs(rotacionGrados.value % 180) === 90
-        const outCanvas = document.createElement('canvas')
-        outCanvas.width = intercambiaLados ? src.height : src.width
-        outCanvas.height = intercambiaLados ? src.width : src.height
+        for (const src of paginasCanvases.value) {
+          const rad = ((rotacionGrados.value % 360) * Math.PI) / 180
+          const intercambiaLados = Math.abs(rotacionGrados.value % 180) === 90
+          const outCanvas = document.createElement('canvas')
+          outCanvas.width = intercambiaLados ? src.height : src.width
+          outCanvas.height = intercambiaLados ? src.width : src.height
 
-        const ctx = outCanvas.getContext('2d')!
-        if (!fondoTransparenteActivo.value) {
-          ctx.fillStyle = '#FFFFFF'
-          ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
-        }
+          const ctx = outCanvas.getContext('2d')!
+          if (!fondoTransparenteActivo.value) {
+            ctx.fillStyle = '#FFFFFF'
+            ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+          }
 
-        ctx.save()
-        ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
-        ctx.rotate(rad)
-        ctx.scale(voltearH.value ? -1 : 1, voltearV.value ? -1 : 1)
-        ctx.drawImage(src, -src.width / 2, -src.height / 2)
-        ctx.restore()
+          ctx.save()
+          ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
+          ctx.rotate(rad)
+          ctx.scale(voltearH.value ? -1 : 1, voltearV.value ? -1 : 1)
+          ctx.drawImage(src, -src.width / 2, -src.height / 2)
+          ctx.restore()
 
-        const fmt = esPdfOrigen ? 'png' : formatoConEdicionSinPerdida
-        rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt, fmt === 'jpg' ? 1 : 0.92))
-        dims.push({
-          width: Math.round(outCanvas.width * 0.5),
-          height: Math.round(outCanvas.height * 0.5)
-        })
+          const fmt = esPdfOrigen ? 'png' : formatoConEdicionSinPerdida
+          rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt, fmt === 'jpg' ? 1 : 0.92))
+          dims.push({
+            width: Math.round(outCanvas.width * 0.5),
+            height: Math.round(outCanvas.height * 0.5)
+          })
       }
 
       if (esPdfOrigen && !fondoTransparenteActivo.value) {
