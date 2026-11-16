@@ -127,6 +127,19 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
+  guardarImagenSinPerdida: (datos: {
+    rutaOriginal: string
+    operacion:
+      | { tipo: 'recortar'; region: { x: number; y: number; w: number; h: number } }
+      | { tipo: 'rotar'; grados: number; voltearH: boolean; voltearV: boolean }
+    conservarJpg?: boolean
+  }) => ipcRenderer.invoke('guardar-imagen-sin-perdida', datos) as Promise<{
+    formato: 'png' | 'webp' | 'jpg'
+    modo: 'sin-perdida-adicional' | 'jpeg-recodificado'
+    ancho: number
+    alto: number
+  }>,
+
   guardarPaginasImagen: (
     paginasBytes: Uint8Array[],
     formatoDestino: string,
