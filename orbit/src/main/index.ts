@@ -422,55 +422,39 @@ function obtenerRutasWallpaperWindows(): { ruta: string; firma: string } | null 
   return null
 }
 
-async function extraerHslDominanteDeImagen(rutaImagen: string): Promise<[number, number] | null> {
+async function extraerTonoDeImagen(rutaImagen: string): Promise<TonoWallpaper | null> {
   try {
-    const raw = await sharp(rutaImagen)
-      .resize(48, 48, { fit: 'cover' })
+    const { data, info } = await sharp(rutaImagen)
+      .resize(64, 64, { fit: 'inside', withoutEnlargement: true })
+      .toColourspace('srgb')
       .removeAlpha()
       .raw()
-      .toBuffer()
+      .toBuffer({ resolveWithObject: true })
+    return obtenerTonoImagen(data, info.channels)
+  } catch (error) {
+    console.warn('[Orbit Wallpaper] Imagen no legible:', path.basename(rutaImagen), error)
+    return null
+  }
+}
 
-    // 36 cubetas de 10 grados cada una para hallar el pico real de color
-    const binsPeso = new Float64Array(36)
-    const binsHueSum = new Float64Array(36)
-    const binsSatSum = new Float64Array(36)
-
-    for (let i = 0; i < raw.length; i += 3) {
-      const r = raw[i]
-      const g = raw[i + 1]
-      const b = raw[i + 2]
-      const [h, s, l] = rgbToHsl(r, g, b)
-
-      // Ignorar negros, blancos y grises apagados
-      if (l < 12 || l > 90 || s < 18) continue
-
-      const bin = Math.min(35, Math.floor(h / 10))
-      const peso = (s / 100) * (1 - Math.abs(l - 50) / 50)
-      binsPeso[bin] += peso
-      binsHueSum[bin] += h * peso
-      binsSatSum[bin] += s * peso
-    }
-
-    let mejorBin = -1
-    let maxPeso = 0
-    for (let b = 0; b < 36; b++) {
-      // Suavizado con cubetas vecinas
-      const prev = (b + 35) % 36
-      const next = (b + 1) % 36
-      const pesoSuavizado = binsPeso[b] + (binsPeso[prev] + binsPeso[next]) * 0.35
-      if (pesoSuavizado > maxPeso) {
-        maxPeso = pesoSuavizado
-        mejorBin = b
-      }
-    }
-
-    if (mejorBin !== -1 && binsPeso[mejorBin] > 0) {
-      const hueFinal = binsHueSum[mejorBin] / binsPeso[mejorBin]
-      const satFinal = binsSatSum[mejorBin] / binsPeso[mejorBin]
-      return [hueFinal, satFinal]
-    }
-  } catch {}
-  return null
+// En Windows, Electron puede solicitar a Shell una miniatura de vídeos.
+// No requiere FFmpeg, decodificadores propios ni reconstruir módulos C++.
+// El sistema puede no disponer de un proveedor de miniaturas para algún formato.
+async function extraerTonoMiniaturaVideo(rutaVideo: string): Promise<TonoWallpaper | null> {
+  if (process.platform !== 'win32') return null
+  try {
+    const miniatura = await nativeImage.createThumbnailFromPath(rutaVideo, { width: 128, height: 128 })
+    if (miniatura.isEmpty()) return null
+    const { data, info } = await sharp(miniatura.toPNG())
+      .resize(64, 64, { fit: 'inside', withoutEnlargement: true })
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true })
+    return obtenerTonoImagen(data, info.channels)
+  } catch {
+    console.warn('[Orbit Wallpaper] Windows no dispone de miniatura para el video:', path.extname(rutaVideo))
+    return null
+  }
 }
 
 function informarOrigenTema(origen: string, detalle = '') {
