@@ -1391,6 +1391,9 @@ function createWindow(): BrowserWindow {
   const { width, height } = primaryDisplay.bounds
 
   const win = new BrowserWindow({
+    // Windows: una ventana auxiliar nativa no aparece en la barra de tareas
+    // (WS_EX_TOOLWINDOW). Mantener el System Tray como punto de acceso.
+    type: process.platform === 'win32' ? 'toolbar' : undefined,
     width: width - 2,
     height: height - 4,
     x: 1,
