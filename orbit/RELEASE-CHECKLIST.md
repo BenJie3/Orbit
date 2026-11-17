@@ -7,12 +7,12 @@ Este documento separa lo **verificado automáticamente** de lo **comprobado manu
 - [x] Compilación Electron/TypeScript en Windows, Node 20.18.0.
 - [x] Pruebas unitarias de selección de wallpapers y gestión de foco.
 - [x] Pruebas del generador TXT→PDF.
-- [ ] Pruebas de píxeles en rotación/recorte PNG, WebP y JPEG→PNG, más orientación EXIF (CI: `npm run test:images`).
-- [ ] Validación visual manual de imagen JPG/JPEG, PNG transparente y WebP: guardar, comparar con original, verificar rotación, coordenadas y metadatos.
+- [x] Pruebas de píxeles en rotación/recorte PNG, WebP y JPEG→PNG, más orientación EXIF (CI: `npm run test:images`; confirmado en Windows).
+- [x] Validación manual de rotación/recorte de imágenes confirmada por el desarrollador. Los metadatos y la precisión de píxeles se verifican también con las pruebas automatizadas.
 - [x] Pruebas de salida MP4 con copia de pistas, recodificación y archivo sin audio.
 - [x] Instalador NSIS con FFmpeg como recurso separado en el flujo de CI.
-- [ ] Auditoría de integridad del instalador: ejecutar `npm run audit:installer` después de `npm run build:win` y comprobar que no reporte errores.
-- [ ] Validación de los metadatos públicos de actualización: `latest.yml`, nombre de archivo y hash SHA-512 deben corresponder al **mismo build**.
+- [x] Auditoría de integridad del instalador superada en CI (`npm run audit:installer`); repetir con el instalador candidato definitivo.
+- [x] Validación de metadatos **locales** de actualización: `latest.yml`, nombre de archivo y SHA-512 coinciden con el mismo build. Pendiente probar descarga real desde GitHub Releases.
 
 ## Pruebas manuales en Windows 10/11
 
@@ -24,7 +24,7 @@ Este documento separa lo **verificado automáticamente** de lo **comprobado manu
 - [ ] Comprobar recortes MP4 con y sin audio, inicio/fin, velocidad y volumen; reproducir resultados en Windows.
 - [ ] Medir RAM/CPU tras 5 minutos en reposo y después de 20 aperturas de rueda.
 - [ ] Comprobar uninstall y ausencia de procesos residuales; revisar si conserva configuración y si el comportamiento es correcto.
-- [ ] Verificar firma digital (PowerShell: `Get-AuthenticodeSignature .\dist\orbit-1.0.0-Setup.exe`); si el estado es `NotSigned`, documentarlo y no afirmar que está firmado.
+- [ ] Verificar firma digital con `./scripts/audit-signature.ps1` después de `npm run build:win`; el script comprueba instalador y `Orbit.exe`, pero **un CI en verde no significa que estén firmados**. Si aparece `NotSigned` u otro estado distinto de `Valid`, documentarlo antes de distribuir.
 
 ## Actualización automática: bloqueo antes del Release definitivo
 
