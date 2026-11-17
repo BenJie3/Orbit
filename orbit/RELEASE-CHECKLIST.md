@@ -24,7 +24,8 @@ Este documento separa lo **verificado automáticamente** de lo **comprobado manu
 - [ ] Comprobar recortes MP4 con y sin audio, inicio/fin, velocidad y volumen; reproducir resultados en Windows.
 - [ ] Medir RAM/CPU tras 5 minutos en reposo y después de 20 aperturas de rueda.
 - [ ] Comprobar uninstall y ausencia de procesos residuales; revisar si conserva configuración y si el comportamiento es correcto.
-- [ ] Verificar firma digital con `./scripts/audit-signature.ps1` después de `npm run build:win`; el script comprueba instalador y `Orbit.exe`, pero **un CI en verde no significa que estén firmados**. Si aparece `NotSigned` u otro estado distinto de `Valid`, documentarlo antes de distribuir.
+- [x] Estado de firma **comprobado en CI** (17/11/2026): tanto `orbit-1.0.0-Setup.exe` como `Orbit.exe` presentan `NotSigned` (ejecución [44119780541](https://github.com/BenJie3/Orbit/actions/runs/44119780541)). **No se ha firmado ni certificado Orbit.**
+- [ ] Resolver estrategia de firma para publicación pública; si se decide distribuir sin firma, documentar de manera explícita los avisos de Windows y no afirmar que el paquete está firmado.
 
 ## Actualización automática: bloqueo antes del Release definitivo
 
