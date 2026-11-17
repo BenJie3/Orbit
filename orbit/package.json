@@ -31,18 +31,26 @@
     "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json --composite false",
 
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test:wallpaper": "node scripts/test-wallpaper-selection.cjs && node scripts/test-wallpaper-colors.cjs",
+    "test:focus": "node scripts/test-window-focus.cjs",
+    "test:conversiones": "node scripts/test-text-to-pdf.cjs && node scripts/test-media-export.cjs",
+    "test:video": "node scripts/test-video-clip.cjs",
+    "audit:installer": "node scripts/audit-installer.cjs",
+    "test:updater": "node scripts/test-update-version.cjs",
+    "test:images": "node scripts/test-image-quality.cjs",
+    "setup:video": "node scripts/prepare-video-engine.cjs",
 
     "start": "electron-vite preview",
 
-    "dev": "electron-vite dev",
+    "dev": "node scripts/prepare-video-engine.cjs && electron-vite dev",
 
     "build": "npm run typecheck && electron-vite build",
 
-    "postinstall": "install-electron && electron-builder install-app-deps",
+    "postinstall": "node scripts/check-native.cjs",
 
     "build:unpack": "npm run build && electron-builder --dir",
 
-    "build:win": "electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win",
+    "build:win": "npm run typecheck && node scripts/prepare-video-engine.cjs && node scripts/generate-icon.cjs && electron-vite build && node --experimental-require-module ./node_modules/electron-builder/cli.js --win --publish never",
 
     "build:mac": "npm run build && electron-builder --mac",
 
@@ -56,7 +64,7 @@
 
     "@electron-toolkit/utils": "^4.0.0",
 
-    "electron-updater": "^6.3.9",
+    "electron-updater": "^6.8.9",
 
     "pdf-lib": "^1.17.1",
 

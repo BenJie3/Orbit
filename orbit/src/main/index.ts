@@ -5,6 +5,7 @@ import {
   screen,
   Tray,
   nativeImage,
+  dialog,
   shell,
   clipboard,
   systemPreferences
@@ -12,12 +13,21 @@ import {
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { uIOhook, UiohookKey } from 'uiohook-napi'
-import { spawn, execSync, ChildProcessWithoutNullStreams } from 'child_process'
+import { spawn, execSync, execFile, ChildProcessWithoutNullStreams } from 'child_process'
 import sharp from 'sharp'
+import { autoUpdater } from 'electron-updater'
 import { PDFDocument } from 'pdf-lib'
 import fs from 'fs'
 import path from 'path'
 import zlib from 'zlib'
+import { seleccionarWallpaperEngine, diagnosticarWallpaperEngine } from './wallpaper-selection'
+import { obtenerTonoImagen, leerColorProyecto, type TonoWallpaper } from './wallpaper-colors'
+import { mostrarSuperficieOrbit, ocultarSuperficieOrbit } from './window-focus'
+import { generarPdfDesdeTexto, MAX_CARACTERES_TXT_PDF } from './text-to-pdf'
+import { recortarVideoConFfmpeg } from './video-clip'
+import { compararVersiones } from './update-version'
+import { formatoImagenCalidad, procesarImagenConCalidad, type OperacionImagenCalidad } from './image-quality'
+import os from 'os'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
@@ -70,6 +80,8 @@ let intervaloMonitorWallpaper: NodeJS.Timeout | null = null
 let watchersActivos: fs.FSWatcher[] = []
 let debounceCambioWallpaper: NodeJS.Timeout | null = null
 let rutaConfigWallpaperEngineCache = ''
+let ultimoIntentoLocalizarConfigWallpaper = 0
+let ultimoOrigenTema = ''
 
 const rutaConfig = path.join(app.getPath('userData'), 'orbit-settings.json')
 
@@ -102,35 +114,6 @@ function registrarArchivoReciente(rutaArchivo: string) {
 }
 
 // --- CONVERSIÓN MATEMÁTICA RGB <-> HSL PARA TEMAS CAMALEÓNICOS ---
-function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
-  r /= 255
-  g /= 255
-  b /= 255
-  const max = Math.max(r, g, b)
-  const min = Math.min(r, g, b)
-  let h = 0
-  let s = 0
-  const l = (max + min) / 2
-
-  if (max !== min) {
-    const d = max - min
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-    switch (max) {
-      case r:
-        h = (g - b) / d + (g < b ? 6 : 0)
-        break
-      case g:
-        h = (b - r) / d + 2
-        break
-      case b:
-        h = (r - g) / d + 4
-        break
-    }
-    h /= 6
-  }
-  return [h * 360, s * 100, l * 100]
-}
-
 function hslToRgb(h: number, s: number, l: number): [number, number, number] {
   h = ((h % 360) + 360) % 360
   s = Math.max(0, Math.min(100, s)) / 100
@@ -158,8 +141,8 @@ function hslToHex(h: number, s: number, l: number): string {
   return '#' + [r, g, b].map((v) => v.toString(16).padStart(2, '0')).join('')
 }
 
-function construirTemaDesdeHsl(h: number, s: number): TemaOrbit {
-  const satViva = Math.max(68, Math.min(92, s))
+function construirTemaDesdeHsl(h: number, s: number, neutro = false): TemaOrbit {
+  const satViva = neutro ? 10 : Math.max(48, Math.min(92, s))
   const hSecundario = (h + 24) % 360
   const primario = hslToHex(h, satViva, 52)
   const secundario = hslToHex(hSecundario, satViva, 44)
@@ -168,8 +151,8 @@ function construirTemaDesdeHsl(h: number, s: number): TemaOrbit {
   const inactivoFin = hslToHex(hSecundario, Math.min(78, satViva), 78)
   const textoInactivo = hslToHex(h, 45, 11)
 
-  const [cr, cg, cb] = hslToRgb(h, 52, 12)
-  const [br, bg, bb] = hslToRgb(h, 80, 82)
+  const [cr, cg, cb] = hslToRgb(h, neutro ? 10 : 52, 12)
+  const [br, bg, bb] = hslToRgb(h, neutro ? 12 : 80, 82)
   const [sr, sg, sb] = hslToRgb(h, satViva, 52)
 
   return {
@@ -190,6 +173,10 @@ function localizarConfigWallpaperEngine(): string {
   if (rutaConfigWallpaperEngineCache && fs.existsSync(rutaConfigWallpaperEngineCache)) {
     return rutaConfigWallpaperEngineCache
   }
+
+  // Evitar búsquedas síncronas repetidas si no se encuentra Wallpaper Engine.
+  if (Date.now() - ultimoIntentoLocalizarConfigWallpaper < 30000) return ''
+  ultimoIntentoLocalizarConfigWallpaper = Date.now()
 
   // 1. Buscar en Registro de Windows (HKCU\Software\WallpaperEngine -> installPath)
   try {
@@ -232,75 +219,154 @@ function localizarConfigWallpaperEngine(): string {
   return ''
 }
 
-function obtenerWallpaperActivoWallpaperEngine(): {
-  rutaPreview: string
-  schemeColor: string
-  firma: string
-} | null {
+type SeleccionWallpaper = { rutaPreview: string; rutaVideo: string; schemeColor: unknown; firma: string; monitor: string; origen: string }
+let cacheSeleccionWallpaper: { firmaArchivo: string; seleccion: SeleccionWallpaper | null } | null = null
+let rutaCliWallpaper: string | null = null
+let ultimaConsultaCli = 0
+let consultaCliEnCurso: Promise<string | null> | null = null
+
+// Resolver escena, vídeo o página web a su proyecto y miniatura.
+function resolverProyectoWallpaper(
+  archivo: string,
+  monitor: string,
+  firma: string,
+  origen: string,
+  configDir: string
+): SeleccionWallpaper | null {
+  const rutaArchivo = path.isAbsolute(archivo) ? path.normalize(archivo) : path.resolve(configDir, archivo)
+  if (!fs.existsSync(rutaArchivo)) return null
+  const carpeta = fs.statSync(rutaArchivo).isDirectory() ? rutaArchivo : path.dirname(rutaArchivo)
+  let rutaPreview = ''
+  let rutaVideo = /\.(mp4|webm|mov|mkv|avi|wmv|m4v|mpeg|mpg)$/i.test(rutaArchivo) ? rutaArchivo : ''
+  let schemeColor: unknown = ''
+
+  const proyectoPath = path.join(carpeta, 'project.json')
+  if (fs.existsSync(proyectoPath)) {
+    try {
+      const proyecto = JSON.parse(fs.readFileSync(proyectoPath, 'utf8'))
+      if (typeof proyecto.preview === 'string') {
+        const posible = path.resolve(carpeta, proyecto.preview)
+        if (fs.existsSync(posible)) rutaPreview = posible
+      }
+      const esquema = proyecto.general?.properties?.schemecolor?.value ??
+        proyecto.schemecolor
+      if (esquema !== undefined && esquema !== null) schemeColor = esquema
+      if (typeof proyecto.file === 'string') {
+        const contenido = path.resolve(carpeta, proyecto.file)
+        if (/\.(mp4|webm|mov|mkv|avi|wmv|m4v|mpeg|mpg)$/i.test(contenido) && fs.existsSync(contenido)) {
+          rutaVideo = contenido
+        }
+      }
+    } catch (error) {
+      console.warn('[Orbit Wallpaper] No se pudo leer project.json:', error)
+    }
+  }
+  if (!rutaPreview) {
+    for (const nombre of ['preview.jpg', 'preview.jpeg', 'preview.png', 'preview.webp', 'preview.gif', 'preview.avif', 'thumb.jpg']) {
+      const candidato = path.join(carpeta, nombre)
+      if (fs.existsSync(candidato)) {
+        rutaPreview = candidato
+        break
+      }
+    }
+  }
+  if (!rutaPreview && /\.(jpg|jpeg|png|webp|bmp)$/i.test(rutaArchivo)) {
+    rutaPreview = rutaArchivo
+  }
+  if (!rutaPreview && !schemeColor && !rutaVideo) return null
+  return {
+    rutaPreview, rutaVideo, schemeColor, firma: origen + ':' + monitor + ':' + rutaArchivo + ':' + firma,
+    monitor, origen
+  }
+}
+
+function obtenerWallpaperActivoWallpaperEngine(): SeleccionWallpaper | null {
   const cfgPath = localizarConfigWallpaperEngine()
   if (!cfgPath || !fs.existsSync(cfgPath)) return null
 
   try {
     const stat = fs.statSync(cfgPath)
-    const raw = fs.readFileSync(cfgPath, 'utf8')
-
-    // Extraer únicamente el bloque "selectedwallpapers" activo
-    const selIdx = raw.indexOf('"selectedwallpapers"')
-    const zonaBusqueda = selIdx !== -1 ? raw.slice(selIdx, selIdx + 12000) : raw
-
-    const fileMatches = [...zonaBusqueda.matchAll(/"file"\s*:\s*"([^"]+)"/gi)]
-    for (const m of fileMatches) {
-      const fileVal = m[1].replace(/\\\\/g, '/').replace(/\\/g, '/')
-      if (!fileVal) continue
-
-      const folder = fs.existsSync(fileVal) && fs.statSync(fileVal).isDirectory()
-        ? fileVal
-        : path.dirname(fileVal)
-
-      if (!fs.existsSync(folder)) continue
-
-      let previewFile = ''
-      let schemeColor = ''
-      const projPath = path.join(folder, 'project.json')
-
-      if (fs.existsSync(projPath)) {
-        try {
-          const proj = JSON.parse(fs.readFileSync(projPath, 'utf8'))
-          if (proj.preview) {
-            const pCand = path.join(folder, proj.preview)
-            if (fs.existsSync(pCand)) previewFile = pCand
-          }
-          if (proj.schemecolor) {
-            schemeColor = String(proj.schemecolor)
-          }
-        } catch {}
-      }
-
-      if (!previewFile) {
-        for (const nombre of ['preview.jpg', 'preview.png', 'preview.gif', 'preview.webp', 'thumb.jpg']) {
-          const cand = path.join(folder, nombre)
-          if (fs.existsSync(cand)) {
-            previewFile = cand
-            break
-          }
-        }
-      }
-
-      if (!previewFile && /\.(jpg|jpeg|png|webp|bmp)$/i.test(fileVal) && fs.existsSync(fileVal)) {
-        previewFile = fileVal
-      }
-
-      if (previewFile || schemeColor) {
-        return {
-          rutaPreview: previewFile,
-          schemeColor,
-          firma: `WE:${fileVal}:${stat.mtimeMs}`
-        }
-      }
+    const firmaArchivo = cfgPath + ':' + stat.mtimeMs + ':' + stat.size
+    if (cacheSeleccionWallpaper?.firmaArchivo === firmaArchivo) {
+      return cacheSeleccionWallpaper.seleccion
     }
-  } catch {}
 
-  return null
+    // Wallpaper Engine guarda un bloque por nombre de usuario de Windows.
+    // No asumir que el bloque se llama literalmente "steamuser".
+    const configuracion = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+    const usuarioWindows = process.env.USERNAME || os.userInfo().username
+    const actual = seleccionarWallpaperEngine(configuracion, usuarioWindows)
+    if (!actual) {
+      const diagnostico = diagnosticarWallpaperEngine(configuracion)
+      console.warn(
+        '[Orbit Wallpaper] Sin selección de fondo en config.json.',
+        'Cuentas detectadas: ' + diagnostico.cuentas +
+          '; cuentas con selección: ' + diagnostico.cuentasConSeleccion + '.'
+      )
+      cacheSeleccionWallpaper = { firmaArchivo, seleccion: null }
+      return null
+    }
+
+    const seleccion = resolverProyectoWallpaper(
+      actual.archivo, actual.monitor, firmaArchivo, 'config', path.dirname(cfgPath)
+    )
+    if (!seleccion) {
+      console.warn('[Orbit Wallpaper] Hay fondo seleccionado, pero no encontré preview ni color de proyecto.')
+    }
+    cacheSeleccionWallpaper = { firmaArchivo, seleccion }
+    return seleccion
+  } catch (error) {
+    console.warn('[Orbit Wallpaper] No se pudo interpretar temporalmente config.json:', error)
+    return cacheSeleccionWallpaper?.seleccion ?? null
+  }
+}
+
+// Comando oficial de Wallpaper Engine: consulta el fondo que se reproduce,
+// también cuando una playlist cambia sin modificar config.json.
+function consultarFondoViaCli(exe: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile(
+      exe, ['-control', 'getWallpaper', '-monitor', '0'],
+      { encoding: 'utf8', windowsHide: true, timeout: 2000, maxBuffer: 8192 },
+      (_error, stdout) => {
+        const archivo = String(stdout || '').split(/\r?\n/)
+          .map((linea) => linea.trim().replace(/^["']|["']$/g, ''))
+          .find((linea) => path.isAbsolute(linea) && fs.existsSync(linea))
+        resolve(archivo || null)
+      }
+    )
+  })
+}
+
+async function obtenerRutaCliWallpaper(forzar = false): Promise<string | null> {
+  if (process.platform !== 'win32') return null
+  const configPath = localizarConfigWallpaperEngine()
+  if (!configPath) return null
+  if (consultaCliEnCurso) return consultaCliEnCurso
+  const ahora = Date.now()
+  // fs.watch procesa cambios de configuración inmediatamente. La consulta
+  // CLI cada 8 s también detecta cambios internos de una playlist.
+  if (!forzar && ahora - ultimaConsultaCli < 8000) return rutaCliWallpaper
+  ultimaConsultaCli = ahora
+
+  const carpeta = path.dirname(configPath)
+  const exes = ['wallpaper64.exe', 'wallpaper32.exe']
+    .map((nombre) => path.join(carpeta, nombre))
+    .filter((archivo) => fs.existsSync(archivo))
+
+  consultaCliEnCurso = (async () => {
+    for (const exe of exes) {
+      const ruta = await consultarFondoViaCli(exe)
+      if (ruta) return ruta
+    }
+    return null
+  })()
+  try {
+    rutaCliWallpaper = await consultaCliEnCurso
+    return rutaCliWallpaper
+  } finally {
+    consultaCliEnCurso = null
+  }
 }
 
 function obtenerRutasWallpaperWindows(): { ruta: string; firma: string } | null {
@@ -333,121 +399,140 @@ function obtenerRutasWallpaperWindows(): { ruta: string; firma: string } | null 
   return null
 }
 
-async function extraerHslDominanteDeImagen(rutaImagen: string): Promise<[number, number] | null> {
+async function extraerTonoDeImagen(rutaImagen: string): Promise<TonoWallpaper | null> {
   try {
-    const raw = await sharp(rutaImagen)
-      .resize(48, 48, { fit: 'cover' })
+    const { data, info } = await sharp(rutaImagen)
+      .resize(64, 64, { fit: 'inside', withoutEnlargement: true })
+      .toColourspace('srgb')
       .removeAlpha()
       .raw()
-      .toBuffer()
+      .toBuffer({ resolveWithObject: true })
+    return obtenerTonoImagen(data, info.channels)
+  } catch (error) {
+    console.warn('[Orbit Wallpaper] Imagen no legible:', path.basename(rutaImagen), error)
+    return null
+  }
+}
 
-    // 36 cubetas de 10 grados cada una para hallar el pico real de color
-    const binsPeso = new Float64Array(36)
-    const binsHueSum = new Float64Array(36)
-    const binsSatSum = new Float64Array(36)
+// En Windows, Electron puede solicitar a Shell una miniatura de vídeos.
+// No requiere FFmpeg, decodificadores propios ni reconstruir módulos C++.
+// El sistema puede no disponer de un proveedor de miniaturas para algún formato.
+async function extraerTonoMiniaturaVideo(rutaVideo: string): Promise<TonoWallpaper | null> {
+  if (process.platform !== 'win32') return null
+  try {
+    const miniatura = await nativeImage.createThumbnailFromPath(rutaVideo, { width: 128, height: 128 })
+    if (miniatura.isEmpty()) return null
+    const { data, info } = await sharp(miniatura.toPNG())
+      .resize(64, 64, { fit: 'inside', withoutEnlargement: true })
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true })
+    return obtenerTonoImagen(data, info.channels)
+  } catch {
+    console.warn('[Orbit Wallpaper] Windows no dispone de miniatura para el video:', path.extname(rutaVideo))
+    return null
+  }
+}
 
-    for (let i = 0; i < raw.length; i += 3) {
-      const r = raw[i]
-      const g = raw[i + 1]
-      const b = raw[i + 2]
-      const [h, s, l] = rgbToHsl(r, g, b)
-
-      // Ignorar negros, blancos y grises apagados
-      if (l < 12 || l > 90 || s < 18) continue
-
-      const bin = Math.min(35, Math.floor(h / 10))
-      const peso = (s / 100) * (1 - Math.abs(l - 50) / 50)
-      binsPeso[bin] += peso
-      binsHueSum[bin] += h * peso
-      binsSatSum[bin] += s * peso
-    }
-
-    let mejorBin = -1
-    let maxPeso = 0
-    for (let b = 0; b < 36; b++) {
-      // Suavizado con cubetas vecinas
-      const prev = (b + 35) % 36
-      const next = (b + 1) % 36
-      const pesoSuavizado = binsPeso[b] + (binsPeso[prev] + binsPeso[next]) * 0.35
-      if (pesoSuavizado > maxPeso) {
-        maxPeso = pesoSuavizado
-        mejorBin = b
-      }
-    }
-
-    if (mejorBin !== -1 && binsPeso[mejorBin] > 0) {
-      const hueFinal = binsHueSum[mejorBin] / binsPeso[mejorBin]
-      const satFinal = binsSatSum[mejorBin] / binsPeso[mejorBin]
-      return [hueFinal, satFinal]
-    }
-  } catch {}
-  return null
+function informarOrigenTema(origen: string, detalle = '') {
+  const firma = `${origen}|${temaActual.primario}|${detalle}`
+  if (firma !== ultimoOrigenTema) {
+    ultimoOrigenTema = firma
+    console.info(`[Orbit Wallpaper] Fuente: ${origen}. Color: ${temaActual.primario}.${detalle ? ` ${detalle}` : ''}`)
+  }
 }
 
 async function sincronizarColorConWallpaper(forzar = false): Promise<boolean> {
   if (!adaptarFondoActivo) {
+    const anterior = temaActual.primario
     temaActual = { ...TEMA_ZAFIRO_DEFAULT }
     ultimaFirmaWallpaper = 'DEFAULT'
-    return true
+    informarOrigenTema('Zafiro (adaptación desactivada)')
+    return forzar || anterior !== temaActual.primario
   }
 
-  const infoWE = obtenerWallpaperActivoWallpaperEngine()
+  const infoConfig = obtenerWallpaperActivoWallpaperEngine()
+  const rutaActivaCli = await obtenerRutaCliWallpaper(forzar)
+  const cfgPath = localizarConfigWallpaperEngine()
+  // CLI refleja el wallpaper realmente reproducido, incluso en playlists.
+  // Si no responde o carece de preview, conservar el fallback de config.json.
+  const infoCli = rutaActivaCli && cfgPath
+    ? resolverProyectoWallpaper(rutaActivaCli, '0', rutaActivaCli, 'cli', path.dirname(cfgPath))
+    : null
+  const infoWE = infoCli || infoConfig
   const infoWin = obtenerRutasWallpaperWindows()
-  const accentWin = systemPreferences.getAccentColor?.() || ''
+  // El acento de Windows NO es el fondo. Usarlo como fuente final causaba
+  // que Orbit se quedara rosa incluso si el wallpaper había cambiado.
+  const previewFirma = infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)
+    ? fs.statSync(infoWE.rutaPreview).mtimeMs
+    : ''
+  const firmaActual = `${infoWE?.firma || ''}|${previewFirma}|${infoWin?.firma || ''}`
+  if (!forzar && firmaActual === ultimaFirmaWallpaper) return false
 
-  const firmaActual = `${infoWE?.firma || ''}|${infoWin?.firma || ''}|${accentWin}`
-  if (!forzar && firmaActual === ultimaFirmaWallpaper) {
-    return false
-  }
-  ultimaFirmaWallpaper = firmaActual
-
-  // 1. Intentar extraer de la imagen activa de Wallpaper Engine
-  if (infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)) {
-    const hsl = await extraerHslDominanteDeImagen(infoWE.rutaPreview)
-    if (hsl) {
-      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
-      return true
-    }
-  }
-
-  // 2. Si Wallpaper Engine no tiene imagen pero tiene schemecolor en project.json
-  if (infoWE?.schemeColor) {
-    const partes = infoWE.schemeColor
-      .trim()
-      .split(/\s+/)
-      .map((n) => parseFloat(n))
-    if (partes.length >= 3 && partes.every((n) => !isNaN(n))) {
-      const r = partes[0] <= 1 ? Math.round(partes[0] * 255) : Math.round(partes[0])
-      const g = partes[1] <= 1 ? Math.round(partes[1] * 255) : Math.round(partes[1])
-      const b = partes[2] <= 1 ? Math.round(partes[2] * 255) : Math.round(partes[2])
-      const [h, s] = rgbToHsl(r, g, b)
-      if (s > 10) {
-        temaActual = construirTemaDesdeHsl(h, s)
-        return true
-      }
-    }
-  }
-
-  // 3. Intentar extraer del Wallpaper de Windows (TranscodedWallpaper / CachedFiles)
-  if (infoWin?.ruta && fs.existsSync(infoWin.ruta)) {
-    const hsl = await extraerHslDominanteDeImagen(infoWin.ruta)
-    if (hsl) {
-      temaActual = construirTemaDesdeHsl(hsl[0], hsl[1])
-      return true
-    }
-  }
-
-  // 4. Respaldo final: Color de acento DWM de Windows
-  if (accentWin && accentWin.length >= 6) {
-    const r = parseInt(accentWin.slice(0, 2), 16)
-    const g = parseInt(accentWin.slice(2, 4), 16)
-    const b = parseInt(accentWin.slice(4, 6), 16)
-    const [h, s] = rgbToHsl(r, g, b)
-    temaActual = construirTemaDesdeHsl(h, Math.max(65, s))
+  const aplicarTono = (tono: TonoWallpaper, origen: string, detalle: string) => {
+    temaActual = construirTemaDesdeHsl(tono.h, tono.s, tono.neutro)
+    ultimaFirmaWallpaper = firmaActual
+    informarOrigenTema(origen, detalle)
     return true
   }
 
-  return false
+  // 1. Preview real del fondo activo. El analizador acepta píxeles oscuros
+  // y también paletas neutras (negro, blanco y gris).
+  const tonoPreview = infoWE?.rutaPreview && fs.existsSync(infoWE.rutaPreview)
+    ? await extraerTonoDeImagen(infoWE.rutaPreview)
+    : null
+  const tonoProyecto = infoWE ? leerColorProyecto(infoWE.schemeColor) : null
+  const etiquetaWE = infoWE?.origen === 'cli' ? 'Wallpaper Engine (activo)' : 'Wallpaper Engine (config)'
+  const detalleWE = infoWE ? 'Monitor: ' + infoWE.monitor : ''
+
+  // Priorizar imágenes y colores definidos por el autor. En previews totalmente
+  // grises preferimos el schemecolor (si es cromático) o el frame de un vídeo.
+  if (tonoPreview && !tonoPreview.neutro) {
+    return aplicarTono(tonoPreview, etiquetaWE + ' / preview', detalleWE)
+  }
+  if (tonoProyecto && !tonoProyecto.neutro) {
+    return aplicarTono(tonoProyecto, etiquetaWE + ' / schemecolor', detalleWE)
+  }
+  // Pedir a Windows una miniatura solo cuando preview y schemecolor
+  // no han proporcionado ya un color útil: evita trabajo de E/S innecesario.
+  const tonoVideo = infoWE?.rutaVideo && fs.existsSync(infoWE.rutaVideo)
+    ? await extraerTonoMiniaturaVideo(infoWE.rutaVideo)
+    : null
+  if (tonoVideo && !tonoVideo.neutro) {
+    return aplicarTono(tonoVideo, etiquetaWE + ' / miniatura de video', detalleWE)
+  }
+  if (tonoPreview) {
+    return aplicarTono(tonoPreview, etiquetaWE + ' / preview neutra', detalleWE)
+  }
+  if (tonoProyecto) {
+    return aplicarTono(tonoProyecto, etiquetaWE + ' / schemecolor neutro', detalleWE)
+  }
+  if (tonoVideo) {
+    return aplicarTono(tonoVideo, etiquetaWE + ' / video neutro', detalleWE)
+  }
+
+  // 2. Solo si Wallpaper Engine no ofrece recursos útiles, probar la imagen
+  // estática de Windows (no confundirla con el color de acento de Windows).
+  if (infoWin?.ruta && fs.existsSync(infoWin.ruta)) {
+    const tono = await extraerTonoDeImagen(infoWin.ruta)
+    if (tono) {
+      return aplicarTono(tono, 'Imagen de fondo de Windows', path.basename(infoWin.ruta))
+    }
+  }
+
+  // Si no hay imagen identificable, no inventar una paleta a partir del acento
+  // de Windows. Conservar el tema Zafiro permite diagnosticar el origen.
+  temaActual = { ...TEMA_ZAFIRO_DEFAULT }
+  ultimaFirmaWallpaper = firmaActual
+  const razon = infoWE
+    ? 'preview: ' + Boolean(infoWE.rutaPreview) +
+      ', schemecolor: ' + Boolean(infoWE.schemeColor) +
+      ', video: ' + (infoWE.rutaVideo ? path.extname(infoWE.rutaVideo) : 'no')
+    : rutaActivaCli
+      ? 'Fondo activo sin miniatura ni metadatos útiles (extensión: ' + path.extname(rutaActivaCli) + ')'
+      : 'Wallpaper Engine no devolvió un fondo activo legible'
+  informarOrigenTema('Zafiro (ninguna imagen de fondo identificada)', razon)
+  return true
 }
 
 // Dispara la actualización visual en el Icono del Tray y en la Ventana Vue en tiempo real
@@ -572,12 +657,9 @@ function ocultarLienzoCompletamente() {
   modoVentanaActivo = false
   menuTrayVisible = false
 
-  if (toastActivo) return
-
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setIgnoreMouseEvents(true)
-    mainWindow.setSkipTaskbar(true)
-    mainWindow.hide()
+    // Si hay un aviso visible, mantenerlo pero soltar igualmente el foco.
+    ocultarSuperficieOrbit(mainWindow, toastActivo)
   }
 }
 
@@ -663,9 +745,7 @@ function abrirPanelTrayPersonalizado() {
   modoVentanaActivo = true
   menuTrayVisible = true
 
-  mainWindow.setSkipTaskbar(true)
-  mainWindow.setIgnoreMouseEvents(false)
-  mainWindow.showInactive()
+  mostrarSuperficieOrbit(mainWindow)
   mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
   mainWindow.webContents.send('abrir-menu-tray', obtenerEstadoTray(true, x, y))
 }
@@ -1300,9 +1380,7 @@ function mostrarRuedaEnCursor() {
   const posX = Math.max(margen, Math.min(width - margen, cursor.x - dispX))
   const posY = Math.max(margen, Math.min(height - margen, cursor.y - dispY))
 
-  mainWindow.setSkipTaskbar(true)
-  mainWindow.setIgnoreMouseEvents(false)
-  mainWindow.showInactive()
+  mostrarSuperficieOrbit(mainWindow)
   mainWindow.setAlwaysOnTop(true, 'pop-up-menu')
   mainWindow.webContents.send('toggle-menu', {
     mostrar: true,
@@ -1318,6 +1396,9 @@ function createWindow(): BrowserWindow {
   const { width, height } = primaryDisplay.bounds
 
   const win = new BrowserWindow({
+    // Windows: una ventana auxiliar nativa no aparece en la barra de tareas
+    // (WS_EX_TOOLWINDOW). Mantener el System Tray como punto de acceso.
+    type: process.platform === 'win32' ? 'toolbar' : undefined,
     width: width - 2,
     height: height - 4,
     x: 1,
@@ -1331,13 +1412,13 @@ function createWindow(): BrowserWindow {
     fullscreenable: false,
     alwaysOnTop: true,
     skipTaskbar: true,
-    focusable: true,
+    focusable: false,
     hasShadow: false,
+    paintWhenInitiallyHidden: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
-      backgroundThrottling: false,
-      paintWhenInitiallyHidden: true
+      backgroundThrottling: false
     }
   })
 
@@ -1449,14 +1530,23 @@ if (!instanciaUnica) {
       return temaActual
     })
 
+    ipcMain.handle('mostrar-error-operacion', async (_, detalle: string) => {
+      const mensaje = typeof detalle === 'string' ? detalle.slice(0, 900) : 'Error desconocido.'
+      await dialog.showMessageBox({
+        type: 'error',
+        title: 'Orbit',
+        message: 'No se pudo completar la operación',
+        detail: mensaje,
+        buttons: ['Aceptar'],
+        noLink: true
+      })
+    })
+
     ipcMain.on('activar-modo-ventana', () => {
       modoVentanaActivo = true
       menuTrayVisible = false
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setSkipTaskbar(true)
-        mainWindow.setIgnoreMouseEvents(false)
-        mainWindow.showInactive()
-        mainWindow.focus()
+        mostrarSuperficieOrbit(mainWindow, true)
       }
     })
 
@@ -1482,133 +1572,151 @@ if (!instanciaUnica) {
       return false
     })
 
-    // --- AUTO-ACTUALIZACIÓN 100% DIRECTA Y SILENCIOSA (SIN ABRIR GITHUB) ---
+    // Actualización NSIS mediante electron-updater: solo instala versiones superiores y
+    // verifica la integridad del archivo usando latest.yml (SHA-512).
+    let actualizacionEnCurso = false
+    autoUpdater.autoDownload = false
+    autoUpdater.autoInstallOnAppQuit = false
+    autoUpdater.allowPrerelease = false
+    autoUpdater.allowDowngrade = false
+    autoUpdater.on('error', (error) => {
+      console.error('[Orbit] Error de actualización:', error)
+    })
+
     ipcMain.handle('buscar-y-actualizar-directo', async () => {
-      const versionActual = app.getVersion() || '1.0.0'
-      const emitirProgreso = (info: any) => {
+      const versionActual = app.getVersion()
+      const emitirProgreso = (info: {
+        estado: 'buscando' | 'disponible' | 'descargando' | 'instalando' | 'actualizado' | 'error'
+        porcentaje: number
+        versionNueva?: string
+        mensaje: string
+      }) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow.webContents.send('progreso-actualizacion', info)
         }
       }
 
-      try {
-        emitirProgreso({
-          estado: 'buscando',
-          porcentaje: 5,
-          mensaje: 'Buscando nueva versión...'
-        })
-
-        const resp = await fetch('https://api.github.com/repos/BenJie3/Orbit/releases/latest', {
-          headers: { 'User-Agent': 'Orbit-Updater' }
-        })
-
-        if (!resp.ok) {
-          return {
-            estado: 'actualizado',
-            porcentaje: 100,
-            mensaje: `Estás al día (v${versionActual})`
-          }
+      if (actualizacionEnCurso) {
+        return { estado: 'descargando', porcentaje: 0, mensaje: 'Ya hay una actualización en curso.' }
+      }
+      if (!app.isPackaged || process.platform !== 'win32') {
+        const info = {
+          estado: 'error' as const,
+          porcentaje: 0,
+          mensaje: 'Las actualizaciones se prueban en Orbit instalado para Windows, no en modo desarrollo.'
         }
+        emitirProgreso(info)
+        return info
+      }
 
-        const release: any = await resp.json()
-        const tagLimpio = String(release.tag_name || '').replace(/^v/i, '')
+      actualizacionEnCurso = true
+      let hayActualizacion = false
+      let instalacionProgramada = false
+      const marcarDisponible = () => { hayActualizacion = true }
+      const informarDescarga = (progreso: { percent: number }) => {
+        const porcentaje = Math.min(99, Math.max(0, Math.round(progreso.percent || 0)))
+        emitirProgreso({
+          estado: 'descargando',
+          porcentaje,
+          mensaje: `Descargando actualización (${porcentaje}%)...`
+        })
+      }
 
-        if (!tagLimpio || tagLimpio === versionActual) {
-          const res = {
+      try {
+        emitirProgreso({ estado: 'buscando', porcentaje: 0, mensaje: 'Buscando nueva versión...' })
+        // Preflight: los releases beta antiguos pueden no tener latest.yml.
+        // Evitar falsos errores y sobre todo cualquier intento de downgrade.
+        const respRelease = await fetch('https://api.github.com/repos/BenJie3/Orbit/releases/latest', {
+          headers: { 'User-Agent': 'Orbit-Updater', Accept: 'application/vnd.github+json' }
+        })
+        if (!respRelease.ok) throw new Error(`GitHub Releases respondió ${respRelease.status}`)
+        const release = (await respRelease.json()) as { tag_name?: string }
+        // Las versiones preliminares tienen precedencia inferior a la
+        // versión estable equivalente (1.0.0-rc.1 < 1.0.0).
+        const comparacion = compararVersiones(String(release.tag_name || ''), versionActual)
+        if (comparacion !== null && comparacion <= 0) {
+          const info = {
             estado: 'actualizado' as const,
             porcentaje: 100,
             mensaje: `Estás en la última versión (v${versionActual})`
           }
-          emitirProgreso(res)
-          return res
+          emitirProgreso(info)
+          return info
         }
+        autoUpdater.once('update-available', marcarDisponible)
+        const comprobacion = await autoUpdater.checkForUpdates()
+        autoUpdater.removeListener('update-available', marcarDisponible)
 
-        const assetExe = (release.assets || []).find((a: any) =>
-          String(a.name || '').toLowerCase().endsWith('.exe')
-        )
-
-        if (!assetExe || !assetExe.browser_download_url) {
-          const res = {
+        // electron-updater compara SemVer y bloquea downgrades. No interpretar
+        // como nueva versión un release antiguo que tenga un .exe mal nombrado.
+        if (!hayActualizacion || !comprobacion?.updateInfo) {
+          const info = {
             estado: 'actualizado' as const,
             porcentaje: 100,
-            mensaje: `Versión v${tagLimpio} detectada (sin instalador .exe adjunto)`
+            mensaje: `Estás en la última versión (v${versionActual})`
           }
-          emitirProgreso(res)
-          return res
+          emitirProgreso(info)
+          return info
         }
 
+        const versionNueva = comprobacion.updateInfo.version
         emitirProgreso({
-          estado: 'descargando',
-          porcentaje: 10,
-          versionNueva: tagLimpio,
-          mensaje: `Descargando v${tagLimpio} (10%)...`
+          estado: 'disponible',
+          porcentaje: 0,
+          versionNueva,
+          mensaje: `Actualización v${versionNueva} disponible.`
         })
 
-        const dlResp = await fetch(assetExe.browser_download_url, {
-          headers: { 'User-Agent': 'Orbit-Updater' }
-        })
-        if (!dlResp.ok || !dlResp.body) {
-          throw new Error('No se pudo descargar el instalador')
+        autoUpdater.on('download-progress', informarDescarga)
+        try {
+          // latest.yml incluye la suma SHA-512 validada por electron-updater.
+          await autoUpdater.downloadUpdate()
+        } finally {
+          autoUpdater.removeListener('download-progress', informarDescarga)
         }
 
-        const totalBytes = Number(dlResp.headers.get('content-length')) || assetExe.size || 60000000
-        const tempInstallerPath = path.join(app.getPath('temp'), `Orbit-Setup-${tagLimpio}.exe`)
-        const fileStream = fs.createWriteStream(tempInstallerPath)
-        const reader = dlResp.body.getReader()
+        const info = {
+          estado: 'instalando' as const,
+          porcentaje: 100,
+          versionNueva,
+          mensaje: 'Descarga verificada. Instalando y reiniciando Orbit...'
+        }
+        emitirProgreso(info)
 
-        let recibidos = 0
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          if (value) {
-            fileStream.write(Buffer.from(value))
-            recibidos += value.byteLength
-            const pct = Math.min(99, Math.max(10, Math.round((recibidos / totalBytes) * 100)))
+        instalacionProgramada = true
+        setTimeout(() => {
+          try {
+            uIOhook.stop()
+            detenerMonitorWallpaperTiempoReal()
+            if (shellNotifierProc) shellNotifierProc.kill()
+            // La API de electron-updater v6 fuerza el reinicio tras NSIS silencioso.
+            autoUpdater.quitAndInstall(true, true)
+          } catch (error) {
+            console.error('[Orbit] No se pudo iniciar la instalación:', error)
+            actualizacionEnCurso = false
             emitirProgreso({
-              estado: 'descargando',
-              porcentaje: pct,
-              versionNueva: tagLimpio,
-              mensaje: `Descargando v${tagLimpio} (${pct}%)...`
+              estado: 'error',
+              porcentaje: 0,
+              mensaje: 'No se pudo iniciar la instalación de la actualización.'
             })
           }
-        }
-
-        await new Promise<void>((res) => fileStream.end(() => res()))
-
-        emitirProgreso({
-          estado: 'instalando',
-          porcentaje: 100,
-          versionNueva: tagLimpio,
-          mensaje: 'Instalando y reiniciando Orbit...'
-        })
-
-        setTimeout(() => {
-          uIOhook.stop()
-          if (shellNotifierProc) shellNotifierProc.kill()
-          detenerMonitorWallpaperTiempoReal()
-
-          const child = spawn(tempInstallerPath, ['/S'], {
-            detached: true,
-            stdio: 'ignore'
-          })
-          child.unref()
-          app.quit()
-        }, 700)
-
-        return {
-          estado: 'instalando',
-          porcentaje: 100,
-          versionNueva: tagLimpio,
-          mensaje: 'Instalando y reiniciando Orbit...'
-        }
-      } catch {
-        const errRes = {
+        }, 900)
+        return info
+      } catch (error) {
+        console.error('[Orbit] Error verificando o descargando actualización:', error)
+        const info = {
           estado: 'error' as const,
           porcentaje: 0,
-          mensaje: 'Error al descargar actualización'
+          mensaje: 'No se pudo actualizar. Verifica la conexión y que el Release incluya latest.yml.'
         }
-        emitirProgreso(errRes)
-        return errRes
+        emitirProgreso(info)
+        return info
+      } finally {
+        autoUpdater.removeListener('update-available', marcarDisponible)
+        // Conservar el candado mientras el instalador está arrancando.
+        if (!instalacionProgramada) {
+          actualizacionEnCurso = false
+        }
       }
     })
 
@@ -1656,6 +1764,38 @@ if (!instanciaUnica) {
       }
 
       return obtenerEstadoTray(true)
+    })
+
+    // El recorte y la rotación de fotografías se hacen desde la imagen
+    // ORIGINAL usando Sharp, sin pasar por el canvas ni aplicar su JPEG 92%.
+    // Solo se aplica cuando el renderer no ha editado manualmente los píxeles.
+    ipcMain.handle('guardar-imagen-sin-perdida', async (_, datos: {
+      rutaOriginal: string
+      operacion: OperacionImagenCalidad
+      conservarJpg?: boolean
+    }) => {
+      if (!datos || typeof datos.rutaOriginal !== 'string' ||
+          !datos.operacion || !['recortar', 'rotar'].includes(datos.operacion.tipo)) {
+        throw new Error('Los datos de edición de imagen no son válidos.')
+      }
+      const formato = formatoImagenCalidad(path.extname(datos.rutaOriginal), datos.conservarJpg)
+      const sufijo = datos.operacion.tipo === 'recortar' ? '_recorte' : '_rotado'
+      const outPath = obtenerRutaSalida(datos.rutaOriginal, formato, sufijo)
+      const resultado = await procesarImagenConCalidad({
+        rutaOriginal: datos.rutaOriginal,
+        rutaSalida: outPath,
+        operacion: datos.operacion,
+        conservarJpg: datos.conservarJpg
+      })
+      if (shellNotifierProc && shellNotifierProc.stdin.writable) {
+        shellNotifierProc.stdin.write(outPath + '\n')
+      }
+      registrarArchivoReciente(outPath)
+      notificarToastArchivoGuardado(outPath)
+      console.log('[Orbit Imagen] ' + datos.operacion.tipo + ' -> ' +
+        resultado.formato.toUpperCase() + ' (' + resultado.modo + '), ' +
+        resultado.ancho + 'x' + resultado.alto)
+      return resultado
     })
 
     ipcMain.handle(
@@ -1766,6 +1906,41 @@ if (!instanciaUnica) {
         }
       }
     )
+
+    // TXT a PDF: texto real y seleccionable, sin crear imágenes/canvases ni
+    // transferir cientos de MB entre renderer y proceso principal.
+    ipcMain.handle(
+      'guardar-texto-como-pdf',
+      async (_, texto: string, rutaOriginal: string, sufijoPersonalizado?: string) => {
+        if (typeof texto !== 'string' || texto.length > MAX_CARACTERES_TXT_PDF) {
+          throw new Error('El texto no es válido o excede el límite seguro de conversión.')
+        }
+        const pdfBytes = await generarPdfDesdeTexto(texto)
+        const outPath = obtenerRutaSalida(rutaOriginal, 'pdf', sufijoPersonalizado || '')
+        await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+        return true
+      }
+    )
+
+    ipcMain.handle('convertir-txt-a-pdf', async (_, rutaOriginal: string) => {
+      if (path.extname(rutaOriginal).toLowerCase() !== '.txt') {
+        throw new Error('Esta operación solo acepta documentos TXT.')
+      }
+      const stat = await fs.promises.stat(rutaOriginal)
+      // UTF-8: cuatro bytes por carácter como máximo. Limitar entrada reduce
+      // el riesgo de bloquear la interfaz ante archivos desproporcionados.
+      if (stat.size > 4 * 1024 * 1024) {
+        throw new Error('El archivo TXT supera los 4 MB permitidos para esta conversión.')
+      }
+      const texto = await fs.promises.readFile(rutaOriginal, 'utf8')
+      if (texto.length > MAX_CARACTERES_TXT_PDF) {
+        throw new Error('El documento TXT es demasiado extenso para convertirlo a PDF.')
+      }
+      const pdfBytes = await generarPdfDesdeTexto(texto)
+      const outPath = obtenerRutaSalida(rutaOriginal, 'pdf')
+      await guardarEnOrigenYRefrescar(outPath, Buffer.from(pdfBytes))
+      return true
+    })
 
     ipcMain.handle('leer-documento-texto', async (_, rutaOriginal: string) => {
       try {
@@ -1900,6 +2075,44 @@ if (!instanciaUnica) {
         return new Uint8Array(0)
       }
     })
+
+    // Ejecutar FFmpeg fuera de Chromium: copia de pistas MP4 en segundos cuando
+    // son H.264/AAC, o recodificación cuando el origen requiere convertirlas.
+    // No cargar el archivo entero a memoria ni usar una captura a tiempo real.
+    ipcMain.handle(
+      'recortar-video-compatible',
+      async (_, opciones: {
+        rutaOriginal: string
+        inicioSeg: number
+        finSeg: number
+        duracionTotal: number
+        velocidad: number
+        volumen: number
+      }) => {
+        const ffmpeg = app.isPackaged
+          ? path.join(process.resourcesPath, 'video-engine', 'ffmpeg.exe')
+          : path.join(app.getAppPath(), 'build', 'video-engine', 'ffmpeg.exe')
+        const salida = obtenerRutaSalida(opciones.rutaOriginal, 'mp4', '_clip')
+        const modo = await recortarVideoConFfmpeg({
+          origen: opciones.rutaOriginal,
+          salida,
+          inicioSeg: opciones.inicioSeg,
+          finSeg: opciones.finSeg,
+          duracionTotal: opciones.duracionTotal,
+          velocidad: opciones.velocidad,
+          volumen: opciones.volumen,
+          ffmpeg
+        })
+        if (shellNotifierProc && shellNotifierProc.stdin.writable) {
+          shellNotifierProc.stdin.write(salida + '\n')
+        }
+        registrarArchivoReciente(salida)
+        notificarToastArchivoGuardado(salida)
+        console.log('[Orbit Video] Clip MP4 verificado; modo: ' + modo + '; tamaño: ' +
+          (await fs.promises.stat(salida)).size + ' bytes')
+        return { ruta: salida, modo }
+      }
+    )
 
     ipcMain.handle(
       'guardar-multimedia-bytes',

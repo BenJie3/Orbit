@@ -2,6 +2,7 @@
 import { ref, shallowRef, computed, onMounted, nextTick, watch } from 'vue'
 import * as pdfjsLib from 'pdfjs-dist'
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.mjs?url'
+import { formatoAudioDisponible } from './media-export'
 
 if (typeof (Promise as any).try !== 'function') {
   ;(Promise as any).try = function (callback: Function, ...args: any[]) {
@@ -61,10 +62,6 @@ if (typeof (RegExp as any).escape !== 'function') {
 
 ;(window as any).Worker = undefined
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
-
-window.requestAnimationFrame = (cb: FrameRequestCallback): number => {
-  return window.setTimeout(() => cb(performance.now()), 0)
-}
 
 interface SegmentoTexto {
   texto: string
@@ -141,6 +138,18 @@ declare global {
       buscarYActualizarDirecto?: () => Promise<ResultadoActualizacion>
       buscarActualizaciones?: () => Promise<ResultadoActualizacion>
       obtenerRuta: (file: File) => string
+      guardarImagenSinPerdida: (datos: {
+        rutaOriginal: string
+        operacion:
+          | { tipo: 'recortar'; region: { x: number; y: number; w: number; h: number } }
+          | { tipo: 'rotar'; grados: number; voltearH: boolean; voltearV: boolean }
+        conservarJpg?: boolean
+      }) => Promise<{
+        formato: 'png' | 'webp' | 'jpg'
+        modo: 'sin-perdida-adicional' | 'jpeg-recodificado'
+        ancho: number
+        alto: number
+      }>
       guardarPaginasImagen: (
         paginasBytes: Uint8Array[],
         formatoDestino: string,
@@ -159,6 +168,8 @@ declare global {
         rutaOriginal: string
       ) => Promise<boolean>
       leerDocumentoTexto: (rutaOriginal: string) => Promise<BloqueDocumento[]>
+      convertirTxtAPdf: (rutaOriginal: string) => Promise<boolean>
+      guardarTextoComoPdf: (texto: string, rutaOriginal: string, sufijo?: string) => Promise<boolean>
       convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) => Promise<boolean>
       unirPdfsBackend: (rutasPdfs: string[]) => Promise<boolean>
       convertirImagenesAPdfUnico: (rutasImagenes: string[]) => Promise<boolean>
@@ -169,6 +180,14 @@ declare global {
         nombre: string
       } | null>
       leerArchivoBinario: (rutaOriginal: string) => Promise<Uint8Array>
+      recortarVideoCompatible: (opciones: {
+        rutaOriginal: string
+        inicioSeg: number
+        finSeg: number
+        duracionTotal: number
+        velocidad: number
+        volumen: number
+      }) => Promise<{ ruta: string; modo: string }>
       guardarMultimediaBytes: (
         bytes: Uint8Array,
         extDestino: string,
@@ -179,6 +198,7 @@ declare global {
       setMouseIgnore: (ignorar: boolean) => void
       activarModoVentana: () => void
       cerrarMenu: () => void
+      mostrarErrorOperacion: (mensaje: string) => Promise<void>
     }
   }
 }
@@ -287,6 +307,10 @@ const grosorPincel = ref(3)
 const dibujando = ref(false)
 const ultimoPuntoTrazo = ref<{ x: number; y: number } | null>(null)
 const fondoTransparenteActivo = ref(false)
+// JPEG se exporta por defecto como PNG para evitar una segunda compresión con pérdida.
+// Mantener JPG es opt-in y supone recodificación, incluso con calidad 100.
+const conservarJpgAlEditar = ref(false)
+const imagenModificadaEnCanvas = ref(false)
 
 const zoomNivel = ref(100)
 const modoPan = ref(false)
@@ -476,13 +500,13 @@ const catalogoConversion = {
   video: [
     { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
     { id: 'gif', label: 'GIF', angulo: 0, tx: 265, ty: 160 },
-    { id: 'mp3', label: 'MP3', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:multimedia', label: 'CLIP', angulo: 90, tx: 160, ty: 265 },
     { id: 'jpg', label: 'FRAME', angulo: 180, tx: 55, ty: 160 }
   ],
   audio: [
     { id: 'wav', label: 'WAV', angulo: -90, tx: 160, ty: 55 },
-    { id: 'mp3', label: 'MP3', angulo: 0, tx: 265, ty: 160 },
-    { id: 'webm', label: 'WEBM', angulo: 90, tx: 160, ty: 265 },
+    { id: 'tool:multimedia', label: 'RECORTAR', angulo: 0, tx: 265, ty: 160 },
+    { id: 'tool:multimedia', label: 'AJUSTAR', angulo: 90, tx: 160, ty: 265 },
     { id: 'txt', label: 'INFO', angulo: 180, tx: 55, ty: 160 }
   ]
 }
@@ -861,9 +885,15 @@ const quitarFondoBlanco = () => {
     }
   }
 
+  // Conservar el estado anterior para que Ctrl+Z restaure la imagen original.
+  const anterior = ctx.getImageData(0, 0, c.width, c.height)
   ctx.putImageData(imgData, 0, 0)
-  historialTrazos.value = [...historialTrazos.value, imgData]
+  historialTrazos.value = [
+    ...(historialTrazos.value.length ? historialTrazos.value : [anterior]),
+    ctx.getImageData(0, 0, c.width, c.height)
+  ]
   fondoTransparenteActivo.value = true
+  imagenModificadaEnCanvas.value = true
 
   const pageCanvas = paginasCanvases.value[paginaIndice.value]
   if (pageCanvas) {
@@ -1736,127 +1766,6 @@ const extraerAudioAWavDirecto = async (
 }
 
 // --- FUNCIÓN PRO A: RECORTAR CLIP DE VIDEO CON IMAGEN Y SONIDO ---
-const recortarClipDeVideo = async (
-  videoUrl: string,
-  inicioSeg: number,
-  finSeg: number,
-  gananciaVolumen = 1.0,
-  velocidad = 1.0
-): Promise<{ bytes: Uint8Array; ext: string }> => {
-  const video = document.createElement('video')
-  video.src = videoUrl
-  video.playsInline = true
-  video.crossOrigin = 'anonymous'
-
-  await new Promise<void>((resolve, reject) => {
-    video.onloadedmetadata = () => resolve()
-    video.onerror = () => reject(new Error('No se pudo cargar el video para recortar'))
-  })
-
-  const duracionTotal = video.duration || 10
-  const tStart = Math.max(0, Math.min(inicioSeg, duracionTotal - 0.3))
-  const tEnd = Math.min(duracionTotal, Math.max(tStart + 0.5, finSeg))
-
-  video.currentTime = tStart
-  video.playbackRate = velocidad
-
-  await new Promise<void>((res) => {
-    const onSeek = () => {
-      video.removeEventListener('seeked', onSeek)
-      res()
-    }
-    video.addEventListener('seeked', onSeek)
-  })
-
-  const w = video.videoWidth || 1280
-  const h = video.videoHeight || 720
-  const canvas = document.createElement('canvas')
-  canvas.width = w
-  canvas.height = h
-  const ctx = canvas.getContext('2d')!
-  ctx.drawImage(video, 0, 0, w, h)
-
-  const canvasStream = canvas.captureStream(30)
-  const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)()
-  const sourceNode = audioCtx.createMediaElementSource(video)
-  const gainNode = audioCtx.createGain()
-  gainNode.gain.value = gananciaVolumen
-  const destAudio = audioCtx.createMediaStreamDestination()
-
-  sourceNode.connect(gainNode)
-  gainNode.connect(destAudio)
-
-  const combinedStream = new MediaStream([
-    ...canvasStream.getVideoTracks(),
-    ...destAudio.stream.getAudioTracks()
-  ])
-
-  let mimeElegido = 'video/webm;codecs=vp8,opus'
-  let extSalida = 'webm'
-  const candidatos = [
-    { mime: 'video/mp4;codecs=avc1,mp4a.40.2', ext: 'mp4' },
-    { mime: 'video/mp4', ext: 'mp4' },
-    { mime: 'video/webm;codecs=vp9,opus', ext: 'webm' },
-    { mime: 'video/webm;codecs=vp8,opus', ext: 'webm' },
-    { mime: 'video/webm', ext: 'webm' }
-  ]
-
-  for (const c of candidatos) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c.mime)) {
-      mimeElegido = c.mime
-      extSalida = c.ext
-      break
-    }
-  }
-
-  const chunks: BlobPart[] = []
-  const recorder = new MediaRecorder(combinedStream, {
-    mimeType: mimeElegido,
-    videoBitsPerSecond: 4500000
-  })
-
-  recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) chunks.push(e.data)
-  }
-
-  const promesaGrabacion = new Promise<Uint8Array>((resolve, reject) => {
-    recorder.onstop = async () => {
-      try {
-        const blobFinal = new Blob(chunks, { type: mimeElegido })
-        const ab = await blobFinal.arrayBuffer()
-        resolve(new Uint8Array(ab))
-      } catch (err) {
-        reject(err)
-      }
-    }
-    recorder.onerror = (err) => reject(err)
-  })
-
-  let activo = true
-  const pintarFrame = () => {
-    if (!activo) return
-    if (video.currentTime >= tEnd || video.ended) {
-      activo = false
-      video.pause()
-      if (recorder.state === 'recording') recorder.stop()
-      return
-    }
-    ctx.drawImage(video, 0, 0, w, h)
-    window.requestAnimationFrame(pintarFrame)
-  }
-
-  recorder.start(100)
-  await video.play()
-  pintarFrame()
-
-  const bytes = await promesaGrabacion
-  activo = false
-  combinedStream.getTracks().forEach((t) => t.stop())
-  await audioCtx.close().catch(() => {})
-
-  return { bytes, ext: extSalida }
-}
-
 const convertirVideoAGif = async (
   videoUrl: string,
   inicioSeg: number,
@@ -2022,6 +1931,8 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
   zoomNivel.value = 100
   modoPan.value = false
   fondoTransparenteActivo.value = false
+  conservarJpgAlEditar.value = false
+  imagenModificadaEnCanvas.value = false
   volumenMediaPct.value = 100
   velocidadMedia.value = 1
 
@@ -2038,12 +1949,15 @@ const abrirHerramientaConArchivo = async (file: File, rutaReal: string, tool: Ti
 
     if (esVideo || esAudio) {
       esVideoActivo.value = esVideo
-      const bytes = await window.api.leerArchivoBinario(rutaReal)
-      bytesMultimediaOriginal.value = bytes
-      const blob = new Blob([bytes], {
-        type: file.type || (esVideo ? 'video/mp4' : 'audio/mpeg')
-      })
-      mediaUrlActiva.value = URL.createObjectURL(blob)
+      // El vídeo se reproduce directamente desde su File/Blob:
+      // no copiar el archivo completo varias veces en la RAM del renderer.
+      bytesMultimediaOriginal.value = esVideo
+        ? null
+        : await window.api.leerArchivoBinario(rutaReal)
+      if (!esVideo && !bytesMultimediaOriginal.value?.length) {
+        throw new Error('No se pudo leer el audio de origen.')
+      }
+      mediaUrlActiva.value = URL.createObjectURL(file)
       showMenu.value = false
       ventanaAbierta.value = true
       return
@@ -2239,6 +2153,7 @@ const onCanvasMouseUp = () => {
         pageCtx.clearRect(0, 0, pageCanvas.width, pageCanvas.height)
         pageCtx.drawImage(c, 0, 0)
       }
+      imagenModificadaEnCanvas.value = true
     }
   } else if (herramientaActual.value === 'recortar') {
     arrastrandoRecorte.value = false
@@ -2250,6 +2165,7 @@ const deshacerTrazo = () => {
   if (!c || historialTrazos.value.length <= 1) return
   const nuevoHistorial = historialTrazos.value.slice(0, -1)
   historialTrazos.value = nuevoHistorial
+  imagenModificadaEnCanvas.value = true
   if (nuevoHistorial.length === 1) {
     fondoTransparenteActivo.value = false
   }
@@ -2267,6 +2183,7 @@ const limpiarLienzo = () => {
   if (!c || historialTrazos.value.length === 0) return
   const inicial = historialTrazos.value[0]
   historialTrazos.value = [inicial]
+  imagenModificadaEnCanvas.value = true
   fondoTransparenteActivo.value = false
   const ctx = c.getContext('2d', { willReadFrequently: true })
   if (ctx && inicial) {
@@ -2308,6 +2225,12 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       : ['jpg', 'png', 'webp'].includes(extArchivoActivo.value)
         ? extArchivoActivo.value
         : 'png'
+    const esFotoOriginalSinCambios = !esPdfOrigen &&
+      ['jpg', 'jpeg', 'png', 'webp'].includes(extArchivoActivo.value) &&
+      !fondoTransparenteActivo.value && !imagenModificadaEnCanvas.value
+    const formatoConEdicionSinPerdida = fondoTransparenteActivo.value ||
+      (['jpg', 'jpeg', 'webp'].includes(extArchivoActivo.value) && !conservarJpgAlEditar.value)
+      ? 'png' : formatoImgDestino
 
     if (herramientaActual.value === 'capturar' && videoPlayerRef.value) {
       const v = videoPlayerRef.value
@@ -2338,39 +2261,41 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         rutaArchivoActivo.value,
         '_clip'
       )
-    } else if (herramientaActual.value === 'multimedia' && bytesMultimediaOriginal.value) {
+    } else if (herramientaActual.value === 'multimedia' &&
+      (esVideoActivo.value || bytesMultimediaOriginal.value)) {
       if (formatoSalidaOpcional === 'video-clip' && esVideoActivo.value && mediaUrlActiva.value) {
         if (videoPlayerRef.value && !videoPlayerRef.value.paused) {
           videoPlayerRef.value.pause()
         }
-        const clip = await recortarClipDeVideo(
-          mediaUrlActiva.value,
-          inicioCorteSeg.value,
-          finCorteSeg.value,
-          volumenMediaPct.value / 100,
-          velocidadMedia.value
-        )
-        await window.api.guardarMultimediaBytes(
-          clip.bytes,
-          clip.ext,
-          rutaArchivoActivo.value,
-          '_clip'
-        )
+        // FFmpeg trabaja en disco fuera del renderer y evita la recaptura
+        // cuadro a cuadro, que tardaba lo mismo que duraba el clip.
+        await window.api.recortarVideoCompatible({
+          rutaOriginal: rutaArchivoActivo.value,
+          inicioSeg: inicioCorteSeg.value,
+          finSeg: finCorteSeg.value,
+          duracionTotal: duracionMedia.value,
+          velocidad: velocidadMedia.value,
+          volumen: volumenMediaPct.value / 100
+        })
       } else {
-        const destino = formatoSalidaOpcional || 'wav'
+        const destino = formatoAudioDisponible(formatoSalidaOpcional || 'wav')
+        const bytesOrigen = bytesMultimediaOriginal.value ??
+          await window.api.leerArchivoBinario(rutaArchivoActivo.value)
+        if (!bytesOrigen.length) throw new Error('No se pudo leer el audio de origen.')
         const wavBytes = await extraerAudioAWavDirecto(
-          bytesMultimediaOriginal.value,
+          bytesOrigen,
           inicioCorteSeg.value,
           finCorteSeg.value,
           volumenMediaPct.value / 100,
           velocidadMedia.value
         )
-        await window.api.guardarMultimediaBytes(
+        const guardado = await window.api.guardarMultimediaBytes(
           wavBytes,
           destino,
           rutaArchivoActivo.value,
           '_recorte'
         )
+        if (!guardado) throw new Error('No se pudo guardar el audio WAV recortado.')
       }
     } else if (herramientaActual.value === 'dibujar') {
       if (
@@ -2400,76 +2325,97 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         )
       }
     } else if (herramientaActual.value === 'recortar') {
-      const src = paginasCanvases.value[paginaIndice.value]
-      const cropCanvas = document.createElement('canvas')
-      const cw = Math.max(20, Math.round(cajaRecorte.value.w))
-      const ch = Math.max(20, Math.round(cajaRecorte.value.h))
-      cropCanvas.width = cw
-      cropCanvas.height = ch
-      const ctx = cropCanvas.getContext('2d')!
-      if (!fondoTransparenteActivo.value) {
-        ctx.fillStyle = '#FFFFFF'
-        ctx.fillRect(0, 0, cw, ch)
-      }
-      ctx.drawImage(
-        src,
-        Math.round(cajaRecorte.value.x),
-        Math.round(cajaRecorte.value.y),
-        cw,
-        ch,
-        0,
-        0,
-        cw,
-        ch
-      )
-
-      if (esPdfOrigen && !fondoTransparenteActivo.value) {
-        const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
-        await window.api.guardarPaginasComoPdf(
-          [pngBytes],
-          rutaArchivoActivo.value,
-          [{ width: Math.round(cw * 0.5), height: Math.round(ch * 0.5) }],
-          '_recorte'
-        )
+      if (esFotoOriginalSinCambios) {
+        await window.api.guardarImagenSinPerdida({
+          rutaOriginal: rutaArchivoActivo.value,
+          operacion: { tipo: 'recortar', region: { ...cajaRecorte.value } },
+          conservarJpg: conservarJpgAlEditar.value
+        })
       } else {
-        const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoImgDestino)
-        await window.api.guardarPaginasImagen(
-          [bytes],
-          formatoImgDestino,
-          rutaArchivoActivo.value,
-          fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
-        )
-      }
-    } else if (herramientaActual.value === 'rotar') {
-      const rotadosBytes: Uint8Array[] = []
-      const dims: { width: number; height: number }[] = []
-
-      for (const src of paginasCanvases.value) {
-        const rad = ((rotacionGrados.value % 360) * Math.PI) / 180
-        const intercambiaLados = Math.abs(rotacionGrados.value % 180) === 90
-        const outCanvas = document.createElement('canvas')
-        outCanvas.width = intercambiaLados ? src.height : src.width
-        outCanvas.height = intercambiaLados ? src.width : src.height
-
-        const ctx = outCanvas.getContext('2d')!
+        const src = paginasCanvases.value[paginaIndice.value]
+        const cropCanvas = document.createElement('canvas')
+        const cw = Math.max(20, Math.round(cajaRecorte.value.w))
+        const ch = Math.max(20, Math.round(cajaRecorte.value.h))
+        cropCanvas.width = cw
+        cropCanvas.height = ch
+        const ctx = cropCanvas.getContext('2d')!
         if (!fondoTransparenteActivo.value) {
           ctx.fillStyle = '#FFFFFF'
-          ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
-        }
+          ctx.fillRect(0, 0, cw, ch)
+      }
+        ctx.drawImage(
+          src,
+          Math.round(cajaRecorte.value.x),
+          Math.round(cajaRecorte.value.y),
+          cw,
+          ch,
+          0,
+          0,
+          cw,
+          ch
+        )
 
-        ctx.save()
-        ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
-        ctx.rotate(rad)
-        ctx.scale(voltearH.value ? -1 : 1, voltearV.value ? -1 : 1)
-        ctx.drawImage(src, -src.width / 2, -src.height / 2)
-        ctx.restore()
-
-        const fmt = esPdfOrigen ? 'png' : formatoImgDestino
-        rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt))
-        dims.push({
-          width: Math.round(outCanvas.width * 0.5),
-          height: Math.round(outCanvas.height * 0.5)
+        if (esPdfOrigen && !fondoTransparenteActivo.value) {
+          const pngBytes = await canvasToUint8ArrayDirecto(cropCanvas, 'png')
+          await window.api.guardarPaginasComoPdf(
+            [pngBytes],
+            rutaArchivoActivo.value,
+            [{ width: Math.round(cw * 0.5), height: Math.round(ch * 0.5) }],
+            '_recorte'
+          )
+        } else {
+          const bytes = await canvasToUint8ArrayDirecto(cropCanvas, formatoConEdicionSinPerdida,
+            formatoConEdicionSinPerdida === 'jpg' ? 1 : 0.92)
+          await window.api.guardarPaginasImagen(
+            [bytes],
+            formatoConEdicionSinPerdida,
+            rutaArchivoActivo.value,
+            fondoTransparenteActivo.value ? '_recorte_transparente' : '_recorte'
+          )
+      }
+      }
+    } else if (herramientaActual.value === 'rotar') {
+      if (esFotoOriginalSinCambios) {
+        await window.api.guardarImagenSinPerdida({
+          rutaOriginal: rutaArchivoActivo.value,
+          operacion: {
+            tipo: 'rotar',
+            grados: rotacionGrados.value,
+            voltearH: voltearH.value,
+            voltearV: voltearV.value
+          },
+          conservarJpg: conservarJpgAlEditar.value
         })
+      } else {
+        const rotadosBytes: Uint8Array[] = []
+        const dims: { width: number; height: number }[] = []
+
+        for (const src of paginasCanvases.value) {
+          const rad = ((rotacionGrados.value % 360) * Math.PI) / 180
+          const intercambiaLados = Math.abs(rotacionGrados.value % 180) === 90
+          const outCanvas = document.createElement('canvas')
+          outCanvas.width = intercambiaLados ? src.height : src.width
+          outCanvas.height = intercambiaLados ? src.width : src.height
+
+          const ctx = outCanvas.getContext('2d')!
+          if (!fondoTransparenteActivo.value) {
+            ctx.fillStyle = '#FFFFFF'
+            ctx.fillRect(0, 0, outCanvas.width, outCanvas.height)
+          }
+
+          ctx.save()
+          ctx.translate(outCanvas.width / 2, outCanvas.height / 2)
+          ctx.rotate(rad)
+          ctx.scale(voltearH.value ? -1 : 1, voltearV.value ? -1 : 1)
+          ctx.drawImage(src, -src.width / 2, -src.height / 2)
+          ctx.restore()
+
+          const fmt = esPdfOrigen ? 'png' : formatoConEdicionSinPerdida
+          rotadosBytes.push(await canvasToUint8ArrayDirecto(outCanvas, fmt, fmt === 'jpg' ? 1 : 0.92))
+          dims.push({
+            width: Math.round(outCanvas.width * 0.5),
+            height: Math.round(outCanvas.height * 0.5)
+          })
       }
 
       if (esPdfOrigen && !fondoTransparenteActivo.value) {
@@ -2482,10 +2428,11 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
       } else {
         await window.api.guardarPaginasImagen(
           rotadosBytes,
-          formatoImgDestino,
+          formatoConEdicionSinPerdida,
           rutaArchivoActivo.value,
           '_rotado'
         )
+      }
       }
     } else if (herramientaActual.value === 'dividir') {
       if (modoDivisionPdf.value === 'unico') {
@@ -2583,19 +2530,16 @@ const guardarResultadoHerramienta = async (formatoSalidaOpcional?: string) => {
         | 'txt'
         | 'pdf'
       if (destino === 'pdf') {
-        const paginasPng = await renderizarBloquesAPaginas(bloques, 'png')
-        await window.api.guardarPaginasComoPdf(
-          paginasPng,
-          rutaArchivoActivo.value,
-          undefined,
-          '_editado'
-        )
+        const guardado = await window.api.guardarTextoComoPdf(textoEditable.value, rutaArchivoActivo.value, '_editado')
+        if (!guardado) throw new Error('No se pudo guardar el PDF de texto.')
       } else {
         await window.api.guardarTextoDocumento(bloques, destino, rutaArchivoActivo.value)
       }
     }
   } catch (error) {
     console.error('Error guardando desde herramienta:', error)
+    const detalle = error instanceof Error ? error.message : String(error)
+    await window.api.mostrarErrorOperacion(detalle)
   } finally {
     procesando.value = false
     cerrarVentanaHerramienta()
@@ -2613,11 +2557,14 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
 
   if (esVideo || esAudio) {
     const bytes = await window.api.leerArchivoBinario(rutaReal)
-    if (formatoDestino === 'wav' || formatoDestino === 'mp3' || formatoDestino === 'webm') {
+    if (formatoDestino === 'wav') {
       const wavBytes = await extraerAudioAWavDirecto(bytes, 0, undefined, 1.0, 1.0)
-      await window.api.guardarMultimediaBytes(wavBytes, formatoDestino, rutaReal)
+      const guardado = await window.api.guardarMultimediaBytes(wavBytes, 'wav', rutaReal)
+      if (!guardado) throw new Error('No se pudo guardar el audio WAV.')
+    } else if (formatoDestino === 'mp3' || formatoDestino === 'webm') {
+      formatoAudioDisponible(formatoDestino)
     } else if (formatoDestino === 'gif' && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const gifBytes = await convertirVideoAGif(url, 0, 5, 10, 360)
@@ -2626,7 +2573,7 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
         URL.revokeObjectURL(url)
       }
     } else if ((formatoDestino === 'jpg' || formatoDestino === 'png') && esVideo) {
-      const blob = new Blob([bytes], { type: file.type || 'video/mp4' })
+      const blob = new Blob([new Uint8Array(bytes)], { type: file.type || 'video/mp4' })
       const url = URL.createObjectURL(blob)
       try {
         const imgBytes = await capturarFrameDeVideo(url, 0.5, formatoDestino)
@@ -2700,6 +2647,12 @@ const convertirArchivoIndividual = async (file: File, rutaReal: string, formatoD
       rutaReal
     )
   } else if (esDocTexto) {
+    // El TXT no se rasteriza: evita saturar memoria con páginas PNG grandes.
+    if (ext === 'txt' && formatoDestino === 'pdf') {
+      const guardado = await window.api.convertirTxtAPdf(rutaReal)
+      if (!guardado) throw new Error('La conversión TXT a PDF no pudo completarse.')
+      return
+    }
     const bloques = await window.api.leerDocumentoTexto(rutaReal)
 
     if (formatoDestino === 'txt' || formatoDestino === 'docx') {
@@ -2760,6 +2713,7 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
     const detalle =
       error instanceof Error ? `${error.name}: ${error.message}` : JSON.stringify(error)
     console.error(`[ERROR EN CONVERSIÓN]: ${detalle}`)
+    await window.api.mostrarErrorOperacion(detalle)
   } finally {
     procesando.value = false
     showMenu.value = false
@@ -3713,6 +3667,25 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </div>
 
               <div
+                v-if="(extArchivoActivo === 'jpg' || extArchivoActivo === 'jpeg') &&
+                  (herramientaActual === 'recortar' || herramientaActual === 'rotar') &&
+                  !fondoTransparenteActivo"
+                class="flex flex-wrap items-center gap-2 justify-center text-white text-xs bg-black/25 rounded-full px-4 py-2 border border-white/25"
+              >
+                <span class="font-bold">Guardar como:</span>
+                <button
+                  @click="conservarJpgAlEditar = false"
+                  :class="!conservarJpgAlEditar ? 'orbit-btn-primary border-white' : 'orbit-pill-btn border-white/40'"
+                  class="px-3 py-1 rounded-full border cursor-pointer"
+                >PNG sin pérdida adicional</button>
+                <button
+                  @click="conservarJpgAlEditar = true"
+                  :class="conservarJpgAlEditar ? 'orbit-btn-primary border-white' : 'orbit-pill-btn border-white/40'"
+                  class="px-3 py-1 rounded-full border cursor-pointer"
+                >JPG calidad máxima (recomprime)</button>
+              </div>
+
+              <div
                 ref="contenedorScrollRef"
                 @wheel="onWheelCanvasZoom"
                 @contextmenu.prevent
@@ -3898,13 +3871,6 @@ const procesarArchivo = async (event: DragEvent, opcionId: string) => {
               </template>
 
               <template v-else-if="herramientaActual === 'multimedia'">
-                <button
-                  @click="guardarResultadoHerramienta('mp3')"
-                  :disabled="procesando"
-                  class="orbit-pill-btn px-4 py-2 rounded-full font-extrabold text-xs tracking-wider uppercase border border-white/60 cursor-pointer"
-                >
-                  Audio MP3
-                </button>
                 <button
                   @click="guardarResultadoHerramienta('wav')"
                   :disabled="procesando"

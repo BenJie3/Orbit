@@ -127,6 +127,19 @@ contextBridge.exposeInMainWorld('api', {
     }
   },
 
+  guardarImagenSinPerdida: (datos: {
+    rutaOriginal: string
+    operacion:
+      | { tipo: 'recortar'; region: { x: number; y: number; w: number; h: number } }
+      | { tipo: 'rotar'; grados: number; voltearH: boolean; voltearV: boolean }
+    conservarJpg?: boolean
+  }) => ipcRenderer.invoke('guardar-imagen-sin-perdida', datos) as Promise<{
+    formato: 'png' | 'webp' | 'jpg'
+    modo: 'sin-perdida-adicional' | 'jpeg-recodificado'
+    ancho: number
+    alto: number
+  }>,
+
   guardarPaginasImagen: (
     paginasBytes: Uint8Array[],
     formatoDestino: string,
@@ -164,6 +177,12 @@ contextBridge.exposeInMainWorld('api', {
   leerDocumentoTexto: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-documento-texto', rutaOriginal),
 
+  convertirTxtAPdf: (rutaOriginal: string) =>
+    ipcRenderer.invoke('convertir-txt-a-pdf', rutaOriginal) as Promise<boolean>,
+
+  guardarTextoComoPdf: (texto: string, rutaOriginal: string, sufijo?: string) =>
+    ipcRenderer.invoke('guardar-texto-como-pdf', texto, rutaOriginal, sufijo) as Promise<boolean>,
+
   convertirImagenBackend: (rutaOriginal: string, formatoDestino: string) =>
     ipcRenderer.invoke('convertir-imagen-backend', rutaOriginal, formatoDestino),
 
@@ -176,6 +195,15 @@ contextBridge.exposeInMainWorld('api', {
 
   leerArchivoBinario: (rutaOriginal: string) =>
     ipcRenderer.invoke('leer-archivo-binario', rutaOriginal) as Promise<Uint8Array>,
+
+  recortarVideoCompatible: (opciones: {
+    rutaOriginal: string
+    inicioSeg: number
+    finSeg: number
+    duracionTotal: number
+    velocidad: number
+    volumen: number
+  }) => ipcRenderer.invoke('recortar-video-compatible', opciones) as Promise<{ ruta: string; modo: string }>,
 
   guardarMultimediaBytes: (
     bytes: Uint8Array,
@@ -197,6 +225,9 @@ contextBridge.exposeInMainWorld('api', {
   setMouseIgnore: (ignorar: boolean) => ipcRenderer.send('set-mouse-ignore', ignorar),
 
   activarModoVentana: () => ipcRenderer.send('activar-modo-ventana'),
+
+  mostrarErrorOperacion: (mensaje: string) =>
+    ipcRenderer.invoke('mostrar-error-operacion', mensaje) as Promise<void>,
 
   cerrarMenu: () => ipcRenderer.send('forzar-cierre-menu')
 })

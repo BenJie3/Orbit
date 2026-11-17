@@ -1,0 +1,73 @@
+name: Orbit Windows verification
+
+on:
+  push:
+    branches:
+      - fix/v1.0.0-stability-update-wallpaper
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'orbit/**'
+      - '.github/workflows/orbit-windows.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: orbit
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Install Node 20.18.0 (Orbit native module compatibility)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.18.0'
+          cache: npm
+          cache-dependency-path: orbit/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci --legacy-peer-deps
+      - name: Verify native prebuilds on Node 20
+        run: node scripts/check-native.cjs
+      - name: Test Wallpaper Engine config selection
+        run: npm run test:wallpaper
+      - name: Test focused, passive and hidden window transitions
+        run: npm run test:focus
+      - name: Test TXT-to-PDF and media export regressions
+        run: npm run test:conversiones
+      - name: Test lossless image crop, rotation and EXIF preservation
+        run: npm run test:images
+      - name: Test stable and prerelease updater version ordering
+        run: npm run test:updater
+      - name: Cache pinned video engine
+        uses: actions/cache@v4
+        with:
+          path: orbit/build/video-engine
+          key: orbit-video-win64-ffmpeg-8.1.2-db580001
+      - name: Prepare SHA-256 verified FFmpeg
+        run: npm run setup:video
+      - name: Test real playable MP4 video clips
+        run: npm run test:video
+      - name: Type-check main, preload and renderer
+        run: npm run typecheck
+      - name: Build Windows installer including bundled video engine (no release)
+        run: npm run build:win
+      - name: Audit installer integrity and updater metadata (no release)
+        run: npm run audit:installer
+      - name: Report Authenticode signing status (warning if unsigned)
+        shell: pwsh
+        run: ./scripts/audit-signature.ps1
+      - name: Verify NSIS installer and bundled FFmpeg
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'build/icon.png')) { throw 'Missing build/icon.png' }
+          if (!(Test-Path 'dist/orbit-1.0.0-Setup.exe')) { throw 'Missing Windows installer' }
+          if (!(Test-Path 'dist/win-unpacked/resources/video-engine/ffmpeg.exe')) { throw 'Missing packaged FFmpeg' }
+          & 'dist/win-unpacked/resources/video-engine/ffmpeg.exe' -hide_banner -version | Select-Object -First 1
+          $setup = (Get-Item 'dist/orbit-1.0.0-Setup.exe').Length / 1MB
+          $engine = (Get-Item 'dist/win-unpacked/resources/video-engine/ffmpeg.exe').Length / 1MB
+          Write-Host ('Instalador MB: {0:N1}; FFmpeg MB: {1:N1}' -f $setup, $engine)
