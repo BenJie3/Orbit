@@ -58,6 +58,9 @@ jobs:
         run: npm run build:win
       - name: Audit installer integrity and updater metadata (no release)
         run: npm run audit:installer
+      - name: Report Authenticode signing status (warning if unsigned)
+        shell: pwsh
+        run: ./scripts/audit-signature.ps1
       - name: Verify NSIS installer and bundled FFmpeg
         shell: pwsh
         run: |
